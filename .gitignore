@@ -1,0 +1,31 @@
+# Compiled object files
+*.o
+*.obj
+
+# Compiled binaries / executables
+*.exe
+*.out
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+securelink
+!*.c
+!*.h
+
+# Debug/build directories
+build/
+bin/
+obj/
+
+# Editor / OS cruft
+.vscode/
+.vs/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Valgrind / sanitizer output
+*.log
