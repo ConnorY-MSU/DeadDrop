@@ -88,6 +88,47 @@ Notably: **the actual SHA-256 algorithm logic — the message schedule recurrenc
 
 ---
 
-## AES-128 — Week 1, Day 3–4
+## AES-128 — Week 1, Day 3
 
-*Not yet started.*
+### Status: Single-block encryption complete and validated. Decryption and a cipher mode are not yet implemented.
+
+### Design decisions
+
+**Byte-oriented key schedule.** `aes128_key_expansion()` builds the full 176-byte round-key array (11 round keys × 16 bytes, for AES-128's 10 rounds) using a byte-indexed loop rather than a word-indexed (`uint32_t[44]`) one. Every 16 bytes — i.e. at each new round-key boundary — the last 4 bytes are rotated (`RotWord`), passed through the S-box (`SubWord`), and XORed with the round constant (`Rcon`) before being XORed against the corresponding bytes from the previous round key. Mathematically identical to the more commonly seen word-based schedule, just implemented at byte granularity.
+
+**Round keys stored as a flat `uint8_t[176]` array** (`AES128_ROUND_KEY_SIZE`), rather than an `[11][16]` 2D array or a struct — round key `n` occupies bytes `n*16` through `n*16+15`. Kept consistent between `aes128_key_expansion()` and `aes128_encrypt_block()`.
+
+**State representation: flat `uint8_t[16]`, column-major**, matching FIPS 197's own byte numbering. All four round operations (`sub_bytes`, `shift_rows`, `mix_columns`, `add_round_key`) operate directly on this representation.
+
+**Internal helpers kept `static`; only the two functions a caller actually needs are exposed** in `aes128.h` — `aes128_key_expansion()` and `aes128_encrypt_block()`. `sbox`, `rcon`, `xtime()`, `sub_bytes()`, `shift_rows()`, `mix_columns()`, `add_round_key()` are all file-local implementation details, same header/implementation split reasoning as SHA-256's constants and helper functions.
+
+**Round structure**: an initial `AddRoundKey` (round 0) before the loop, rounds 1–9 run SubBytes → ShiftRows → MixColumns → AddRoundKey, and round 10 omits MixColumns, per the spec's final-round exception.
+
+### Test vector
+
+FIPS-197 Appendix B's official worked example — the spec's own key, plaintext, and expected ciphertext:
+
+| | Value |
+|---|---|
+| Key | `000102030405060708090a0b0c0d0e0f` |
+| Plaintext | `00112233445566778899aabbccddeeff` |
+| Expected ciphertext | `69c4e0d86a7b0430d8cdb78070b4c55a` |
+
+### Test harness
+
+`tests/test_aes128.c` — expands the key, encrypts the plaintext block, compares the result against the expected ciphertext with `memcmp`. Structured the same way as `tests/test_sha256.c` (`hex_to_bytes`/`check_block` pattern), reusing `debug.c`'s `print_hex` for failure output.
+
+### Actual run output
+
+```
+[PASS] FIPS-197 Appendix B single-block encrypt
+
+ALL VECTORS PASSED
+```
+
+Compiled clean with `gcc -Wall -Wextra -g`, zero warnings. Matched the spec's expected ciphertext on the first run.
+
+### Next up
+- Pull at least one additional CAVP Known-Answer Test vector — a single passing vector isn't sufficient proof of a general-purpose correct implementation (same reasoning as SHA-256's multi-block requirement)
+- `InvSubBytes`, `InvShiftRows`, `InvMixColumns`, and full decryption with round keys applied in reverse order
+- CBC or CTR mode on top of the validated single-block cipher
