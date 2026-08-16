@@ -271,7 +271,7 @@ Notably: every bug above was environment/tooling/shell-scripting, not a wolfSSL 
 
 ## Week 2, Day 2 — PKI setup
 
-### Status: CA, server cert, and client cert generated and fully verified. Revocation checking not yet implemented.
+### Status: Complete. CA, server cert, and client cert generated and fully verified. Revocation-check module built and tested.
 
 ### Design decisions
 
@@ -300,6 +300,33 @@ Full detail and exact commands in `docs/PKI_SETUP.md`. Summary:
 1. **Passphrase prompt appeared where it shouldn't have (Step 4, generating the server CSR).** Root cause: nearly certainly a copy-paste/typo referencing `ca_key.pem` instead of `server_key.pem` in the command (the two commands look similar). Diagnosed by directly inspecting `server_key.pem`'s actual PEM header (`-----BEGIN PRIVATE KEY-----`, no `ENCRYPTED` marker) to confirm the file itself was correctly unencrypted before concluding the mistake was in the command, not the key generation step.
 2. **`chmod 600` appeared not to work** — `ls -la` continued showing `-rw-r--r--` (644) after running it. Root cause: MSYS2's `chmod`/`ls -la` on an NTFS filesystem is a POSIX-permission *emulation* layer that doesn't map 1:1 onto real Windows ACLs. The actual enforced permission (verified via `icacls`, the authoritative source on Windows) was already correctly restricted, inherited from the folder-level lockdown set up before the files existed. Not a real bug — a display-layer discrepancy worth knowing about for any future Windows/MSYS2 permission check.
 
+### Revocation-check module (`src/revocation.c` / `include/revocation.h`)
+
+**Design**: revoked serials stored one-per-line in a plain text file, in the exact hex format `openssl x509 -noout -serial` already outputs — revoking a cert in practice is just running that command and pasting the result in. Public interface: `revocation_load(filepath)`, `revocation_is_revoked(serial_hex)`, `revocation_free()`.
+
+**Real security decisions made, not just plumbing:**
+- **Fails closed** — before `revocation_load()` is ever called, after `revocation_free()`, on a `NULL` input, or if the list file fails to load: every check returns "revoked" rather than silently trusting an unverified state. Deliberately the safer default for a security check.
+- **Case-insensitive by normalization** — both the stored list and every query are uppercased before comparing, rather than relying on a case-insensitive compare function at check time. Keeps the in-memory list in one consistent format.
+- **Bounds-checked loading** — a fixed `MAX_REVOKED_SERIALS` capacity with a warning (not a silent overflow) if exceeded; `MAX_SERIAL_LEN` sized with real margin above the RFC 5280 max serial length (20 bytes = 40 hex chars).
+- Every `strncpy` call is followed by explicit null-termination — the specific gotcha `strncpy` doesn't handle on its own.
+
+**Test harness** (`tests/test_revocation.c`) — validated against real certificate serials from `docs/PKI_SETUP.md`, not synthetic data:
+
+```
+[PASS] fails closed before revocation_load() is called (got 1, expected 1)
+[PASS] revocation_load() succeeds on a valid file (got 0, expected 0)
+[PASS] revoked serial (server) is detected as revoked (got 1, expected 1)
+[PASS] non-revoked serial (client) is NOT flagged as revoked (got 0, expected 0)
+[PASS] case-insensitive match (lowercase input) (got 1, expected 1)
+[PASS] NULL input fails closed (got 1, expected 1)
+[PASS] fails closed again after revocation_free() (got 1, expected 1)
+[PASS] revocation_load() fails cleanly on a missing file (got -1, expected -1)
+
+ALL VECTORS PASSED
+```
+
+Compiled clean with `gcc -Wall -Wextra -g`, zero warnings.
+
 ### Next up
-- Implement the revocation-check function (revoked-serials list, checked against a presented certificate's serial number) — standalone and testable, per [[02-Week 2 - TLS and mTLS/X.509 and PKI Concepts|X.509 and PKI Concepts]]'s scoped-down design
-- Wire it into wolfSSL's verify callback (Week 2 Day 3)
+- Week 2 Day 2 is fully complete
+- Wire `revocation_is_revoked()` into wolfSSL's verify callback (Week 2 Day 3) — today's work was deliberately kept standalone/testable so Day 3's integration is plumbing, not new logic
