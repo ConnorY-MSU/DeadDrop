@@ -225,3 +225,44 @@ Bottom line: verify-before-decrypt means only a simple, fixed MAC check ever run
 ### Week 1 — closed
 
 SHA-256 and AES-128 (encrypt, decrypt, CTR mode) are complete, independently validated against multiple official NIST sources, clean under sanitizers, documented, and committed. Per [[00-Start Here/Four-Week Roadmap|Four-Week Roadmap]]'s End of Week 1 gate: all three checkpoints met — SHA-256 passes all tested vectors including a multi-block message, AES-128 passes FIPS-197 Appendix B plus an independent KAT, and the Encrypt-then-MAC reasoning above is written from understanding, not paraphrased.
+
+---
+
+## Week 2, Day 1 — wolfSSL build
+
+### Status: Complete. wolfSSL built from source, installed, and verified working with a real TLS 1.3 handshake.
+
+### Environment notes
+
+Full rationale in `docs/BUILD.md`. Summary: built under MSYS2's **UCRT64** environment specifically (not plain MSYS, not raw PowerShell) so the resulting library links cleanly against the same toolchain the rest of this project already uses. Required installing `autoconf`/`automake`/`libtool` (for the autotools build itself) and a separate `git` inside MSYS2 (which doesn't inherit the Windows PATH, so Week 1's Git for Windows install is invisible to it).
+
+### Build configuration
+
+```
+./configure --enable-static --disable-shared --enable-debug --prefix=/ucrt64
+```
+
+Verified against this exact checkout's real `./configure --help` output rather than assumed — static-only build (avoids a runtime-DLL-discovery problem, same category as Week 1's ASan DLL issue), debug symbols on, installed directly into the existing UCRT64 toolchain's search path. `--enable-tls13` was **not** needed — confirmed already the default in current wolfSSL (`--disable-tls13` is the flag that exists to turn it off).
+
+### Verification
+
+Confirmed via `Test-Path`: `C:\msys64\ucrt64\include\wolfssl\` and `C:\msys64\ucrt64\lib\libwolfssl.a` both present after `make install`.
+
+**Real functional proof** — wolfSSL's own bundled example client/server, run against each other over loopback with TLS 1.3 explicitly forced (`-v 4`), output captured to separate files:
+
+```
+client_out.txt: SSL version is TLSv1.3 / I hear you fa shizzle!
+server_out.txt: SSL version is TLSv1.3 / Client message: hello wolfssl!
+```
+
+A genuine handshake, both sides agreeing on TLS 1.3, message exchanged in both directions — not just "it compiled." (First attempt, without `-v 4`, negotiated TLS 1.2 by default — proved the build works, but not the actual TLS-1.3 requirement specifically; re-ran with the version forced to get real proof of the thing that matters.)
+
+### Bugs hit and how they were resolved
+
+1. **`configure: error: no acceptable C compiler found in $PATH`** despite gcc being installed — root cause: invoking MSYS2's bash directly (`usr/bin/bash.exe`) uses the base MSYS environment's PATH, which doesn't include the UCRT64 compiler. Fixed by explicitly setting `MSYSTEM=UCRT64` and sourcing `/etc/profile` before running `configure`.
+2. **`autoreconf: command not found`** on the first `./autogen.sh` attempt — `autoconf`/`automake`/`libtool` weren't installed yet (Week 1 only installed the compiler, not the autotools). Installed via `pacman`.
+3. **`fatal: repository '' does not exist`** on the very first `git clone` attempt — an empty argument reached git, most likely from a copy-paste whitespace artifact (a double space between `clone` and the URL). Re-ran the clone cleanly rather than debugging the exact shell-parsing cause.
+4. **Shell scripting bug, not a wolfSSL problem**: `cd dir && server.exe &` backgrounds the *entire* `cd && server` compound as one subshell — the `cd` never affected the main shell, so a following command using a relative path failed with "No such file or directory". Fixed by putting `cd` on its own line and backgrounding only the server command, capturing its PID via `$!` for cleanup instead of relying on job-control (`%1`) syntax.
+5. **Garbled/interleaved output** on the first client+server test — both processes were redirected to the same output file, and concurrent writes interleaved character-by-character into unreadable text. Fixed by redirecting each process to its own file.
+
+Notably: every bug above was environment/tooling/shell-scripting, not a wolfSSL configuration or usage mistake — the actual wolfSSL build and API usage worked correctly once the surrounding mechanics were sorted out.
