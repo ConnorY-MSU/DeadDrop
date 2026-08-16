@@ -167,4 +167,61 @@ Notably, once both of those were sorted out, **every actual algorithm decision �
 
 ### Next up
 - AES-128 core is complete: encrypt, decrypt, a cipher mode, and the ECB failure demonstration are all done and validated
-- Remaining Day 5 items (Valgrind/ASan, code cleanup, Encrypt-then-MAC write-up, commit hygiene review) per [[01-Week 1 - Crypto Foundations/Week 1 Day 5 Walkthrough|Week 1 Day 5 Walkthrough]]
+
+---
+
+## Week 1, Day 5 — Hardening, cleanup, and write-up
+
+### Status: Complete. Week 1 is fully closed out.
+
+### Sanitizer results
+
+Valgrind isn't available on native Windows without WSL. Used AddressSanitizer + UndefinedBehaviorSanitizer instead, per [[01-Week 1 - Crypto Foundations/Week 1 Day 5 Walkthrough|Week 1 Day 5 Walkthrough]]'s guidance for this exact situation.
+
+One real environment finding along the way: **GCC's MinGW build on Windows has no sanitizer runtime at all** — `-fsanitize=address`/`-fsanitize=undefined` fail to link (`cannot find -lasan`). Installed a separate Clang toolchain via MSYS2 (`clang64` environment) specifically for this, since Clang's Windows ASan/UBSan support is considerably more mature than GCC's MinGW port.
+
+Both test binaries rebuilt and run under Clang with `-fsanitize=address -fsanitize=undefined`:
+
+```
+test_sha256.exe: [PASS] empty string / [PASS] "abc" / [PASS] 56-byte message — ALL VECTORS PASSED
+test_aes128.exe:  all 12 checks PASS — ALL VECTORS PASSED
+```
+
+**Zero memory-safety or undefined-behavior findings on either binary.**
+
+### Code review pass
+
+Per the Documentation Standard, reviewed both `.c` files and both headers for magic numbers, naming consistency, and missing function documentation:
+
+- **Function-header docs added** to every public function in `sha256.h` and `aes128.h` — purpose, parameters, return value, preconditions.
+- **Magic numbers explained**: `0x1B` in `xtime` (AES reduction polynomial, FIPS 197 Sec. 4.2 — flagged as a to-do back on Day 3 and finally addressed here), the InvMixColumns matrix constants (`0x0e`/`0x0b`/`0x0d`/`0x09`), `H0`/`K`'s FIPS 180-4 citations, and the `0x80`/`56`-byte padding boundary in `sha256_final`.
+- **Naming inconsistency found and fixed**: `sha256.c`'s helper functions (`ROTR`, `CH`, `MAJ`, `BSIG0/1`, `SSIG0/1`) were ALL-CAPS while everything else in the project is snake_case — inconsistent with C convention, where ALL-CAPS conventionally signals a macro, not a real function. Renamed to `rotr`/`ch`/`maj`/`bsig0/1`/`ssig0/1`, with a comment mapping each back to FIPS 180-4's own Σ₀/Σ₁/σ₀/σ₁/Ch/Maj notation so the spec cross-reference isn't lost.
+- **`debug.c`/`debug.h` relocated** into `src/`/`include/` — flagged as a lingering layout inconsistency since Day 1, finally fixed.
+
+Rebuilt and re-ran both full test suites after every change in this pass; all vectors continued to pass throughout.
+
+### Write-up: Encrypt-then-MAC
+
+For MAC-then-Encrypt you must decrypt (run padding/parsing logic) before you can check the MAC, so attacker-forged ciphertext reaches your complex decryption code, and any signal about *why* decryption failed (bad padding vs bad MAC) becomes an oracle to decrypt data byte-by-byte (e.g., POODLE).
+
+For Encrypt-then-MAC you verify the MAC over the raw ciphertext first. Forged data gets rejected immediately, and it never touches your decryption/padding logic at all.
+
+Bottom line: verify-before-decrypt means only a simple, fixed MAC check ever runs on untrusted bytes; the riskier decryption code only ever sees data already proven authentic.
+
+### NIST vectors tested this week (full citation list)
+
+| Component | Source | Vectors |
+|---|---|---|
+| SHA-256 | FIPS 180-4 | Empty-string, `"abc"`, and a 56-byte two-block message |
+| SHA-256 | Independent cross-check | Windows `Get-FileHash` (PowerShell, SHA-256) |
+| AES-128 encrypt/decrypt | FIPS 197 Appendix B | Single official worked example, both directions |
+| AES-128 encrypt/decrypt | NIST SP 800-38A Appendix F.1.1 (ECB-AES128) | Independent key, both directions |
+| AES-128 CTR mode | NIST SP 800-38A Appendix F.5.1 (CTR-AES128) | All 4 blocks against the spec's own worked example |
+
+### Commit hygiene check
+
+`git log --oneline` reviewed end-to-end: every commit is small, scoped to one logical change, and clearly labeled (scaffold → SHA-256 impl → tests → docs → AES impl → tests → docs → decrypt/CTR → tests → docs → cleanup). No giant dumps, nothing needing history rewrites.
+
+### Week 1 — closed
+
+SHA-256 and AES-128 (encrypt, decrypt, CTR mode) are complete, independently validated against multiple official NIST sources, clean under sanitizers, documented, and committed. Per [[00-Start Here/Four-Week Roadmap|Four-Week Roadmap]]'s End of Week 1 gate: all three checkpoints met — SHA-256 passes all tested vectors including a multi-block message, AES-128 passes FIPS-197 Appendix B plus an independent KAT, and the Encrypt-then-MAC reasoning above is written from understanding, not paraphrased.
