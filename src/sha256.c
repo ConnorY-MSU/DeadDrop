@@ -3,11 +3,15 @@
 
 void sha256_transform(sha256_context *ctx, const uint8_t block[64]);
 
+/* Initial hash values, FIPS 180-4 Sec. 5.3.3 -- fractional parts of the square
+   roots of the first 8 primes ("nothing up my sleeve" numbers). */
 static const uint32_t H0[8] = {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
+/* Round constants, FIPS 180-4 Sec. 4.2.2 -- fractional parts of the cube
+   roots of the first 64 primes. */
 static const uint32_t K[64] = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -19,33 +23,39 @@ static const uint32_t K[64] = {
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
 };
 
-/* Bitwise primitives */
-static inline uint32_t ROTR(uint32_t x, unsigned int n) {
+/* Bitwise primitives. Lowercase snake_case, matching the rest of the project
+   (aes128.c's sub_bytes/shift_rows/etc.) rather than ALL-CAPS -- deliberate
+   choice for consistency, since in C, ALL-CAPS conventionally signals a macro,
+   not a real typed function like these. Names still map directly onto FIPS
+   180-4's own notation: rotr = ROTR, ch = Ch, maj = Maj, bsig0/1 = Sigma0/1
+   (uppercase sigma, used in the compression function), ssig0/1 = sigma0/1
+   (lowercase sigma, used in the message schedule). */
+static inline uint32_t rotr(uint32_t x, unsigned int n) {
     return (x >> n) | (x << (32 - n));
 }
 
-static inline uint32_t CH(uint32_t x, uint32_t y, uint32_t z) {
+static inline uint32_t ch(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (~x & z);
 }
 
-static inline uint32_t MAJ(uint32_t x, uint32_t y, uint32_t z) {
+static inline uint32_t maj(uint32_t x, uint32_t y, uint32_t z) {
     return (x & y) ^ (x & z) ^ (y & z);
 }
 
-static inline uint32_t BSIG0(uint32_t x) {
-    return ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22);
+static inline uint32_t bsig0(uint32_t x) {
+    return rotr(x, 2) ^ rotr(x, 13) ^ rotr(x, 22);
 }
 
-static inline uint32_t BSIG1(uint32_t x) {
-    return ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25);
+static inline uint32_t bsig1(uint32_t x) {
+    return rotr(x, 6) ^ rotr(x, 11) ^ rotr(x, 25);
 }
 
-static inline uint32_t SSIG0(uint32_t x) {
-    return ROTR(x, 7) ^ ROTR(x, 18) ^ (x >> 3);
+static inline uint32_t ssig0(uint32_t x) {
+    return rotr(x, 7) ^ rotr(x, 18) ^ (x >> 3);
 }
 
-static inline uint32_t SSIG1(uint32_t x) {
-    return ROTR(x, 17) ^ ROTR(x, 19) ^ (x >> 10);
+static inline uint32_t ssig1(uint32_t x) {
+    return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
 }
 
 
@@ -73,14 +83,18 @@ void sha256_update(sha256_context *ctx, const uint8_t *data, size_t len) {
 }
 
 void sha256_final(sha256_context *ctx, uint8_t digest[32]) {
-    uint8_t pad = 0x80;
-    uint64_t bitlen_be = ctx->bitlen;
+    uint8_t pad = 0x80; /* single '1' bit followed by zero bits, FIPS 180-4 Sec. 5.1.1 */
+    uint64_t bitlen_be = ctx->bitlen; /* snapshot before update() calls below inflate it with padding bits */
     sha256_update(ctx, &pad, 1);
     static const uint8_t zero = 0;
+    /* Pad with zero bytes until exactly 56 bytes (448 bits) are buffered, leaving
+       the last 8 bytes of the 64-byte block for the length field below. Reusing
+       update()'s buffering means this naturally spills into a second block when
+       the message was already close to a block boundary -- see FIPS 180-4 Sec. 5.1.1. */
     while (ctx->buffer_len != 56) {
         sha256_update(ctx, &zero, 1);
     }
-    uint8_t len_bytes[8];
+    uint8_t len_bytes[8]; /* original message length in bits, big-endian, per FIPS 180-4 Sec. 5.1.1 */
     for (int i =0; i < 8; i++) {
         len_bytes[i] = (uint8_t)(bitlen_be >> (56 - 8 * i));
     }
@@ -104,7 +118,7 @@ void sha256_transform(sha256_context *ctx, const uint8_t block[64]) {
                ((uint32_t)block[t * 4 + 3]);
     }
     for (int t = 16; t < 64; t++) {
-        W[t] = SSIG1(W[t - 2]) + W[t - 7] + SSIG0(W[t - 15]) + W[t - 16];
+        W[t] = ssig1(W[t - 2]) + W[t - 7] + ssig0(W[t - 15]) + W[t - 16];
     }
     
     a = ctx->state[0];
@@ -117,8 +131,8 @@ void sha256_transform(sha256_context *ctx, const uint8_t block[64]) {
     h = ctx->state[7];
 
     for (int t = 0; t < 64; t++) {
-        uint32_t T1 = h + BSIG1(e) + CH(e, f, g) + K[t] + W[t];
-        uint32_t T2 = BSIG0(a) + MAJ(a, b, c);
+        uint32_t T1 = h + bsig1(e) + ch(e, f, g) + K[t] + W[t];
+        uint32_t T2 = bsig0(a) + maj(a, b, c);
         h = g;
         g = f;
         f = e;
