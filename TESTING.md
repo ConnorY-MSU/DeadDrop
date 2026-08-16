@@ -88,9 +88,9 @@ Notably: **the actual SHA-256 algorithm logic — the message schedule recurrenc
 
 ---
 
-## AES-128 — Week 1, Day 3
+## AES-128 — Week 1, Day 3–4
 
-### Status: Single-block encryption complete and validated. Decryption and a cipher mode are not yet implemented.
+### Status: Complete. Key expansion, single-block encryption, single-block decryption, and CTR mode are all implemented and independently validated.
 
 ### Design decisions
 
@@ -104,31 +104,67 @@ Notably: **the actual SHA-256 algorithm logic — the message schedule recurrenc
 
 **Round structure**: an initial `AddRoundKey` (round 0) before the loop, rounds 1–9 run SubBytes → ShiftRows → MixColumns → AddRoundKey, and round 10 omits MixColumns, per the spec's final-round exception.
 
-### Test vector
+**Decryption uses the straightforward `InvCipher` structure from FIPS 197 §5.3**, not the "Equivalent Inverse Cipher" optimization — `AddRoundKey(10)` first, then for rounds 9 down to 1: `InvShiftRows → InvSubBytes → AddRoundKey(round) → InvMixColumns`, then a final `InvShiftRows → InvSubBytes → AddRoundKey(0)` with no `InvMixColumns` after it. Derived by literally inverting the encrypt function step-by-step (reverse the order, invert each operation, keep `AddRoundKey` as-is since XOR is its own inverse) rather than copying the spec's pseudocode directly.
 
-FIPS-197 Appendix B's official worked example — the spec's own key, plaintext, and expected ciphertext:
+**`inv_sbox` transcribed separately from FIPS 197 Figure 14**, then verified against the already-validated forward `sbox` (spot-checked, not derived from it programmatically) — both tables independently confirmed correct against the spec, byte for byte.
 
-| | Value |
-|---|---|
-| Key | `000102030405060708090a0b0c0d0e0f` |
-| Plaintext | `00112233445566778899aabbccddeeff` |
-| Expected ciphertext | `69c4e0d86a7b0430d8cdb78070b4c55a` |
+**A general GF(2⁸) multiplier (`gmul`)**, built from repeated `xtime` calls using the standard "Russian peasant multiplication" pattern, rather than only the specific ×2/×3 combinations `mix_columns` needed. This generalizes cleanly to `inv_mix_columns`'s larger constants (0x09, 0x0b, 0x0d, 0x0e) without needing separate hardcoded multiply functions per constant.
+
+**CTR mode (`aes128_ctr_xcrypt`)**: encrypts a 16-byte counter block with `aes128_encrypt_block` (never the decrypt path — CTR only ever uses the forward cipher, on the counter, not on the data) to produce a keystream block, XORs it against up to 16 bytes of input/output, and increments the counter before the next chunk. The final chunk of a non-block-aligned input still generates a full 16-byte keystream block internally but only consumes as many bytes as remain — handles arbitrary-length input without padding, by design. Encrypt and decrypt are the literal same function call.
+
+**Counter increment (`increment_counter`)**: a full 128-bit big-endian increment with carry propagation across all 16 bytes (start at byte 15, carry left on overflow), rather than only incrementing a 32-bit tail with a fixed nonce prefix. A legitimate alternative per SP 800-38A Appendix B's "standard incrementing function," which permits applying the increment to the whole block or just part of it.
+
+### Test vectors
+
+| Test | Key | Input | Expected |
+|---|---|---|---|
+| FIPS-197 Appendix B encrypt | `000102030405060708090a0b0c0d0e0f` | `00112233445566778899aabbccddeeff` | `69c4e0d86a7b0430d8cdb78070b4c55a` |
+| FIPS-197 Appendix B decrypt | (same key) | `69c4e0d86a7b0430d8cdb78070b4c55a` | `00112233445566778899aabbccddeeff` |
+| SP 800-38A F.1.1 ECB-AES128 encrypt | `2b7e151628aed2a6abf7158809cf4f3c` | `6bc1bee22e409f96e93d7e117393172a` | `3ad77bb40d7a3660a89ecaf32466ef97` |
+| SP 800-38A F.1.1 ECB-AES128 decrypt | (same key) | `3ad77bb40d7a3660a89ecaf32466ef97` | `6bc1bee22e409f96e93d7e117393172a` |
+| SP 800-38A F.5.1 CTR-AES128, 4 blocks | `2b7e151628aed2a6abf7158809cf4f3c`, initial counter `f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff` | 4 blocks of plaintext (see SP 800-38A Appendix F) | `874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee` |
+
+Two independent official NIST sources (FIPS 197 and SP 800-38A), different keys, both directions, plus a full 4-block CTR run against the spec's own worked example.
 
 ### Test harness
 
-`tests/test_aes128.c` — expands the key, encrypts the plaintext block, compares the result against the expected ciphertext with `memcmp`. Structured the same way as `tests/test_sha256.c` (`hex_to_bytes`/`check_block` pattern), reusing `debug.c`'s `print_hex` for failure output.
+`tests/test_aes128.c` — same `hex_to_bytes`/`check_block` pattern as `test_sha256.c`, reusing `debug.c`'s `print_hex`. Beyond the spec vectors, it also includes:
+- A round-trip test (encrypt then decrypt, confirm original bytes recovered) for both the single-block cipher and CTR mode
+- A CTR round-trip on a deliberately **non-block-aligned length (37 bytes)** — this is the case that actually exercises the partial-final-block logic in `aes128_ctr_xcrypt`, since all the spec vectors happen to be exact multiples of 16 bytes
+- An **ECB demonstration**: two identical 16-byte plaintext blocks, encrypted independently with raw `aes128_encrypt_block` (no mode), confirming identical ciphertext blocks — reproducing the mechanism behind the "ECB penguin" directly rather than just describing it
 
 ### Actual run output
 
 ```
 [PASS] FIPS-197 Appendix B single-block encrypt
+[PASS] FIPS-197 Appendix B single-block decrypt
+[PASS] Round-trip: encrypt then decrypt returns original plaintext
+[PASS] NIST SP800-38A F.1.1 block #1 encrypt
+[PASS] NIST SP800-38A F.1.1 block #1 decrypt
+[PASS] SP800-38A F.5.1 CTR block 1
+[PASS] SP800-38A F.5.1 CTR block 2
+[PASS] SP800-38A F.5.1 CTR block 3
+[PASS] SP800-38A F.5.1 CTR block 4
+[PASS] CTR round-trip: decrypt(encrypt(P)) == P
+[PASS] CTR round-trip on non-block-aligned length (37 bytes)
+[PASS] ECB demonstration: identical plaintext blocks produce identical ciphertext blocks
+  plaintext block A : 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11
+  plaintext block B : 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11
+  ciphertext block A: 35 d1 4e 6d 3e 3a 27 9c f0 1e 34 3e 34 e7 de d3
+  ciphertext block B: 35 d1 4e 6d 3e 3a 27 9c f0 1e 34 3e 34 e7 de d3
 
 ALL VECTORS PASSED
 ```
 
-Compiled clean with `gcc -Wall -Wextra -g`, zero warnings. Matched the spec's expected ciphertext on the first run.
+Compiled clean with `gcc -Wall -Wextra -g`, zero warnings.
+
+### Bugs hit and how they were resolved
+
+1. **Stray code pasted at file scope in `aes128.c`.** A block of test/usage-style statements (calling `aes128_key_expansion` and the not-yet-written `aes128_ctr_xcrypt` on undeclared variables) ended up sitting directly between two function definitions in the source file, outside any function body — not valid C. Actual compiler output: `error: conflicting types for 'aes128_key_expansion'; have 'int()'`, since a statement at file scope with no type is interpreted as an implicit-int function declaration. Removed; the calls belonged in the test file, not the implementation file.
+2. **`aes128_ctr_xcrypt` was declared in the header and "called" before it was ever implemented** — the function body didn't exist anywhere. Not really a bug so much as building top-down (interface first) rather than bottom-up; resolved by writing the actual implementation.
+
+Notably, once both of those were sorted out, **every actual algorithm decision — the `InvCipher` round sequence, `gmul`, the counter increment, the partial-block handling — was correct on the first compiled attempt**, proven against official vectors rather than just assumed.
 
 ### Next up
-- Pull at least one additional CAVP Known-Answer Test vector — a single passing vector isn't sufficient proof of a general-purpose correct implementation (same reasoning as SHA-256's multi-block requirement)
-- `InvSubBytes`, `InvShiftRows`, `InvMixColumns`, and full decryption with round keys applied in reverse order
-- CBC or CTR mode on top of the validated single-block cipher
+- AES-128 core is complete: encrypt, decrypt, a cipher mode, and the ECB failure demonstration are all done and validated
+- Remaining Day 5 items (Valgrind/ASan, code cleanup, Encrypt-then-MAC write-up, commit hygiene review) per [[01-Week 1 - Crypto Foundations/Week 1 Day 5 Walkthrough|Week 1 Day 5 Walkthrough]]
