@@ -266,3 +266,40 @@ A genuine handshake, both sides agreeing on TLS 1.3, message exchanged in both d
 5. **Garbled/interleaved output** on the first client+server test — both processes were redirected to the same output file, and concurrent writes interleaved character-by-character into unreadable text. Fixed by redirecting each process to its own file.
 
 Notably: every bug above was environment/tooling/shell-scripting, not a wolfSSL configuration or usage mistake — the actual wolfSSL build and API usage worked correctly once the surrounding mechanics were sorted out.
+
+---
+
+## Week 2, Day 2 — PKI setup
+
+### Status: CA, server cert, and client cert generated and fully verified. Revocation checking not yet implemented.
+
+### Design decisions
+
+**PKI files stored entirely outside any git repository**, at `C:\Users\yette\securelink-pki` — not even gitignored inside a repo, since physical separation avoids the "one `git add -f` away from a leaked key" failure mode a `.gitignore` entry doesn't fully protect against. Also confirmed outside OneDrive's sync scope (OneDrive is scoped to `C:\Users\yette\OneDrive\` specifically on this machine — verified via the registry's `User Shell Folders` keys before choosing the location, not assumed).
+
+**Folder-level NTFS permissions restricted** via `icacls` (inheritance removed, access granted only to the local account and `SYSTEM`) *before* any files were created inside it, so every file inherits the restriction automatically.
+
+**CA key passphrase-protected (`-aes256`, RSA 4096); server/client keys left unencrypted (RSA 2048).** Deliberate asymmetry: the CA key never needs unattended access and its compromise would be catastrophic (ability to forge trust for anything), so a passphrase is pure upside. The device keys will eventually need to load automatically on an unattended Pi (Week 4's zero-touch-boot requirement), so a passphrase there would be a real conflict, not just an inconvenience — same reasoning already established for the hardware-backed key storage decision.
+
+**Distinct, deliberately different Common Names** for the CA (`SecureLink Root CA`) vs. server (`SecureLink-Server`) vs. client (`SecureLink-Client`) — guards against the CN-mixup class of mistake flagged in [[02-Week 2 - TLS and mTLS/X.509 and PKI Concepts|X.509 and PKI Concepts]]' common-mistakes list.
+
+### Verification performed
+
+Full detail and exact commands in `docs/PKI_SETUP.md`. Summary:
+
+| Check | Method | Result |
+|---|---|---|
+| Key encryption | `head -2 <key>.pem`, inspect PEM header | CA: `ENCRYPTED PRIVATE KEY` ✓ / server, client: plain `PRIVATE KEY` ✓ |
+| Subject/issuer/serial/validity | `openssl x509 -noout -subject -issuer -serial -dates` | All three correct — see table in `docs/PKI_SETUP.md` |
+| Serial uniqueness | Compared serials directly | Sequential and distinct (`...83F8`, `...83F9`) — required for the revocation check |
+| File permissions | `chmod 600`, then verified via `icacls` (not `ls -la`) | Correctly restricted to owning user + SYSTEM only |
+| **Cryptographic chain validity** | `openssl verify -CAfile ca_cert.pem <cert>.pem` | `server_cert.pem: OK`, `client_cert.pem: OK` — proves the signatures are actually valid, not just that the issuer field contains the right string |
+
+### Bugs hit and how they were resolved
+
+1. **Passphrase prompt appeared where it shouldn't have (Step 4, generating the server CSR).** Root cause: nearly certainly a copy-paste/typo referencing `ca_key.pem` instead of `server_key.pem` in the command (the two commands look similar). Diagnosed by directly inspecting `server_key.pem`'s actual PEM header (`-----BEGIN PRIVATE KEY-----`, no `ENCRYPTED` marker) to confirm the file itself was correctly unencrypted before concluding the mistake was in the command, not the key generation step.
+2. **`chmod 600` appeared not to work** — `ls -la` continued showing `-rw-r--r--` (644) after running it. Root cause: MSYS2's `chmod`/`ls -la` on an NTFS filesystem is a POSIX-permission *emulation* layer that doesn't map 1:1 onto real Windows ACLs. The actual enforced permission (verified via `icacls`, the authoritative source on Windows) was already correctly restricted, inherited from the folder-level lockdown set up before the files existed. Not a real bug — a display-layer discrepancy worth knowing about for any future Windows/MSYS2 permission check.
+
+### Next up
+- Implement the revocation-check function (revoked-serials list, checked against a presented certificate's serial number) — standalone and testable, per [[02-Week 2 - TLS and mTLS/X.509 and PKI Concepts|X.509 and PKI Concepts]]'s scoped-down design
+- Wire it into wolfSSL's verify callback (Week 2 Day 3)
