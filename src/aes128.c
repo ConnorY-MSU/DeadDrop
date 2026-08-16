@@ -47,6 +47,9 @@ static const uint8_t inv_sbox[256] = {
 static const uint8_t rcon[11] = {
     0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1B,0x36
 };
+/* Multiply by 2 in GF(2^8). 0x1B is the AES reduction polynomial
+   (x^8+x^4+x^3+x+1, FIPS 197 Sec. 4.2), XORed in only when the shift
+   overflows the top bit (i.e. the pre-shift value was >= 0x80). */
 static uint8_t xtime(uint8_t x) {
     return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1B : 0x00));
 }
@@ -147,6 +150,9 @@ static uint8_t gmul(uint8_t a, uint8_t b) {
     return p;
 }
 
+/* InvMixColumns: multiply each column by the fixed InvMixColumns matrix over
+   GF(2^8), FIPS 197 Sec. 5.3.3. The 0x0e/0x0b/0x0d/0x09 constants are that
+   matrix's coefficients -- the inverse of MixColumns' 0x02/0x03/0x01 matrix. */
 static void inv_mix_columns(uint8_t state[16]) {
     for (int c = 0; c < 4; c++) {
         uint8_t *col = state + 4 * c;
