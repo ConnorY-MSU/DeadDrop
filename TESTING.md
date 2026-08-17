@@ -330,3 +330,91 @@ Compiled clean with `gcc -Wall -Wextra -g`, zero warnings.
 ### Next up
 - Week 2 Day 2 is fully complete
 - Wire `revocation_is_revoked()` into wolfSSL's verify callback (Week 2 Day 3) — today's work was deliberately kept standalone/testable so Day 3's integration is plumbing, not new logic
+
+## Week 2, Day 3 — mTLS server
+
+### Status: Complete. `src/server.c` implements raw TCP setup, wolfSSL context/cert/CA loading, mandatory client-cert verification, a custom verify callback wired to the Day 2 revocation module, and a minimal post-handshake read/log. All seven planned verification phases passed against real project certs and real serial numbers — not just "it compiled."
+
+### Design decisions
+
+**CLI arguments instead of hardcoded paths** (`-c`/`-k`/`-A`/`-r` for server cert, server key, CA cert, and revoked-serials file). Originally hardcoded absolute paths were fixed early once flagged as a Week 4 deployment blocker — the same binary now runs unmodified against different cert paths per device via a systemd unit's `ExecStart=` arguments, no rebuild needed.
+
+**Mandatory client-cert verification**: `wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT, my_verify_callback)`. `WOLFSSL_VERIFY_PEER` alone only verifies a cert *if offered*; adding `WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT` makes presenting one mandatory — this is the specific flag combination Day 5's "no client cert" negative test depends on.
+
+**Trust scoped to exactly one CA**: `wolfSSL_CTX_load_verify_locations(ctx, ca_path, NULL)` loads only the project's own `ca_cert.pem`, nothing else. No system trust store is ever loaded. Verified concretely, not just by inspection (see Phase 5 below).
+
+**Custom verify callback design**: fails closed on every path — if wolfSSL's own chain verification already set `preverify_ok = 0`, the callback returns 0 immediately without even attempting revocation logic (no point checking revocation status of a cert that's already untrusted). Only once the chain itself is confirmed valid does it extract the serial number and check it against the Day 2 revocation module. This ordering matters: it means the two rejection reasons ("wrong CA" vs. "revoked") are cleanly distinguishable in the logs, which Phase 5 and Phase 6 below both depend on to prove they're testing what they claim to be testing.
+
+**`fflush(stdout)` after every log line the accept loop or verify callback prints.** Discovered mid-testing that `setvbuf(stdout, NULL, _IOLBF, 0)` (line-buffering) is silently ignored by MinGW/UCRT's C runtime whenever stdout isn't an actual console (e.g. redirected to a file or piped) — a known Windows CRT quirk, not specific to this project. Without explicit `fflush()`, log lines sat in an unflushed buffer and were lost entirely if the process was killed rather than exited cleanly, which made the server look like it wasn't doing anything even though it was working correctly. Explicit `fflush()` is the fix that actually works on Windows; this also matters for real deployed behavior later, not just today's testing, since prompt log visibility matters for a long-running service.
+
+### The wolfSSL rebuild — a real, multi-layered build-environment problem
+
+Writing the verify callback (`wolfSSL_X509_STORE_CTX_get_current_cert`, `wolfSSL_X509_get_serial_number`) surfaced that Day 1's wolfSSL build was missing wolfSSL's OpenSSL-compatibility layer (`OPENSSL_EXTRA`), which those two functions live behind. Confirmed definitively before doing anything — not assumed — via `nm libwolfssl.a | grep <function>`, which showed the symbols simply didn't exist as compiled code, and via `grep OPENSSL_EXTRA wolfssl/options.h`, which showed the flag wasn't defined in Day 1's build at all.
+
+Fixing this took four distinct, separately-diagnosed problems, each confirmed with real evidence before moving to the next:
+
+1. **Missing flag** — `--enable-opensslextra` wasn't part of Day 1's `./configure` line, since there was no way to know cert-introspection functions would be needed before this point. Fix: add the flag.
+2. **`config.status: error: Something went wrong bootstrapping makefile fragments`** — the reconfigure's own internal dependency-tracking bootstrap step failed because `config.status` spawns a bare subshell that calls `make` without the full PATH our login shell has, giving `make: command not found` *inside configure itself*. This corrupted the resulting `libtool` script (it fell back to a stale/incorrect archiver command, `lib -OUT:...` — the MSVC-style syntax, not GNU `ar`). Fix: `--disable-dependency-tracking` plus a full `make distclean` to clear the corrupted intermediate state before reconfiguring — the clean reconfigure produced a correct `libtool` (`$AR $AR_FLAGS ...`) with no further intervention needed.
+3. **The `Bash` tool available in this environment is Git Bash, not MSYS2's bash** — it inherits the persistent Windows PATH (so `gcc` in `ucrt64/bin` was found, since that was added to PATH in Week 1), but not MSYS2's `usr/bin` (where `make.exe`/`ar.exe`/`nm.exe` actually live). Every build step had to go through `C:\msys64\usr\bin\bash.exe -lc "export MSYSTEM=UCRT64; source /etc/profile; ..."` explicitly — the same pattern already established on Day 1, just re-confirmed the hard way after assuming a plain shell command would work.
+4. **`make`/`make install` failed linking wolfSSL's own internal test suite** (`tests/unit.test.exe`), not our code — `undefined reference to wolfSSL_ERR_print_errors`. Traced to the actual definition in `wolfssl/wolfcrypt/logging.h`: that function requires `WOLFSSL_HAVE_ERROR_QUEUE`, which is gated `#if (defined(OPENSSL_EXTRA) && !defined(_WIN32) && ...)` — deliberately excluded on Windows by wolfSSL upstream, regardless of `OPENSSL_EXTRA`. This only affects wolfSSL's own bundled unit tests, which this project never uses; `libwolfssl.la`/`.a` and both example binaries (`client.exe`, `server.exe`) had already linked successfully before this failure. Fix: installed only what's actually needed — `make install-nobase_includeHEADERS` (headers, doesn't touch the `tests/` subdirectory) plus a direct copy of the freshly-built `src/.libs/libwolfssl.a` into `/ucrt64/lib/`, bypassing the recursive `make install` entirely rather than chasing down an unrelated upstream test-suite gap.
+
+After all four fixes, `nm /ucrt64/lib/libwolfssl.a | grep wolfSSL_X509_STORE_CTX_get_current_cert` and the equivalent for `wolfSSL_X509_get_serial_number` both confirmed the real compiled symbols were present, and `src/server.c` compiled clean (`gcc -Wall -Wextra -g`, zero warnings) against the rebuilt library.
+
+### Verification — all seven planned phases, each with real evidence
+
+**Phase 1 (raw TCP accept)** — confirmed via the server's own log: `Raw TCP client connected.` printed on every connection attempt, before any TLS logic runs.
+
+**Phase 2 (cert/key/CA loading)** — confirmed on Day 1 already; re-confirmed here as a byproduct of every later phase succeeding (a load failure would have prevented the context from ever reaching `wolfSSL_accept`).
+
+**Phase 3 (mandatory verify mode)** — no standalone test; folded into Phase 4/5's pass/fail results below, which wouldn't be distinguishable without it.
+
+**Phase 4 (full mTLS handshake, real project certs)** — ran wolfSSL's own proven example client against the server, pointed explicitly at this project's real certs:
+```
+./examples/client/client.exe -h 127.0.0.1 -p 4433 -c client_cert.pem -k client_key.pem -A ca_cert.pem -v 4
+```
+Server log:
+```
+Raw TCP client connected.
+Verify callback: checking serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 against revocation list.
+Verify callback: serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 not revoked, proceeding.
+mTLS handshake succeeded.
+Client message: hello wolfssl!
+```
+Client confirmed `SSL version is TLSv1.3`, `SSL cipher suite is TLS_AES_256_GCM_SHA384`, and `Verified Peer's cert` — a genuine, complete TLS 1.3 mutual handshake, both directions, real certs.
+
+**Phase 5 (trust-scoping — must reject a cert that isn't ours, even if it's validly signed by *some* CA)** — ran the same client, but substituted wolfSSL's own bundled default client cert (`./certs/client-cert.pem`, signed by wolfSSL's own bundled CA, not ours) while keeping `-A` pointed at our real CA so the client would still trust our server correctly. Server log:
+```
+Raw TCP client connected.
+```
+stderr:
+```
+Verify callback: standard cert-chain verification failed.
+Handshake failed: certificate verify failed
+```
+This is the exact result the check exists to produce: `preverify_ok` was 0 before the callback's own logic even ran, meaning wolfSSL's own chain verification rejected the cert — proving the server's trust is scoped to *only* the project's CA, not a broader default store that would have accepted wolfSSL's bundled cert.
+
+**Phase 6 (revocation, both directions)**:
+- Added the real client cert's actual serial (`68A7E95F14813C60A047706956F72BA0CCCC83F9`) to `revoked_serials.txt`, restarted the server (the list only loads at startup), reran the *same* previously-successful Phase 4 command. Server log:
+  ```
+  Raw TCP client connected.
+  Verify callback: checking serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 against revocation list.
+  ```
+  stderr:
+  ```
+  Verify callback: serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 is REVOKED - rejecting.
+  Handshake failed: verify problem on certificate
+  ```
+  Distinct rejection reason from Phase 5's — this cert's chain was completely valid (correct CA, correct signature); only the revocation check failed it. That distinction is what actually proves the Day 2 revocation module is wired in and doing something, not just present in the code.
+- Removed the serial, restarted the server, reran the same command again: succeeded exactly as in Phase 4 (`mTLS handshake succeeded.` / `Client message: hello wolfssl!`) — confirms revocation is a live, reloadable check, not a permanent lockout once triggered.
+
+**Phase 7 (post-handshake read)** — `Client message: hello wolfssl!` appears in every successful-handshake server log above, confirming `wolfSSL_read` correctly receives and the server correctly logs the client's application data. (By design, the server logs but doesn't echo — the client's own subsequent `SSL_read` then fails with "connection closed," which is expected client-side behavior given the server's logging-only design, not a bug.)
+
+### Bugs hit and how they were resolved
+1. The four wolfSSL-rebuild issues detailed above (missing flag, corrupted `libtool` from a failed dependency-tracking bootstrap, Git-Bash-vs-MSYS2-bash PATH confusion, and wolfSSL's own Windows-excluded error-queue feature breaking only its own unrelated test suite).
+2. `setvbuf(_IOLBF)` silently ignored by Windows' C runtime for non-console output — replaced with explicit `fflush()` after each log line, which does work reliably.
+3. First trust-scoping test attempt was constructed backwards (swapped which side's CA mismatch was being tested), causing a client-side rejection of the *server's* cert instead of the intended server-side rejection of the *client's* cert. Caught by reading the actual client-side error output carefully rather than just checking the exit code, and re-run correctly.
+
+### Next up
+- Week 2 Day 3 is complete
+- Day 4: write `client.c`, the mirror of everything above from the client role — should go faster, all the mechanics are now familiar
+- Day 5: the four formal negative tests (no cert, wrong CA, expired, revoked) for `TESTING.md` — Phases 5 and 6 above are functionally rehearsals for two of these already
