@@ -18,11 +18,6 @@
 
 #define SERIAL_BUF_SIZE 32
 
-#define DEFAULT_SERVER_CERT_PATH "C:\\Users\\yette\\securelink-pki\\server_cert.pem"
-#define DEFAULT_SERVER_KEY_PATH  "C:\\Users\\yette\\securelink-pki\\server_key.pem"
-#define DEFAULT_CA_CERT_PATH     "C:\\Users\\yette\\securelink-pki\\ca_cert.pem"
-#define DEFAULT_REVOKED_PATH     "revoked_serials.txt"
-
 static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
 {
     WOLFSSL_X509 *cert;
@@ -76,6 +71,17 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
     return 1;
 }
 
+static void print_usage(const char *prog_name)
+{
+    fprintf(stderr,
+        "Usage: %s -c <server_cert.pem> -k <server_key.pem> "
+        "-A <ca_cert.pem> -r <revoked_serials.txt>\n"
+        "All four arguments are required - there are no default paths,\n"
+        "since a hardcoded path baked into the binary would tie it to one\n"
+        "machine and break the moment this runs on a different device.\n",
+        prog_name);
+}
+
 static void parse_args(int argc, char *argv[],
                         const char **cert_path, const char **key_path,
                         const char **ca_path, const char **revoked_path)
@@ -102,12 +108,18 @@ int main(int argc, char *argv[])
     WOLFSSL_CTX *ctx = NULL;
     int rc;
 
-    const char *cert_path = DEFAULT_SERVER_CERT_PATH;
-    const char *key_path = DEFAULT_SERVER_KEY_PATH;
-    const char *ca_path = DEFAULT_CA_CERT_PATH;
-    const char *revoked_path = DEFAULT_REVOKED_PATH;
+    const char *cert_path = NULL;
+    const char *key_path = NULL;
+    const char *ca_path = NULL;
+    const char *revoked_path = NULL;
 
     parse_args(argc, argv, &cert_path, &key_path, &ca_path, &revoked_path);
+
+    if (cert_path == NULL || key_path == NULL || ca_path == NULL ||
+        revoked_path == NULL) {
+        print_usage(argv[0]);
+        return 1;
+    }
 
     rc = revocation_load(revoked_path);
     if (rc != 0) {
