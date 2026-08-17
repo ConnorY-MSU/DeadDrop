@@ -202,6 +202,37 @@ int main(int argc, char *argv[])
         printf("Sent: %s\n", CLIENT_MESSAGE);
     }
 
+    /* server.c always closes the socket immediately after handling a
+     * connection - whether it accepted the handshake or rejected it -
+     * so this read never blocks waiting on data that isn't coming (that
+     * concern only applies to waiting for an *echoed reply*, which the
+     * server deliberately never sends). What it DOES do is give this
+     * client a chance to notice a rejection alert that arrives after
+     * wolfSSL_connect() already returned success: in TLS 1.3 the client
+     * considers its own handshake complete once it sends its final
+     * flight, before the server's verdict on the client's certificate
+     * comes back, so a server-side rejection can otherwise be silently
+     * missed client-side even though the server correctly refused the
+     * connection. */
+    {
+        char reply_buf[16];
+        int n = wolfSSL_read(ssl, reply_buf, sizeof(reply_buf));
+        if (n <= 0) {
+            int err = wolfSSL_get_error(ssl, n);
+            char errbuf[80];
+            /* The server never echoes a reply, so a plain closed-connection
+             * result here is normal, not an error - but a fatal TLS alert
+             * surfacing here means the server actually rejected something
+             * about this connection (wrong CA, revoked cert, etc.) after
+             * wolfSSL_connect() had already returned success. Print the
+             * real string either way rather than guessing which case this
+             * is - the wording wolfSSL itself returns already distinguishes
+             * a benign close from a fatal alert. */
+            printf("Post-send read: %s\n",
+                   wolfSSL_ERR_error_string(err, errbuf));
+        }
+    }
+
     wolfSSL_free(ssl);
     closesocket(sock);
     wolfSSL_CTX_free(ctx);
