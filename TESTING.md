@@ -418,3 +418,66 @@ This is the exact result the check exists to produce: `preverify_ok` was 0 befor
 - Week 2 Day 3 is complete
 - Day 4: write `client.c`, the mirror of everything above from the client role — should go faster, all the mechanics are now familiar
 - Day 5: the four formal negative tests (no cert, wrong CA, expired, revoked) for `TESTING.md` — Phases 5 and 6 above are functionally rehearsals for two of these already
+
+## Week 2, Day 4 — mTLS client
+
+### Status: Complete. `src/client.c` implements socket connect, wolfSSL client context/cert/CA loading, server-cert verification, the handshake, and a minimal application-data send. Full round-trip proven against the project's own `server.c` — not wolfSSL's bundled example client standing in for it.
+
+### Design decisions
+
+**Client-side verify mode: `wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL)`, deliberately without `WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT`.** That flag makes cert presentation *mandatory* for whichever side is being verified — but a TLS server always sends its certificate as part of the protocol regardless, so on the client side it would be a no-op, not a meaningful hardening. Reasoned through explicitly rather than copy-pasted from `server.c`'s (correctly different) verify-mode call.
+
+**No `wolfSSL_read` after sending the message.** `server.c` is designed to log the client's message, not echo one back — so a client that waits to read a reply would just hit "connection closed" once the server closes the socket, exactly what happened when wolfSSL's own example client was used against this server on Day 3. Deliberately not repeating that here; the client just sends and exits cleanly.
+
+**Host/port kept as generic defaults (`127.0.0.1:4433`), but cert/key/CA paths are required arguments with no default** — same reasoning as `server.c`'s CLI-args fix, applied consistently this time. Host/port aren't tied to any one machine; a hardcoded absolute cert path is. Missing `-c`/`-k`/`-A` now prints a usage message and exits 1, rather than silently falling back to a path that only exists on one developer's machine.
+
+### A real mistake caught and fixed before this was "done"
+
+While writing `client.c`, its content was accidentally saved into `src/server.c` instead — overwriting the working, committed Day 3 server with client-only logic, and leaving no `client.c` file on disk at all. Caught immediately by actually reading the file back rather than assuming the save landed correctly. Since nothing had been committed on top of the accidental overwrite, recovery was a two-step, zero-risk fix: `git checkout HEAD -- src/server.c` to restore the real server unchanged, then save the client code to its actual file, `src/client.c`. Confirmed the restore was genuine (not just "no error") by grepping the restored file for server-only symbols (`my_verify_callback`, `wolfTLSv1_3_server_method`, `accept(`) before trusting it.
+
+This is exactly why committing at every real checkpoint (established habit since Week 1) matters beyond just "backup" — it turned what could have been a lost afternoon of work into a two-command fix.
+
+### Verification
+
+**Compiled clean**, `gcc -Wall -Wextra -g`, zero warnings, against the same rebuilt wolfSSL from Day 3.
+
+**Missing-args path tested on both binaries** — confirms the hardcoded-path fix actually works, not just compiles:
+```
+$ ./build/server.exe
+Usage: .../server.exe -c <server_cert.pem> -k <server_key.pem> -A <ca_cert.pem> -r <revoked_serials.txt>
+...
+
+$ ./build/client.exe
+Usage: .../client.exe -c <client_cert.pem> -k <client_key.pem> -A <ca_cert.pem> [-h <host>] [-p <port>]
+...
+```
+Both exit 1, neither silently falls back to a machine-specific path.
+
+**The actual milestone — two custom binaries, not one custom plus wolfSSL's example client:**
+
+Client output:
+```
+wolfSSL initialized; cert/key/CA loaded from client_cert.pem / client_key.pem / ca_cert.pem
+Connected to server.
+mTLS handshake succeeded.
+Sent: hello from client.c
+```
+
+Server output:
+```
+Raw TCP client connected.
+Verify callback: checking serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 against revocation list.
+Verify callback: serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 not revoked, proceeding.
+mTLS handshake succeeded.
+Client message: hello from client.c
+```
+
+The server printing `hello from client.c` verbatim — not wolfSSL's canned `hello wolfssl!` — is the actual proof this is genuinely two pieces of this project's own code completing a full TLS 1.3 mutual handshake with each other, real certs, real revocation check, zero errors on either side. Re-verified identically after the hardcoded-path fix above, confirming the fix didn't regress anything.
+
+### Bugs hit and how they were resolved
+1. Client code accidentally saved to `src/server.c` instead of `src/client.c` — caught and fixed as detailed above, no data actually lost since it had never been committed.
+2. Both binaries still had the Day-3-flagged-but-unresolved hardcoded absolute-path fallback issue; fixed properly this time in both files together rather than leaving it open again.
+
+### Next up
+- Week 2 Day 4 is complete
+- Day 5: the four formal negative tests (no client cert, wrong-CA cert, expired cert, revoked cert) against the real `client.c`/`server.c` pair, each with verbatim captured rejection output and a one-sentence explanation of exactly where in the handshake the rejection happened
