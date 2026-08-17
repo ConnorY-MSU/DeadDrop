@@ -128,6 +128,37 @@ A second, unrelated issue on the very first (TLS 1.2, unforced) test: both proce
 
 ---
 
+## Rebuild — Week 2, Day 3: adding `--enable-opensslextra`
+
+Writing the mTLS verify callback needed `wolfSSL_X509_STORE_CTX_get_current_cert` and `wolfSSL_X509_get_serial_number` — both part of wolfSSL's OpenSSL-compatibility layer, gated behind `OPENSSL_EXTRA`, which Day 1's build never enabled (no way to know it'd be needed yet). Confirmed the gap concretely before touching anything: `nm libwolfssl.a | grep wolfSSL_X509_STORE_CTX_get_current_cert` returned nothing — the symbol genuinely wasn't compiled in, not just a header-visibility issue.
+
+**Final working configure line:**
+```bash
+export MSYSTEM=UCRT64
+source /etc/profile
+cd /c/Users/yette/wolfssl
+make distclean
+./configure --enable-static --disable-shared --enable-debug --prefix=/ucrt64 \
+    --enable-opensslextra --disable-dependency-tracking
+make
+make install-nobase_includeHEADERS
+cp src/.libs/libwolfssl.a /ucrt64/lib/libwolfssl.a
+```
+
+Two flags different from Day 1, and the install step deliberately narrower than a plain `make install`. Each is a fix for a specific, separately-diagnosed problem:
+
+**`--enable-opensslextra`** — the actual goal; adds the OpenSSL-compatibility API surface, including the two functions above.
+
+**`--disable-dependency-tracking`** — works around a real autotools/MSYS2 bug, not a config choice. Re-running `./configure` (without a preceding `make distclean`) failed at the very end with `config.status: error: Something went wrong bootstrapping makefile fragments for automatic dependency tracking`. Root cause, confirmed by reading `config.log` directly: `config.status` spawns its own internal subshell to test-run `make`, and that subshell doesn't inherit the full PATH our interactive shell has — so `make: command not found` fires *inside configure itself*, corrupting the dependency-tracking bootstrap. This left a stale/wrong `libtool` script behind (its `old_archive_cmds` fell back to `lib -OUT:...`, the MSVC archiver syntax, instead of GNU `ar`) — confirmed by grepping the generated `libtool` file directly. Fix was two parts: `make distclean` to clear the corrupted intermediate state, then reconfigure with `--disable-dependency-tracking` so the buggy bootstrap step never runs. The clean reconfigure produced a correct `libtool` (`old_archive_cmds="$AR $AR_FLAGS ..."`) with zero manual patching needed.
+
+**`make install-nobase_includeHEADERS` + manual `.a` copy, instead of `make install`** — a plain `make install` recurses into every subdirectory including `tests/`, and wolfSSL's own bundled unit-test suite (`tests/unit.test.exe`, not anything this project uses) fails to link with `undefined reference to wolfSSL_ERR_print_errors`. Traced to `wolfssl/wolfcrypt/logging.h`: that function needs `WOLFSSL_HAVE_ERROR_QUEUE`, which is defined only under `#if (defined(OPENSSL_EXTRA) && !defined(_WIN32) && ...)` — deliberately excluded on Windows by wolfSSL upstream, regardless of `OPENSSL_EXTRA`. `libwolfssl.la`/`.a` and both example binaries had already linked successfully before this unrelated failure. Rather than chase down wolfSSL's own Windows test-suite gap, installed only the actual deliverables: the top-level `install-nobase_includeHEADERS` target (headers only, doesn't touch `tests/`) plus a direct copy of the freshly built `src/.libs/libwolfssl.a`.
+
+**A tooling gotcha worth remembering going forward**: the `Bash` tool available directly in this environment is Git Bash, not MSYS2's bash — it inherits the persistent Windows PATH (so `gcc` under `ucrt64/bin` resolves, since that was added system-wide in Week 1) but *not* MSYS2's `usr/bin`, where `make.exe`/`ar.exe`/`nm.exe` actually live. Every command touching the wolfSSL build tree has to go through `C:\msys64\usr\bin\bash.exe -lc "export MSYSTEM=UCRT64; source /etc/profile; ..."` explicitly, exactly like Day 1 — using the plain `Bash` tool alone silently fails with `command not found` for anything outside `gcc` itself.
+
+**Verified afterward, not assumed**: `nm /ucrt64/lib/libwolfssl.a | grep wolfSSL_X509_STORE_CTX_get_current_cert` (and the equivalent for `wolfSSL_X509_get_serial_number`) both confirmed real compiled symbols present, and `src/server.c` linked clean against the rebuilt library.
+
+---
+
 ## Related
 - [[06-Reference/Command Reference|Command Reference]]
 - [[02-Week 2 - TLS and mTLS/Week 2 Day 1 Walkthrough|Week 2 Day 1 Walkthrough]]
