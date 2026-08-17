@@ -481,3 +481,85 @@ The server printing `hello from client.c` verbatim — not wolfSSL's canned `hel
 ### Next up
 - Week 2 Day 4 is complete
 - Day 5: the four formal negative tests (no client cert, wrong-CA cert, expired cert, revoked cert) against the real `client.c`/`server.c` pair, each with verbatim captured rejection output and a one-sentence explanation of exactly where in the handshake the rejection happened
+
+## Week 2, Day 5 — Negative testing
+
+### Status: Complete. All four negative tests (no cert, wrong CA, expired, revoked) confirmed rejected, each for a distinct, correctly-identified reason. Happy path re-confirmed working after all four, per the Testing Standard's requirement to prove nothing regressed while building rejection logic.
+
+### A real client-side blind spot found and fixed before testing could even be trusted
+
+Running Test 2 first surfaced a genuine gap: the server's log clearly rejected the wrong-CA cert (`standard cert-chain verification failed`), but `client.c` printed `mTLS handshake succeeded.` anyway. Not a server bug — TLS 1.3 lets a client consider its own handshake "complete" the moment it sends its final flight, before the server's verdict on the client's certificate comes back, so a server-side rejection can arrive *after* `wolfSSL_connect()` already returned success. Since `client.c` (by Day 4's deliberate design) never read anything back, it had no way to ever notice this.
+
+Fixed by adding one `wolfSSL_read()` call after the message send. This is safe specifically because `server.c` always closes the socket immediately after handling a connection — accepted or rejected — so the read never blocks waiting on a reply that isn't coming (the concern that shaped Day 4's original no-read-back decision only applies to waiting for an *echoed application message*, which is a different thing from noticing the connection closed). The resulting error string cleanly distinguishes the two cases without any extra logic needed — wolfSSL's own wording already does it:
+- Benign close (happy path): `fatal I/O error in TLS layer`
+- Genuine rejection: `received alert fatal error`
+
+This is logged here rather than glossed over because it's a real example of why negative testing matters more than the happy path (per today's own walkthrough) — a passing happy-path test had been hiding a client-side observability gap that only a negative test could expose.
+
+### Test 1 — No client certificate
+
+| Field | Value |
+|---|---|
+| Method | wolfSSL's own example client, `-x` flag (disable client cert/key loading), pointed at this project's real CA, against the unmodified server |
+| Expected result | Rejected during the handshake, before any application data exchanged |
+| Actual result (server, verbatim) | `Raw TCP client connected.` then stderr: `Handshake failed: peer did not return a certificate` |
+| Pass/fail | **PASS** |
+
+**Why, precisely:** rejected before `my_verify_callback` ever ran at all — no "checking serial" log line appears, because there was no certificate to check. This is the most fundamental rejection point of the four: `WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT` makes presenting a certificate mandatory before verification logic gets a chance to run.
+
+### Test 2 — Wrong-CA certificate
+
+| Field | Value |
+|---|---|
+| Method | Generated a genuine second, throwaway CA (`throwaway-pki/`, outside the repo, disposable) and a client cert signed by it. Connected with this project's real `client.c`, pointing `-c`/`-k` at the throwaway-CA cert but keeping `-A` on this project's real CA (so the client still correctly trusts the server) |
+| Expected result | Server rejects — trusts only its own configured CA, not any certificate that happens to be validly signed by *something* |
+| Actual result (server, verbatim) | `Verify callback: standard cert-chain verification failed.` / `Handshake failed: certificate verify failed` |
+| Actual result (client, verbatim, after the read-back fix) | `mTLS handshake succeeded.` / `Sent: hello from client.c` / `Post-send read: received alert fatal error` |
+| Pass/fail | **PASS** |
+
+**Why, precisely:** rejected by wolfSSL's own built-in chain verification (`preverify_ok` was 0) before `my_verify_callback`'s own revocation-check logic ever ran — the certificate was well-formed and internally consistent, just signed by a CA this server was never configured to trust. Independently confirmed with plain `openssl verify -CAfile <real ca>`, which fails with `unable to get local issuer certificate` on the same cert.
+
+### Test 3 — Expired certificate
+
+| Field | Value |
+|---|---|
+| Method | Generated a client cert signed by this project's **real** CA (isolating the date check from the CA-trust question already covered by Test 2), backdated via `openssl x509 -req -not_before 20200101000000Z -not_after 20200201000000Z`. Connected with the real `client.c` |
+| Expected result | Server rejects specifically for expiration, not a generic chain failure |
+| Actual result (server, verbatim) | `Verify callback: standard cert-chain verification failed.` / `Handshake failed: ASN date error, current date is after expiration` |
+| Actual result (client, verbatim) | Same shape as Test 2: `mTLS handshake succeeded.` / `Sent: hello from client.c` / `Post-send read: received alert fatal error` |
+| Pass/fail | **PASS** |
+
+**Why, precisely:** same fail-fast point as Test 2 (`preverify_ok` 0, before the revocation callback logic runs) but with a distinctly different, specific reason string — `ASN date error, current date is after expiration` vs. Test 2's generic `certificate verify failed` — proving date-validity is a real, independently-enforced part of wolfSSL's chain verification, not something this project's code has to implement itself.
+
+### Test 4 — Revoked certificate
+
+| Field | Value |
+|---|---|
+| Method | This project's real, correctly-signed, non-expired client cert (`client_cert.pem`) — its actual serial (`68A7E95F14813C60A047706956F72BA0CCCC83F9`) added to `revoked_serials.txt`, server restarted (the list only loads at startup) |
+| Expected result | Rejected despite a completely valid chain — proves the Day 2 revocation module is load-bearing, not just present in the code |
+| Actual result (server, verbatim) | `Verify callback: checking serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 against revocation list.` then stderr: `Verify callback: serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 is REVOKED - rejecting.` / `Handshake failed: verify problem on certificate` |
+| Actual result (client, verbatim) | Same shape as Tests 2/3: `Post-send read: received alert fatal error` |
+| Pass/fail | **PASS** |
+
+**Why, precisely:** the only one of the four tests where `preverify_ok` was actually 1 and `my_verify_callback`'s own logic (not wolfSSL's built-in chain check) is what caught and rejected the connection — visible directly in the log, since "checking serial..." only ever appears once the chain itself has already passed. This is the concrete proof the revocation check is wired into the live handshake path, not dead code.
+
+### Part C — Confirm nothing broke
+
+Re-ran the exact Day 4 happy-path command one more time after all four negative tests, revoked-serials list cleared and server restarted:
+```
+Connected to server.
+mTLS handshake succeeded.
+Sent: hello from client.c
+Post-send read: fatal I/O error in TLS layer
+```
+Server: `mTLS handshake succeeded.` / `Client message: hello from client.c`. `fatal I/O error in TLS layer` (not `received alert fatal error`) confirms this is genuinely the benign case — building four rejection paths didn't make the verify callback or revocation check overly aggressive against the legitimate case.
+
+### Bugs hit and how they were resolved
+1. The client-side blind-spot finding detailed above — `client.c` couldn't previously detect a post-handshake server rejection at all; fixed with a post-send `wolfSSL_read()`, verified safe against the happy path first.
+2. `openssl req -subj "/C=US/..."` inside Git Bash: the leading `/C=US/...` gets auto-mangled into a Windows path by MSYS's path-conversion heuristics (`/C=US/...` looks enough like a drive-letter path to trigger it). Fixed with `MSYS_NO_PATHCONV=1` for just that command — and immediately unset afterward, since the same override breaks genuine `/c/Users/...` path arguments in other commands in the same session.
+3. Every actual test *result* was correct on the first real attempt once the client's read-back gap was fixed — no further surprises across Tests 3 and 4.
+
+### Next up
+- Week 2 Day 5 is complete — all five days of Week 2 are done
+- Still open, the user's own responsibility per the project's standing convention: Week 1 Self-Check Questions, Week 2 Day 1/3's Learning items, and [[Week 2 Self-Check Questions]]
+- Confirm [[00-Start Here/Four-Week Roadmap|Four-Week Roadmap]]'s "End of Week 2" checklist, then Week 3 (protocol design, WireGuard/Tailscale, memory safety)
