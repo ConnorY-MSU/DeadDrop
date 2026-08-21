@@ -819,3 +819,50 @@ Also visible as a side effect: `tailscale status` now shows this device by its t
 - Re-running the Day 2 interactive exchange over the real Tailscale path.
 - The `tshark`/Wireshark capture on the Tailscale interface.
 - The addressing decision itself (hardcoded IP vs. MagicDNS) — deferred until there's a real second device to decide it against.
+
+## Week 3, Day 4 — Benchmarking — 2026-08-21
+
+`src/benchmark.c` written (by the user): `run_handshake_benchmark()` (10,000 fresh TCP-connect-plus-full-mTLS-handshake iterations, timed from just before `wolfSSL_new()` to just after `wolfSSL_connect()` returns — deliberately includes SSL object setup, not just the wire round-trip, since that's genuinely part of this project's real per-connection cost) and `run_throughput_benchmark()` (one persistent connection, many `TEXT_MESSAGE` round-trips at a fixed payload size, timed send-to-ack). Run against an already-running `server.exe`, same cert/key/CA CLI args as `client.c`.
+
+### Two real bugs found by actually running it, not by reading it
+
+**1. `run_throughput_benchmark()` was missing `wolfSSL_KeepArrays(ssl)`** before its own `wolfSSL_connect()` call. `run_handshake_benchmark()` correctly had it; the throughput path does its own separate connect/handshake and didn't. Result: `sl_session_init()` failed on every throughput iteration with the exact Day 2 `wolfSSL_export_keying_material failed (rc=0, err=0: ok)` symptom, and both throughput benchmarks silently produced zero samples (the failure path `goto cleanup`s before `print_stats()` ever runs, so the final report didn't even show a "no samples collected" line for them — worth knowing if this class of failure ever recurs). **Fix:** added the missing call, with a comment cross-referencing why.
+
+**2. `open_tcp_connection()` still used `inet_pton()`**, unaware that `client.c` had already moved to `getaddrinfo()`-based resolution in the Day 3 prep commit (`ba6ab0d`) specifically because `inet_pton()` can't resolve a Tailscale MagicDNS hostname at all. Confirmed failing exactly as expected: `inet_pton failed for host 'localhost'`, where `client.exe` already succeeded on the same input. **Fix:** brought `open_tcp_connection()` in line with `client.c`'s exact `getaddrinfo()` pattern (including the `<netdb.h>` include benchmark.c's own copy of the portability shim was missing).
+
+**A third finding — now fixed too:** `run_handshake_benchmark()`'s loop recorded `samples[i]` from `t0`/`t1` before checking whether `wolfSSL_connect()` actually succeeded, so a failed handshake attempt's timing would have been silently mixed into the same stats as successful ones, with no visible failure count. Didn't manifest in any run today (zero handshake failures across 30,000+ total iterations across four full runs), but real gap in the methodology regardless. **Fix:** separated the loop counter (`i`, attempts) from a new `valid` counter (successful handshakes actually recorded into `samples[]`); a failed handshake now increments a `failures` counter instead of writing a sample, and a nonzero `failures` count is explicitly reported (`"N of M attempted handshakes failed and were excluded..."`) rather than silently absorbed. **Verified**: re-ran the full benchmark after the fix — `n=10000` (all handshakes counted, `valid` correctly reached the full iteration count with zero exclusions) and no failure-count line printed, confirming the fix doesn't spuriously trigger on a normal clean run:
+```
+Handshake (connect+TLS)      n=10000  min=  12.2912 ms  median=  13.9725 ms  mean=  13.9266 ms  max=  29.5377 ms
+Throughput (small payload)   n=2000   min=   0.0526 ms  median=   0.0574 ms  mean=   0.0652 ms  max=   0.4562 ms
+Throughput (large payload)   n=500    min=   0.6113 ms  median=   0.9560 ms  mean=   0.9590 ms  max=   2.3239 ms
+```
+Consistent with the prior two runs (see above). Full regression suite re-run once more after this fix too — still clean.
+
+### Verified — both fixes confirmed by actually re-running it, not just recompiling
+
+Full 10,000-iteration handshake run plus both throughput benchmarks, twice independently (once addressed by raw IP, once by hostname — the second run doubles as proof the `getaddrinfo()` fix genuinely works end to end, not just that it compiles):
+
+**By IP (`-h 127.0.0.1`):**
+```
+Handshake (connect+TLS)      n=10000  min=  12.7036 ms  median=  14.2351 ms  mean=  14.4251 ms  max=  62.1724 ms
+Throughput (small payload)   n=2000   min=   0.0580 ms  median=   0.0614 ms  mean=   0.0721 ms  max=   0.4948 ms
+Throughput (large payload)   n=500    min=   0.6215 ms  median=   0.9637 ms  mean=   0.9541 ms  max=   1.8660 ms
+```
+
+**By hostname (`-h localhost`) — proves the getaddrinfo() fix, wouldn't have run at all before it:**
+```
+Handshake (connect+TLS)      n=10000  min=  12.3684 ms  median=  14.0150 ms  mean=  14.1088 ms  max=  37.6308 ms
+Throughput (small payload)   n=2000   min=   0.0525 ms  median=   0.0569 ms  mean=   0.0668 ms  max=   0.3373 ms
+Throughput (large payload)   n=500    min=   0.5875 ms  median=   0.9374 ms  mean=   0.9398 ms  max=   2.6111 ms
+```
+
+Consistent across both runs, as expected (dev-machine numbers, **not final performance** — the program's own banner says so explicitly, and this needs re-running on the Pi once it's up in Week 4). Handshake latency (~12-14ms typical) is roughly 200x a single small-message round-trip (~0.06ms) — worth carrying into the write-up: a cost paid once per session is a very different thing from the same cost paid on every message.
+
+Note the max/median gap, especially on handshake (62ms max vs. ~14ms median in one run — over 4x): real tail latency, exactly the kind of thing an average alone would have hidden, per the walkthrough's own point about why min/median/max matters over a single number.
+
+Full five-binary regression suite re-run after both fixes: `test_revocation`, `test_sha256`, `test_aes128`, `test_hmac`, `test_message` — all still clean, unaffected (as expected — `benchmark.c` is a new standalone file, doesn't touch any of the tested modules).
+
+### Not yet done (Day 4)
+- Re-running on real Pi hardware once it's up (Week 4) — today's numbers are dev-machine only, clearly labeled as such both in the program's own banner and here.
+- The required README write-up paragraph (numbers-grounded judgment on whether this is fast enough for the stated use case) — not written yet.
+- Confirming this was built as a plain, non-sanitized release build (it was — same `gcc -Wall -Wextra -g` line as `client.c`/`server.c`, no `-fsanitize=` flags — worth restating explicitly here since Day 5's sanitizer build is coming next and it would be easy to conflate the two).
