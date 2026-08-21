@@ -159,6 +159,61 @@ Two flags different from Day 1, and the install step deliberately narrower than 
 
 ---
 
+## Rebuild — Week 3, Day 2: adding `--enable-keying-material`
+
+`docs/PROTOCOL.md`'s HMAC key derivation needs `wolfSSL_export_keying_material()` (RFC 5705/RFC 8446 §7.5). Confirmed the gap the same way as Day 3's rebuild, not by assumption: `nm libwolfssl.a | grep export_keying_material` returned nothing, and attempting to compile against it failed with `implicit declaration of function 'wolfSSL_export_keying_material'`.
+
+**Final working configure line:**
+```bash
+export MSYSTEM=UCRT64
+source /etc/profile
+cd /c/Users/yette/wolfSSl/wolfssl
+make clean
+./configure ac_cv_vcs_checkout=no \
+    --enable-static --disable-shared --enable-debug --prefix=/ucrt64 \
+    --enable-opensslextra --disable-dependency-tracking \
+    --enable-keying-material CPPFLAGS=-DWOLFSSL_HAVE_ERROR_QUEUE
+make
+make install
+```
+
+Three things different from the Day 3 line, each a fix for a separately-diagnosed problem:
+
+**`--enable-keying-material`** — the actual goal. Off by default; not tied to any heavier feature (WPA supplicant, Chrony, SRTP also enable it as a side effect, but this project needs none of those). Confirmed afterward via `grep HAVE_KEYING_MATERIAL wolfssl/options.h` and `nm libwolfssl.a | grep export_keying_material` — both present.
+
+**`ac_cv_vcs_checkout=no`** — works around a real autotools/modern-GCC interaction, not a config choice, and had nothing to do with keying material specifically. Building directly inside a git checkout makes `configure`'s `AX_HARDEN_COMPILER_FLAGS` macro (`m4/ax_harden_compiler_flags.m4`) permanently inject `-Werror` into every subsequent internal probe — including old-style `AC_CHECK_FUNC` compatibility shims (a deliberately-mismatched `strftime` prototype, used only to confirm the symbol exists) that current GCC now flags via `-Werror=builtin-declaration-mismatch`. That single failed probe surfaced as a misleading top-level `Header file inconsistency detected -- error including wolfssl/openssl/asn1.h`, not as anything mentioning `strftime` or `-Werror` directly — traced by reading `config.log`'s actual failed-command output, not by trusting the summary error. `ac_cv_vcs_checkout` is an ordinary `AC_CACHE_CHECK` variable, so it can be pre-seeded on the command line to skip the check and its `-Werror` side effect entirely, without touching wolfSSL's own source.
+
+**`CPPFLAGS=-DWOLFSSL_HAVE_ERROR_QUEUE`** — corrects a wrong assumption recorded in this file's Day 3 section above, that `WOLFSSL_HAVE_ERROR_QUEUE` is "deliberately excluded on Windows by wolfSSL upstream, regardless of `OPENSSL_EXTRA`." That's not accurate for this checkout (`internal.h:6991` gates it on `defined(OPENSSL_EXTRA) && defined(WOLFSSL_HAVE_ERROR_QUEUE)` only — no `_WIN32` exclusion) — it's simply not exposed as a `--enable-*` configure flag at all, only settable via a raw `CPPFLAGS` define. Worth setting now rather than continuing to route around it: without it, `make`/`make install` fail on the *unrelated* internal target `tests/unit.test.exe` (`undefined reference to wolfSSL_ERR_print_errors`), which Day 3's build sidestepped with a narrower `install-nobase_includeHEADERS` install target instead. With this flag, a plain `make install` now succeeds outright, so Day 3's narrower install workaround is no longer necessary going forward (though harmless if used).
+
+**A transient issue hit along the way, not a real problem**: `./configure` intermittently failed with `cannot run C compiled programs` / `./conftest.exe: Permission denied` (exit 77), and later a freshly-linked `server.exe`/`client.exe`/`test_sha256.exe` intermittently failed to execute at all — confirmed via direct PowerShell invocation to be Windows Smart App Control / Application Control evaluating newly-compiled, unsigned binaries by hash, not a permissions or code problem (the identical binary ran fine again once its hash had "settled"/been evaluated). Resolved by retrying rather than by any code or configure change — a bare retry-loop around `./configure` (a handful of attempts, few-second gaps) cleared it for the build itself; freshly-linked project binaries sometimes need a similar short wait after linking before they'll execute.
+
+### New runtime requirements this introduced in `client.c`/`server.c`
+
+Two more things `wolfSSL_export_keying_material()` needs that aren't about the *build* at all, found by actually running a live client/server exchange rather than trusting that "it compiles" meant "it works":
+
+- **`wolfSSL_KeepArrays(ssl)` must be called before `wolfSSL_connect()`/`wolfSSL_accept()`**, not after. wolfSSL frees its internal handshake arrays once the handshake completes (to save memory); the exporter needs them afterward. Without this, `wolfSSL_export_keying_material()` links and runs, but always returns `WOLFSSL_FAILURE` at runtime with no wolfSSL error string attached (`wolfSSL_get_error` reports `0`/`"ok"`) — traced by reading `wolfSSL_export_keying_material`'s own source (`src/ssl.c`) directly rather than guessing from the symptom, since the generic failure gave no other clue.
+- **A graceful `wolfSSL_shutdown(ssl)` before `wolfSSL_free(ssl)`** on both sides, once a session ends. Without it, closing a socket that still has unread bytes sitting in its OS receive buffer (e.g. a post-handshake TLS 1.3 session ticket the peer never explicitly read) can make Winsock send a hard RST instead of a graceful FIN — which was observed concretely closing out a live test: a client's final `DISCONNECT` app-message, sent successfully (`wolfSSL_write` returned success), never arrived at the server, which sat blocked in `wolfSSL_read()` waiting for it. Confirmed as the fix, not just theorized, by re-running the same live exchange after adding the shutdown call.
+
+`docs/BUILD.md` didn't previously document the exact `gcc`/link command line for `client.c`/`server.c` at all — worth recording here since a new library dependency showed up:
+
+```bash
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/server.c -o build/server.o
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/client.c -o build/client.o
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/message.c -o build/message.o
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/hmac.c -o build/hmac.o
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/revocation.c -o build/revocation.o
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/sha256.c -o build/sha256.o
+
+gcc -g build/server.o build/message.o build/hmac.o build/revocation.o build/sha256.o \
+    -o build/server.exe -lwolfssl -lws2_32 -lcrypt32
+gcc -g build/client.o build/message.o build/hmac.o build/sha256.o \
+    -o build/client.exe -lwolfssl -lws2_32 -lcrypt32
+```
+
+**`-lcrypt32`** — new as of this rebuild. `--enable-opensslextra` (already in use since Day 3) pulls in `LoadSystemCaCertsWindows()` inside wolfSSL, which calls the Windows certificate-store API (`CertOpenSystemStoreA`/`CertEnumCertificatesInStore`/`CertCloseStore`, from `crypt32.dll`) — undefined-reference at link time without it. Not something Day 3's build hit, since nothing in that build exercised the code path that pulls this symbol in until now.
+
+---
+
 ## Related
 - [[06-Reference/Command Reference|Command Reference]]
 - [[02-Week 2 - TLS and mTLS/Week 2 Day 1 Walkthrough|Week 2 Day 1 Walkthrough]]

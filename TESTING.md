@@ -643,3 +643,136 @@ Client message: hello from client.c
 **One thing worth flagging, not a bug:** the error string wolfSSL surfaces for this timeout (`non-blocking socket wants data to be read`, i.e. its internal `WANT_READ` condition) is the same shape of message normally meaning "retry me," not "this timed out and should be treated as fatal." Our code doesn't retry on it — correctly, in this context — but a future reader debugging server logs should know this specific message, in this specific spot, means the 30s timeout fired, not that something is misconfigured for non-blocking I/O.
 
 **Found one more, very minor, edge case in the truncation fix (Finding 4) while re-checking it by hand:** if the revoked-serials file's very last line is exactly 79 characters (one short of the 80-byte buffer) with no trailing newline (because the file simply ends there), the current logic would misidentify it as truncated and skip it, even though it's actually complete. Real revoked serials are ~40 hex characters, so this would need a file crafted to land exactly on that specific boundary to ever trigger — not fixed, given how narrow it is, but noted honestly rather than claiming the truncation fix is airtight in every conceivable case.
+
+## Week 3, Day 2 — Protocol implementation review — 2026-08-20
+
+`src/message.c`/`src/hmac.c` (`sl_serialize_message`/`sl_try_parse_message`/`sl_session_init`, plus a from-scratch `hmac_sha256` built on Week 1's own `sha256_context`) were written against `docs/PROTOCOL.md`'s exact spec. Reviewed line-by-line against the spec (byte offsets, HMAC coverage `[0, 12+N)`, key-derivation label, `seq_num` strictly-increasing rule, 65536-byte cap, failure-handling order) before ever compiling, then verified for real: built, linked, and run as a live client/server exchange over loopback, not just read for logical correctness.
+
+### Finding 1 (portability): `include/HMAC.H` / `src/HMAC.c` vs. `#include "hmac.h"`
+
+Both `message.c` and (its own) `HMAC.c` `#include "hmac.h"` (lowercase), but the actual header was `HMAC.H` (uppercase, `.H` extension). Compiles silently on Windows (NTFS is case-insensitive) but would fail to find the header at all on the Week 4 deployment target (Raspberry Pi OS, ext4 — case-sensitive) — the same category of Windows-only assumption as the earlier full-project audit's Finding 1. Also inconsistent with every other header in the project (`sha256.h`, `aes128.h`, `revocation.h`, `message.h`, `debug.h` are all lowercase).
+
+**Fix:** renamed both files to lowercase (`include/hmac.h`, `src/hmac.c`).
+
+### Finding 2 (blocker): `wolfSSL_export_keying_material()` wasn't actually compiled into the installed wolfSSL build
+
+`docs/PROTOCOL.md`'s own "Implementation note for Day 2" explicitly flagged this as a risk to check before implementing. Confirmed the gap concretely rather than assuming: `nm libwolfssl.a | grep export_keying_material` returned nothing, and compiling `message.c` failed with `implicit declaration of function 'wolfSSL_export_keying_material'`. The function exists in `ssl.h` but is gated behind `HAVE_KEYING_MATERIAL`, which the project's wolfSSL build (last configured Week 2 Day 3) never enabled.
+
+**Fix:** rebuilt wolfSSL with `--enable-keying-material` added to the configure line. Full details — including two more real problems hit along the way (a `-Werror`-from-git-checkout autoconf/GCC interaction, and a second missing feature flag needed for `make install` to succeed cleanly) and the exact final configure/build/link commands — are in `docs/BUILD.md`'s new "Rebuild — Week 3, Day 2" section rather than duplicated here.
+
+**Verified:** `grep HAVE_KEYING_MATERIAL wolfssl/options.h` and `nm libwolfssl.a | grep export_keying_material` both confirm the symbol is genuinely compiled in (not just declared) in the installed library.
+
+### Finding 3 (runtime bug, found only by actually running it): `wolfSSL_export_keying_material()` requires `wolfSSL_KeepArrays(ssl)` before the handshake
+
+Even after Finding 2's rebuild, a live client/server run failed at `sl_session_init()` on both sides — `wolfSSL_export_keying_material()` linked and ran, but returned `WOLFSSL_FAILURE` with no wolfSSL error attached (`wolfSSL_get_error` reported `0`/`"ok"`), which gave no clue from the symptom alone. Traced by reading `wolfSSL_export_keying_material`'s own implementation in wolfSSL's `src/ssl.c` directly: it requires `ssl->options.saveArrays` to be set, which only happens if `wolfSSL_KeepArrays(ssl)` is called *before* the handshake — wolfSSL frees its internal handshake arrays once the handshake completes, by default, to save memory.
+
+**Fix:** added `wolfSSL_KeepArrays(ssl)` in both `client.c` (before `wolfSSL_connect()`) and `server.c` (before `wolfSSL_accept()`), and a matching `wolfSSL_FreeArrays(ssl)` inside `sl_session_init()` itself right after a successful export, so the retained memory isn't held for the rest of a potentially long-lived interactive session.
+
+**Verified:** re-ran the live exchange; both sides derived a key and a real message round-trip succeeded (see below).
+
+**First successful live exchange (before Finding 4 below was found), verbatim:**
+```
+Client:
+Connected to server.
+mTLS handshake succeeded.
+Connected. Type a message and press Enter (or 'quit' to exit).
+> Server: ack: hello from client.c
+> Server: ack: ping test coming next... wait no lets just send another message
+>
+```
+```
+Server:
+Raw TCP client connected.
+Verify callback: ... not revoked, proceeding.
+mTLS handshake succeeded.
+Received TEXT_MESSAGE (seq=0, 19 bytes)
+Client message: hello from client.c
+Received TEXT_MESSAGE (seq=1, 63 bytes)
+Client message: ping test coming next... wait no lets just send another message
+```
+Correct `seq_num` tracking (0, then 1), correct body lengths, correct HMAC verification (a bad tag would have been silently rejected per the failure table, not echoed back), correct framing of two independently-typed messages.
+
+### Finding 4 (runtime bug, found only by actually running it): `DISCONNECT` sent by the client never arrived at the server
+
+Continuing the same live test past `quit`: the client's `send_message(..., SL_MSG_DISCONNECT, ...)` returned success (no error printed), but the server sat blocked in `wolfSSL_read()` indefinitely — `Received DISCONNECT` never appeared in its log, confirmed by checking back repeatedly over several seconds and confirming the server process was still alive and not merely slow.
+
+Root cause: neither `client.c` nor `server.c` called `wolfSSL_shutdown()` before `wolfSSL_free()` — both tore down the TLS session abruptly. On Windows/Winsock, closing a socket that still has unread bytes sitting in its receive buffer (e.g. a post-handshake TLS 1.3 session ticket the client never explicitly reads, since the client only calls `wolfSSL_read()` when it's expecting a reply) can make the OS send a hard RST instead of a graceful FIN — which can abort delivery of whatever was just sent immediately beforehand, in this case the `DISCONNECT` message, before the peer's application layer ever sees it.
+
+**Fix:** added `wolfSSL_shutdown(ssl)` before `wolfSSL_free(ssl)` on both the client's post-session path and the server's post-`handle_connection()` path — a single best-effort call (sends this side's `close_notify`, doesn't block waiting for the peer's own `close_notify` in return, so a peer that's already gone doesn't hang the caller).
+
+**Update — Smart App Control blocker resolved (user disabled it) and Finding 4 re-tested. The `wolfSSL_shutdown()` fix alone did *not* actually fix delivery — the real cause was something else entirely, found by instrumenting both sides directly rather than continuing to guess:**
+
+Added temporary debug output around the client's `DISCONNECT` send and the server's `wolfSSL_read()` call. Result: the server's `wolfSSL_read()` *did* return `n=44` (exactly a `DISCONNECT` message's size) — the bytes were arriving and being read all along. What was actually happening: `handle_connection()`'s `printf("Received %s (seq=%u, %u bytes)\n", ...)` had no `fflush()` after it (unlike the `TEXT_MESSAGE` branch three lines below it, which does), and neither did the `PING`/`PONG`/`DISCONNECT`-specific `printf`s further down. Because stdout is fully block-buffered when redirected to a file/pipe (not a TTY), those lines were sitting unflushed in the buffer while the server correctly finished the connection and went back to blocking in `accept()` for the next client — which, observed from outside, looks identical to a genuine hang. **The `wolfSSL_shutdown()`/`wolfSSL_KeepArrays()` fixes above were real and worth keeping (`KeepArrays` in particular is a genuine hard requirement, not optional), but the specific symptom that originally looked like a missing-`DISCONNECT` delivery bug was actually this logging gap the whole time.**
+
+**Fix:** added `fflush(stdout)` after the unconditional `"Received %s..."` line and after the `PING`/`PONG`/`DISCONNECT`-specific lines, so server-side log output is reliably visible in real time rather than only on process exit.
+
+**Verified — full live re-test, verbatim server output:**
+```
+Raw TCP client connected.
+Verify callback: checking serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 against revocation list.
+Verify callback: serial 68A7E95F14813C60A047706956F72BA0CCCC83F9 not revoked, proceeding.
+mTLS handshake succeeded.
+Received TEXT_MESSAGE (seq=0, 19 bytes)
+Client message: hello from client.c
+Received TEXT_MESSAGE (seq=1, 19 bytes)
+Client message: second message here
+Received DISCONNECT (seq=2, 0 bytes)
+Peer sent DISCONNECT - closing cleanly.
+```
+Server process confirmed still alive and correctly back in its accept loop afterward (checked via `tasklist`, not assumed) — proved by immediately running a **second**, independent client connection against the same still-running server, which worked cleanly with `seq_num` correctly reset to `0` for the new session (per `PROTOCOL.md`'s per-session-reset design) and its own clean `DISCONNECT`. **Finding 4 is now genuinely verified**, not just fixed-and-hoped.
+
+### Finding 5: `server.c`'s echo can exceed `SL_MAX_BODY_LEN` — fixed (truncate) and verified
+
+Decision (user's call, per this project's build-your-own-protocol-logic discipline): truncate the echoed body so `"ack: " + body` never exceeds `SL_MAX_BODY_LEN`, rather than dropping the prefix or failing the reply outright — a message this close to the cap is already an edge case on the sender's side, so losing a few trailing bytes of the *echo* is an acceptable tradeoff against dropping the whole reply (and connection) over it.
+
+**Fix:** `reply_len` explicitly capped to `SL_MAX_BODY_LEN` in `handle_connection()`'s `TEXT_MESSAGE` branch, after the existing buffer-size check.
+
+**Verified with a real boundary case, not just a code read:** sent a 65533-byte message (3 bytes under the cap) — small enough to be legal, large enough that `"ack: "` (5 bytes) pushes the natural echo to 65538, two bytes over. Server log confirmed the full message received intact (`Received TEXT_MESSAGE (seq=0, 65533 bytes)`, full 65533-byte body logged correctly), and the client's received reply measured out to exactly `SL_MAX_BODY_LEN` (65536) bytes — `"ack: "` plus 65531 of the original 65533 `A`s, the expected two-byte truncation, no more and no less. No crash, no dropped connection; the session's subsequent `DISCONNECT` was received and processed cleanly afterward, same as every other test.
+
+### Full regression check after all of the above
+`test_revocation.exe` (8/8), `test_aes128.exe`, `test_sha256.exe` — all still passing clean, no regressions from any of today's changes.
+
+### Finding 6 (closed the two remaining gaps flagged above): reconnect-with-backoff live-tested, and `message.c`/`hmac.c` unit tests added
+
+**Reconnect/backoff, live-tested for real** (previously implemented and code-reviewed only): started a real client/server session, sent a message, confirmed the ack, then killed the server process outright to simulate a real dropped connection while the client stayed running. Verbatim client output:
+```
+> Server: ack: message before drop
+> wolfSSL_write: fatal I/O error in TLS layer
+Disconnected - retrying in 1 second(s)...
+connect() failed: 10061
+Disconnected - retrying in 2 second(s)...
+connect() failed: 10061
+Disconnected - retrying in 4 second(s)...
+Connected to server.
+mTLS handshake succeeded.
+Connected. Type a message and press Enter (or 'quit' to exit).
+> Server: ack: message after reconnect
+```
+The drop was detected almost immediately (`wolfSSL_write` failed outright — Windows sends an RST when the peer process is killed, so this didn't need to fall back on the 30-second `SO_RCVTIMEO`), backoff correctly doubled on each failed retry (1s → 2s → 4s) while the server was down, and the very next attempt after the server came back succeeded. Server-side log for the post-reconnect session: `Received TEXT_MESSAGE (seq=0, 23 bytes)` — confirms `seq_num` correctly reset to 0 for the new session, exactly per `PROTOCOL.md`'s per-session design, not carried over from the dropped one.
+
+(Test-harness note, not a project bug: an initial attempt to script this used a named FIFO opened via `exec 3<>fifo` to keep the client's stdin alive across multiple sends — that produced an immediate spurious `DISCONNECT (seq=0)` from the client reading EOF on its very first `fgets()`, a Git-Bash/MSYS FIFO-emulation quirk, not a client.c bug. Switched to `tail -f` on a growing file as the client's stdin instead, which worked reliably.)
+
+**`message.c`/`hmac.c` unit tests added**: `tests/test_hmac.c` (RFC 4231 HMAC-SHA-256 test vectors — Test Cases 1, 2, 3, and 6; Case 6 specifically exercises the key-longer-than-block-size hashing branch none of the others touch) and `tests/test_message.c` (round-trip correctness against `PROTOCOL.md`'s own worked byte example, HMAC tag tamper detection, body tamper detection, exact-replay rejection, strictly-increasing `seq_num` acceptance, oversized `body_length` rejected with no safe resync point, partial/incomplete-message detection at two different boundaries, unrecognized-version and unrecognized-msg_type rejection each isolated with a freshly-recomputed valid HMAC so the rejection is provably about that specific field and not a coincidental tag mismatch, two independent messages parsed correctly out of one combined buffer, and `DISCONNECT`'s zero-length-body edge case) — 29 assertions total, all passing, isolated from wolfSSL/TLS entirely by populating `sl_session_state` with a fixed test key directly rather than going through `sl_session_init()`.
+
+Since the RFC 4231 vectors were transcribed from memory rather than a locally verifiable source (unlike Week 1's downloaded NIST PDF for SHA-256), independently cross-checked `hmac_sha256()` against wolfSSL's own mature `wc_Hmac` API on the same four inputs before trusting the result either way — all four agreed exactly, real independent confirmation rather than an implementation and its hand-typed expected value coincidentally sharing the same transcription error.
+
+```
+[PASS] RFC 4231 Test Case 1 (20-byte key)
+[PASS] RFC 4231 Test Case 2 (short key, "Jefe")
+[PASS] RFC 4231 Test Case 3 (0xdd-filled data)
+[PASS] RFC 4231 Test Case 6 (key > block size)
+
+ALL VECTORS PASSED
+```
+```
+[PASS] serialize returns correct total size (12+5+32) (got 49, expected 49)
+... (29 total)
+[PASS] DISCONNECT body_len is 0 (got 0, expected 0)
+
+ALL VECTORS PASSED
+```
+
+Full five-binary regression after adding both: `test_revocation` (8/8), `test_sha256`, `test_aes128`, `test_hmac` (4/4), `test_message` (29/29) — all clean.
+
+### Not yet done
+- POSIX branch of the portability shim (`server.c`/`client.c`, from the earlier full-project audit) is still unverified on real Linux — unchanged by today's work, still deferred to Week 4 Day 1 by design.
