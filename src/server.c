@@ -4,8 +4,32 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+/* Portability shim: this code has to run both here (Windows, dev machine)
+ * and, unchanged, on the Raspberry Pi (Linux) in Week 4 - Winsock and
+ * POSIX sockets differ in header, init/cleanup, socket type, error
+ * sentinels, close call, and how a socket-option timeout is expressed.
+ * Everything below this block is the only place that knowledge lives;
+ * the rest of the file uses the portable names on the right. */
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    typedef SOCKET socket_t;
+    #define SOCKET_INVALID INVALID_SOCKET
+    #define SOCKET_ERR_RET SOCKET_ERROR
+    #define CLOSE_SOCKET closesocket
+    #define SOCK_LAST_ERROR() WSAGetLastError()
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <errno.h>
+    typedef int socket_t;
+    #define SOCKET_INVALID (-1)
+    #define SOCKET_ERR_RET (-1)
+    #define CLOSE_SOCKET close
+    #define SOCK_LAST_ERROR() errno
+#endif
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
@@ -18,6 +42,42 @@
 
 #define SERIAL_BUF_SIZE 32
 
+/* How long a single connection is allowed to sit idle mid-handshake or
+ * mid-read before we give up on it. Without this, a stalled or malicious
+ * peer that opens a TCP connection and never completes the handshake (or
+ * completes it and then never sends anything) blocks this server - which
+ * handles exactly one connection at a time - from accepting anyone else,
+ * including the legitimate peer's own reconnect attempt. 30s is generous
+ * for a real handshake/read on a slow mobile network, short enough that a
+ * stalled connection doesn't lock everyone else out for long. */
+#define CONN_TIMEOUT_SECONDS 30
+
+static void set_socket_timeout(socket_t s)
+{
+#ifdef _WIN32
+    DWORD timeout_ms = CONN_TIMEOUT_SECONDS * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               (const char *)&timeout_ms, sizeof(timeout_ms));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
+               (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
+    struct timeval tv;
+    tv.tv_sec = CONN_TIMEOUT_SECONDS;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+/* ASSUMPTION: this project's PKI is single-level - the CA signs each
+ * device's leaf certificate directly, with no intermediate CAs (see
+ * docs/PKI_SETUP.md). wolfSSL_X509_STORE_CTX_get_current_cert() returns
+ * whichever certificate is currently being verified, which is only
+ * guaranteed to be the leaf when the chain has exactly one certificate
+ * in it. If an intermediate CA is ever introduced, this callback would
+ * need to explicitly walk to the leaf (e.g. via depth 0) rather than
+ * trusting "current cert" to mean "the peer's own cert" - untested,
+ * revisit before adding any intermediate CA to this project's PKI. */
 static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
 {
     WOLFSSL_X509 *cert;
@@ -102,11 +162,13 @@ static void parse_args(int argc, char *argv[],
 
 int main(int argc, char *argv[])
 {
-    WSADATA wsa_data;
-    SOCKET listen_sock = INVALID_SOCKET;
+    socket_t listen_sock = SOCKET_INVALID;
     struct sockaddr_in server_addr;
     WOLFSSL_CTX *ctx = NULL;
     int rc;
+#ifdef _WIN32
+    WSADATA wsa_data;
+#endif
 
     const char *cert_path = NULL;
     const char *key_path = NULL;
@@ -129,17 +191,22 @@ int main(int argc, char *argv[])
     } else {
         printf("Loaded revoked-serials list: %s\n", revoked_path);
     }
+
+#ifdef _WIN32
     rc = WSAStartup(MAKEWORD(2, 2), &wsa_data);
     if (rc != 0) {
         fprintf(stderr, "WSAStartup failed: %d\n", rc);
         return 1;
     }
+#endif
 
     /* --- wolfSSL init + context --- */
     rc = wolfSSL_Init();
     if (rc != WOLFSSL_SUCCESS) {
         fprintf(stderr, "wolfSSL_Init failed: %d\n", rc);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -147,7 +214,9 @@ int main(int argc, char *argv[])
     if (ctx == NULL) {
         fprintf(stderr, "wolfSSL_CTX_new failed\n");
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -158,7 +227,9 @@ int main(int argc, char *argv[])
             rc, cert_path);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -169,7 +240,9 @@ int main(int argc, char *argv[])
             rc, key_path);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -180,7 +253,9 @@ int main(int argc, char *argv[])
             rc, ca_path);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -191,11 +266,13 @@ int main(int argc, char *argv[])
         my_verify_callback);
 
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listen_sock == INVALID_SOCKET) {
-        fprintf(stderr, "socket() failed: %d\n", WSAGetLastError());
+    if (listen_sock == SOCKET_INVALID) {
+        fprintf(stderr, "socket() failed: %d\n", SOCK_LAST_ERROR());
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -211,22 +288,26 @@ int main(int argc, char *argv[])
     server_addr.sin_port = htons(SERVER_PORT);
 
     rc = bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    if (rc == SOCKET_ERROR) {
-        fprintf(stderr, "bind() failed: %d\n", WSAGetLastError());
-        closesocket(listen_sock);
+    if (rc == SOCKET_ERR_RET) {
+        fprintf(stderr, "bind() failed: %d\n", SOCK_LAST_ERROR());
+        CLOSE_SOCKET(listen_sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
     rc = listen(listen_sock, LISTEN_BACKLOG);
-    if (rc == SOCKET_ERROR) {
-        fprintf(stderr, "listen() failed: %d\n", WSAGetLastError());
-        closesocket(listen_sock);
+    if (rc == SOCKET_ERR_RET) {
+        fprintf(stderr, "listen() failed: %d\n", SOCK_LAST_ERROR());
+        CLOSE_SOCKET(listen_sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -234,18 +315,23 @@ int main(int argc, char *argv[])
     fflush(stdout);
 
     for (;;) {
-        SOCKET client_sock = accept(listen_sock, NULL, NULL);
-        if (client_sock == INVALID_SOCKET) {
-            fprintf(stderr, "accept() failed: %d\n", WSAGetLastError());
-            continue; 
+        socket_t client_sock = accept(listen_sock, NULL, NULL);
+        if (client_sock == SOCKET_INVALID) {
+            fprintf(stderr, "accept() failed: %d\n", SOCK_LAST_ERROR());
+            continue;
         }
         printf("Raw TCP client connected.\n");
         fflush(stdout);
 
+        /* See CONN_TIMEOUT_SECONDS above: bounds how long a single stalled
+         * or malicious connection can block every other connection,
+         * including the legitimate peer's own reconnect attempt. */
+        set_socket_timeout(client_sock);
+
         WOLFSSL *ssl = wolfSSL_new(ctx);
         if (ssl == NULL) {
             fprintf(stderr, "wolfSSL_new failed\n");
-            closesocket(client_sock);
+            CLOSE_SOCKET(client_sock);
             continue;
         }
 
@@ -276,14 +362,28 @@ int main(int argc, char *argv[])
         }
 
         wolfSSL_free(ssl);
-        closesocket(client_sock);
+        CLOSE_SOCKET(client_sock);
     }
 
-    closesocket(listen_sock);
+    /* KNOWN GAP, not yet fixed: the loop above never breaks, so
+     * everything from here down is currently unreachable. Neither this
+     * process nor systemd's default `systemctl stop` (which sends
+     * SIGTERM) installs a signal handler, so today a stop/restart is an
+     * abrupt kill, not a graceful shutdown through this cleanup path.
+     * Fixing this properly needs a signal handler whose exact shape
+     * differs by platform (POSIX signal()/sigaction() vs Windows
+     * SetConsoleCtrlHandler(), and a blocking accept() needs to actually
+     * be interrupted, not just have a flag checked around it) - left
+     * unimplemented here rather than guessed at and left unverified on
+     * a platform this can't currently be tested on. Revisit in Week 4
+     * once this is building and running natively on the Pi. */
+    CLOSE_SOCKET(listen_sock);
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();
     revocation_free();
+#ifdef _WIN32
     WSACleanup();
+#endif
 
     return 0;
 }

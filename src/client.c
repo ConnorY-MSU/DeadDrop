@@ -4,8 +4,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+/* Portability shim - see the matching block in server.c for why this
+ * exists: this code runs both here (Windows) and, unchanged, on the
+ * Raspberry Pi (Linux) in Week 4. */
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    typedef SOCKET socket_t;
+    #define SOCKET_INVALID INVALID_SOCKET
+    #define SOCKET_ERR_RET SOCKET_ERROR
+    #define CLOSE_SOCKET closesocket
+    #define SOCK_LAST_ERROR() WSAGetLastError()
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <errno.h>
+    typedef int socket_t;
+    #define SOCKET_INVALID (-1)
+    #define SOCKET_ERR_RET (-1)
+    #define CLOSE_SOCKET close
+    #define SOCK_LAST_ERROR() errno
+#endif
 
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
@@ -54,12 +75,14 @@ static void parse_args(int argc, char *argv[],
 
 int main(int argc, char *argv[])
 {
-    WSADATA wsa_data;
-    SOCKET sock = INVALID_SOCKET;
+    socket_t sock = SOCKET_INVALID;
     struct sockaddr_in server_addr;
     WOLFSSL_CTX *ctx = NULL;
     WOLFSSL *ssl = NULL;
     int rc;
+#ifdef _WIN32
+    WSADATA wsa_data;
+#endif
 
     const char *host = DEFAULT_HOST;
     int port = DEFAULT_PORT;
@@ -74,16 +97,26 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (port < 1 || port > 65535) {
+        fprintf(stderr, "Invalid port '%d' - must be 1-65535 "
+                         "(did -p get a non-numeric value?)\n", port);
+        return 1;
+    }
+
+#ifdef _WIN32
     rc = WSAStartup(MAKEWORD(2, 2), &wsa_data);
     if (rc != 0) {
         fprintf(stderr, "WSAStartup failed: %d\n", rc);
         return 1;
     }
+#endif
 
     rc = wolfSSL_Init();
     if (rc != WOLFSSL_SUCCESS) {
         fprintf(stderr, "wolfSSL_Init failed: %d\n", rc);
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -91,7 +124,9 @@ int main(int argc, char *argv[])
     if (ctx == NULL) {
         fprintf(stderr, "wolfSSL_CTX_new failed\n");
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -102,7 +137,9 @@ int main(int argc, char *argv[])
             rc, cert_path);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -113,7 +150,9 @@ int main(int argc, char *argv[])
             rc, key_path);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -124,7 +163,9 @@ int main(int argc, char *argv[])
             rc, ca_path);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -134,11 +175,13 @@ int main(int argc, char *argv[])
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        fprintf(stderr, "socket() failed: %d\n", WSAGetLastError());
+    if (sock == SOCKET_INVALID) {
+        fprintf(stderr, "socket() failed: %d\n", SOCK_LAST_ERROR());
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -147,20 +190,24 @@ int main(int argc, char *argv[])
     server_addr.sin_port = htons((unsigned short)port);
     if (inet_pton(AF_INET, host, &server_addr.sin_addr) != 1) {
         fprintf(stderr, "inet_pton failed for host '%s'\n", host);
-        closesocket(sock);
+        CLOSE_SOCKET(sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
     rc = connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    if (rc == SOCKET_ERROR) {
-        fprintf(stderr, "connect() failed: %d\n", WSAGetLastError());
-        closesocket(sock);
+    if (rc == SOCKET_ERR_RET) {
+        fprintf(stderr, "connect() failed: %d\n", SOCK_LAST_ERROR());
+        CLOSE_SOCKET(sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
     printf("Connected to server.\n");
@@ -168,10 +215,12 @@ int main(int argc, char *argv[])
     ssl = wolfSSL_new(ctx);
     if (ssl == NULL) {
         fprintf(stderr, "wolfSSL_new failed\n");
-        closesocket(sock);
+        CLOSE_SOCKET(sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
 
@@ -184,10 +233,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Handshake failed: %s\n",
                 wolfSSL_ERR_error_string(err, errbuf));
         wolfSSL_free(ssl);
-        closesocket(sock);
+        CLOSE_SOCKET(sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
+#ifdef _WIN32
         WSACleanup();
+#endif
         return 1;
     }
     printf("mTLS handshake succeeded.\n");
@@ -234,10 +285,12 @@ int main(int argc, char *argv[])
     }
 
     wolfSSL_free(ssl);
-    closesocket(sock);
+    CLOSE_SOCKET(sock);
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();
+#ifdef _WIN32
     WSACleanup();
+#endif
 
     return 0;
 }
