@@ -1020,6 +1020,81 @@ On an incoming `TEXT_MESSAGE`: a bounded, `NUL`-terminated preview (`msg.body` i
 **Live-tested that this wiring doesn't disturb the actual protocol** (same as the RGB wiring): full client/server exchange, byte-for-byte identical server/client output to before the notification code existed. Full five-binary regression suite re-run clean.
 
 ### Not yet done / explicitly deferred
-- All real hardware verification — everything above needs to actually run on the Pi with the real case attached before any of it can be called "working." Do not report this as tested or working anywhere until that's genuinely happened.
+- All real hardware verification — everything above needs to actually run on the Pi with the real case attached before any of it can be called "working." Do not report this as tested or working anywhere until that's genuinely happened. **Update, same day (see Week 4 Day 1 section below): the compile-only part of this is now resolved** — `hw_expansion.c`/`hw_oled.c`/`hw_tts.c` have genuinely compiled clean on real Linux for the first time. Real I2C peripheral behavior (the OLED actually rendering text, the RGB light actually changing color) is still unverified — I2C hasn't been enabled via `raspi-config` yet.
 - Fan speed control (`REG_FAN_MODE`/`REG_FAN_DUTY`, same expansion board) — not built, wasn't asked for (the request was specifically RGB-for-status, not cooling control).
-- Confirming `espeak-ng` is actually available on Raspberry Pi OS's default package repos (near-certain, but not independently confirmed the way the OLED/RGB protocol details were).
+- Confirming `espeak-ng` is actually available on Raspberry Pi OS's default package repos — still not independently confirmed (not installed yet).
+
+## Week 4, Day 1 — Real Pi hardware bring-up — 2026-08-21
+
+First time this project has run on its actual deployment target. Two Raspberry Pi 5 (4GB) in FNK0100 cases, `securelink-alpha` and `securelink-bravo`. Executed directly via SSH from the dev machine (both Pis reachable on the same LAN as the dev laptop) rather than relayed as instructions — every step below was actually run and its real output checked, not assumed from a command's exit code alone where a real check was possible.
+
+### Flashing and first boot
+Raspberry Pi OS Lite (64-bit), SSH key-only auth and WiFi credentials baked in at image time via Raspberry Pi Imager's advanced options (avoids the classic headless-lockout risk of configuring this after first boot). A dedicated SSH key (`~/.ssh/securelink_pi`, ed25519) was generated specifically for this rather than reusing any other key. Both units reachable via `securelink-alpha.local`/`securelink-bravo.local` (mDNS) on first attempt.
+
+### A real hardware assembly issue, found and fixed before any software work started
+One unit wouldn't power on via the case's own exterior USB-C port while the other worked fine. Isolated methodically using the working unit as a reference rather than guessing: power supply swap (cleared the supply as a cause), then the bare-Pi-outside-the-case test (confirmed the Pi board itself and the case's adapter/header board were both fine — powering the Pi directly also powered everything downstream correctly). Root cause found by reading Freenove's actual assembly manual (`Tutorial.pdf`, extracted via `pdftotext`) rather than guessing at cable layouts: the case's exterior Type-C port isn't a separate cable — the Pi 5's own Type-C/HDMI0/HDMI1 ports plug **directly into matching connectors on the Case Adapter Board** via precise board-to-board alignment. Re-seating that alignment fixed it.
+
+### SSH hardening — confirmed already correct from first boot, not something that needed fixing
+Checked the *effective* runtime sshd config (`sudo sshd -T`), not just grepped the raw config file (a raw grep of `sshd_config` alone was inconclusive — only showed `KbdInteractiveAuthentication no`, a different setting from `PasswordAuthentication`). Effective config on both: `passwordauthentication no`, `pubkeyauthentication yes`. **Proved the negative case empirically, not just trusted the config**: an explicit password-only SSH attempt (`-o PreferredAuthentications=password -o PubkeyAuthentication=no`) was genuinely rejected (`Permission denied (publickey)`) on both — same "prove the rejection, don't just assume it" discipline as Week 2 Day 5's negative tests.
+
+### Passwordless sudo — a deliberate, explicit decision, not a default
+Needed for the rest of Day 1's automation. User explicitly declined to share their account password (correctly — a password typed into a chat session sits in plaintext history indefinitely, for zero benefit over the alternative); instead ran a one-time bootstrap themselves per-Pi (`echo "connor ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/010-connor-nopasswd`, validated with `visudo -c` before trusting it). Confirmed working (`sudo -n true`) on both before relying on it for anything.
+
+### System update, dependencies, native wolfSSL build — all real, all verified
+- `apt update`/`apt upgrade -y`: 95 packages on each, included a kernel update (6.18.34 → 6.18.39), clean on both, no errors.
+- Build dependencies (`build-essential libncurses-dev git autoconf automake libtool pkg-config`): clean install on both.
+- wolfSSL cloned fresh from the official upstream repo (no version pinned in this project's own docs, so current release was the sensible default) and built natively with the same flags as the dev-machine's Week 3 Day 2 rebuild (`ac_cv_vcs_checkout=no --enable-static --disable-shared --enable-debug --prefix=/usr/local --enable-opensslextra --enable-keying-material CPPFLAGS=-DWOLFSSL_HAVE_ERROR_QUEUE`) — every one of those flags exists because of a specific, previously-diagnosed problem, so all were carried forward rather than re-discovered the hard way. Configured, built (`make -j4`), and installed cleanly on the **first attempt** on both — notably, the `ac_cv_vcs_checkout=no`-guarded `-Werror`/modern-GCC interaction that caused real trouble on the Windows/MSYS2 dev-machine build never recurred here (defensively included anyway; harmless if unneeded).
+- Verified for real, not assumed: `grep HAVE_KEYING_MATERIAL /usr/local/include/wolfssl/options.h` and `nm /usr/local/lib/libwolfssl.a | grep export_keying_material` both confirmed present on both Pis.
+
+### Full SecureLink codebase — first native ARM build, first native ARM test run
+
+Cloned from `github.com/ConnorY-MSU/SecureLink` at the latest commit (`35f9490`, includes the Week 4 hardware modules). Compiled every source file with `gcc -Wall -Wextra -g` — **zero warnings, zero errors, on the first attempt, on both Pis**, including `hw_expansion.c`/`hw_oled.c`/`hw_tts.c`, which had never been compiled at all before this moment (no Windows equivalent existed to even syntax-check them against — this was the actual, real resolution of that open item from earlier today's "Week 4 prep" section).
+
+**All 5 unit tests, run natively, verbatim, both Pis:**
+```
+test_sha256:     ALL VECTORS PASSED
+test_aes128:     ALL VECTORS PASSED
+test_revocation: ALL VECTORS PASSED
+test_hmac:       ALL VECTORS PASSED
+test_message:    ALL VECTORS PASSED
+```
+Identical to every dev-machine run of the same tests — no ARM-specific behavioral differences found (endianness, struct padding, or compiler-default differences were all things worth checking for per the walkthrough's own guidance; none surfaced).
+
+`server`, `client`, and `benchmark` also compiled and linked clean. Running them confirmed the hardware modules' absence-handling works exactly as designed in practice, not just in review: `hw_expansion_open`/`hw_oled_open` both logged `cannot open /dev/i2c-1 (case hardware absent or I2C not enabled? continuing without it)` and the server kept running normally — I2C hasn't been enabled via `raspi-config` yet (next real step for that work, per the Week 4 Build Log's own checklist).
+
+### First genuine two-device network test this project has ever had
+
+`alpha` as server, `bravo` as client, real WiFi LAN (not loopback, not localhost) — using the existing, already-trusted dev-machine cert pair (deliberately: the CA private key never touched either Pi, matching Week 2's own PKI design; only `server_cert.pem`/`server_key.pem`/`ca_cert.pem` went to `alpha`, only `client_cert.pem`/`client_key.pem`/`ca_cert.pem` went to `bravo`). Verbatim, both sides:
+```
+Client (bravo): Connected to server. / mTLS handshake succeeded. / Server: ack: hello from bravo, the real deal!
+Server (alpha): Verify callback: serial ... not revoked, proceeding. / mTLS handshake succeeded.
+                Received TEXT_MESSAGE (seq=0, 32 bytes) / Client message: hello from bravo, the real deal!
+                Received DISCONNECT (seq=1, 0 bytes) / Peer sent DISCONNECT - closing cleanly.
+```
+Note: generating genuinely separate per-device PKI identities for `alpha`/`bravo` (each with its own key, its own CSR signed by the dev-machine CA) rather than reusing the existing shared test-cert pair is still open — reasonable for today's connectivity proof, but worth doing properly (matching the Day 6 rotation-drill pattern) before calling device identity "real."
+
+### Tailscale on real hardware
+Installed and authenticated on both (interactive browser approval, necessarily done by the user — same category as every other browser-auth step this project has hit). Real Tailscale IPs assigned (`100.124.177.123` / `100.103.41.44`). `tailscale ping` confirmed a genuine **direct peer-to-peer path** (not relayed through DERP): `pong from securelink-bravo ... via 192.168.113.214:41641 in 27ms`.
+
+**ACL tags applied and verified**, extending Week 3's already-pasted policy: `alpha` → `tag:securelink-server`, `bravo` → `tag:securelink-client`, confirmed via `tailscale whois` on both (not just trusted from the `up` command's exit code — same discipline as Week 3's dev-machine tagging). Dev machine keeps its own `tag:securelink-client` for now (deliberate choice, to allow continued dev-machine-to-Pi testing during development) — revisit before considering the project's real deployed pair finished, since the actual end-state shouldn't need the dev machine in this ACL.
+
+Key expiry disable for both devices: handed to the user (admin-console-only, no CLI equivalent) — not yet confirmed done.
+
+### NetworkManager confirmed — with one genuinely new detail
+`systemctl is-active NetworkManager` → active, `nmcli device status` shows `wlan0` managed correctly on both. **New finding, not anticipated by the original Bullseye-vs-Bookworm dhcpcd-vs-NetworkManager framing**: the WiFi connection profile is named `netplan-wlan0-BDH-public` — this OS image layers **netplan on top of NetworkManager** (netplan generates the NM profile), not NetworkManager acting fully standalone. `nmcli` should still work fine for Days 2-3's WiFi setup screen (it manages NetworkManager connections directly regardless of who created them), but a profile added purely via `nmcli` might not be reflected back into netplan's own config — worth verifying specifically when Days 2-3's WiFi setup screen is actually built, not assumed fine by analogy.
+
+### Console auto-login and full reboot verification
+`raspi-config nonint do_boot_behaviour B2` on both; verified the actual systemd override file exists and targets the right user (`ExecStart=-/sbin/agetty --autologin connor ...`) rather than trusting the command's exit code alone. Both Pis rebooted for real (not just the config checked) — full verification after reboot, all real, all checked:
+```
+kernel:        6.18.39+rpt-rpi-2712 (confirms the earlier apt upgrade's kernel update took effect)
+auto-login:    connor  tty1  <reboot timestamp>  (zero manual login)
+sudo:          passwordless, survived reboot
+tailscale:     Running, both peers visible, reconnected automatically with no manual re-auth
+build/:        all artifacts survived (server, client, test_message, etc. all present)
+```
+
+### Not yet done (Day 1)
+- Key expiry disable for both Pis in the Tailscale admin console — handed to the user, not yet confirmed.
+- I2C not yet enabled (`raspi-config` → Interface Options → I2C) — needed before any of the hardware modules can be verified against real silicon, not just confirmed to compile and fail gracefully.
+- Per-device PKI identities for `alpha`/`bravo` (currently reusing the shared dev-machine test cert pair for the connectivity proof) — real, worth doing, not done today.
+- `espeak-ng` not yet installed on either Pi.
