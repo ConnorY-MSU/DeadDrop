@@ -563,3 +563,61 @@ Server: `mTLS handshake succeeded.` / `Client message: hello from client.c`. `fa
 - Week 2 Day 5 is complete — all five days of Week 2 are done
 - Still open, the user's own responsibility per the project's standing convention: Week 1 Self-Check Questions, Week 2 Day 1/3's Learning items, and [[Week 2 Self-Check Questions]]
 - Confirm [[00-Start Here/Four-Week Roadmap|Four-Week Roadmap]]'s "End of Week 2" checklist, then Week 3 (protocol design, WireGuard/Tailscale, memory safety)
+
+## Full-project audit — 2026-08-20
+
+A deliberate, full read-through of the existing codebase and curriculum, looking for gaps and technical problems rather than building new features. Full findings and fixes below; status: all code-level findings fixed and re-verified against the existing test suite (nothing regressed), curriculum-level finding fixed by restructuring the affected days.
+
+### Finding 1 (major): `server.c`/`client.c` were Windows-only
+
+Discovered while implementing the timeout fix below (Finding 2) — both files used `winsock2.h`/`ws2tcpip.h`, `WSAStartup`/`WSACleanup`, `SOCKET`, `closesocket`, `WSAGetLastError`, none of which exist on Linux. As written, neither file would have compiled at all on the Raspberry Pi — Week 4's entire deployment target.
+
+**Fix:** added a portability shim (`#ifdef _WIN32` / `#else`) in both files covering: headers, socket type (`socket_t`), invalid/error sentinels, close call, and error-code retrieval. `WSAStartup`/`WSACleanup` are now compiled only under `_WIN32`. The POSIX branch is written to standard POSIX socket API conventions but has not been compiled or run on Linux yet — that verification has to happen for real once Week 4 Day 1 builds natively on the Pi, same "verify against the real target, don't assume" discipline as every wolfSSL flag this project has hit so far.
+
+**Verified:** recompiled clean (zero warnings) on the `_WIN32` path, reran the full existing test suite (`test_revocation.c`, 8/8) and a live client/server mTLS handshake — identical results to before the change.
+
+### Finding 2 (major): no connection timeout; server is single-threaded and sequential
+
+`server.c`'s `accept()` loop fully handles one connection (accept → handshake → read → close) before accepting the next, with no timeout anywhere. A stalled or malicious peer that opens a connection and never completes the handshake blocks the server from accepting *anyone* else — including the legitimate peer's own Week 3 Day 2 reconnect attempt.
+
+**Fix:** added `set_socket_timeout()`, applied to each accepted client socket before the handshake begins — `SO_RCVTIMEO`/`SO_SNDTIMEO`, 30 seconds (generous for a real handshake on a slow/mobile network, short enough that one stalled connection doesn't lock everyone else out for long). Implemented per-platform inside the same portability shim (Windows: `DWORD` milliseconds; POSIX: `struct timeval`).
+
+**Verified:** same recompile/retest as Finding 1 — no behavior change on the happy path, confirmed by the same live handshake test.
+
+### Finding 3: `revocation.c`'s buffer was one byte too small for what `server.c` could hand it
+
+`server.c`'s `SERIAL_BUF_SIZE` (32 raw bytes) means its `serial_hex` string can be up to 64 hex characters. `revocation.c`'s old `MAX_SERIAL_LEN` was 64, but `strncpy(..., MAX_SERIAL_LEN - 1)` only copied 63 usable characters, silently truncating a maximum-length serial. Two 64-character serials differing only in the last character would have collided after truncation. Not currently exploitable (real X.509 serials are ≤40 hex chars per RFC 5280, and the CA is fully trusted/controlled), but a genuine sizing mismatch between two files that should agree.
+
+**Fix:** `MAX_SERIAL_LEN` raised to 80, with a comment explaining the derivation (32-byte `SERIAL_BUF_SIZE` → 64 hex chars → margin, not a tight fit) so the next person to touch either constant sees the dependency.
+
+**Verified:** `test_revocation.c`, 8/8 passing, unchanged.
+
+### Finding 4: `revocation_load()` had no defense against an over-length line
+
+`fgets()` would silently split a line longer than the read buffer across two calls, loading the leftover tail as its own bogus, unrelated "revoked serial" entry — low risk given the controlled file format (real entries are ~40 chars, well under the buffer), but a real robustness gap.
+
+**Fix:** detect truncation (line fills the buffer with no trailing `\n`), discard the remainder of that line via `fgetc()`, warn, and skip the entry entirely rather than partially loading it.
+
+**Verified:** `test_revocation.c`, 8/8 passing, unchanged (none of the existing test fixtures exercise this path, since none of them use an over-length line — the fix is defensive, not a behavior change for any currently-tested input).
+
+### Finding 5 (documented, not changed): verify callback assumes a single-level cert chain
+
+`wolfSSL_X509_STORE_CTX_get_current_cert()` returns whichever certificate is currently being verified, which is only guaranteed to be the leaf when the chain has exactly one certificate. This project's PKI is single-level by design (CA signs each device's leaf cert directly, no intermediates), so this is correct today — already empirically proven by every passing revocation test, which specifically checks the leaf's own serial. Documented as an explicit assumption directly in `server.c` (comment above `my_verify_callback`) so it's not silently wrong if an intermediate CA is ever introduced later.
+
+### Finding 6 (documented, not changed): `server.c`'s cleanup code is unreachable
+
+The `for (;;)` accept loop never breaks, so the cleanup code after it (`CLOSE_SOCKET`, `wolfSSL_CTX_free`, `revocation_free`, etc.) never runs under normal operation. Neither `server.c` nor `client.c` installs a signal handler, so `systemctl stop` (which sends `SIGTERM`) would terminate the process exactly as abruptly as `kill -9` does today — the graceful-shutdown path Week 4 Day 5's crash test doesn't actually exercise, since that test uses `kill -9` specifically. Left unimplemented rather than guessed at: a correct fix needs platform-specific signal handling (POSIX `signal()`/`sigaction()` vs. Windows `SetConsoleCtrlHandler()`) and a way to actually interrupt a blocking `accept()` call, neither of which can be verified from this dev environment. Documented directly in `server.c` with a comment explaining the gap and pointing at Week 4 as the place to actually fix it, once this is building and running natively on the Pi.
+
+### Finding 7 (minor): `client.c`'s `-p` argument wasn't validated
+
+`atoi()` on a non-numeric or out-of-range value silently produced `0` or garbage, rather than a clear error. **Fixed:** added a range check (`1`–`65535`) with a specific error message, right after the existing required-argument check.
+
+### Finding 8 (curriculum-level, major): the overlay filesystem conflicts with several things that need to persist
+
+Week 4 Day 1's overlay-filesystem decision was made before several later features existed that genuinely need to survive a reboot: **Tailscale's own node authentication state** (without it, the device re-prompts for a fresh login every boot — a direct violation of the "zero manual steps" milestone), **the Days 2-3 PIN lock's salted hash**, **NetworkManager's saved WiFi profiles** (the mobility work), and **any certificate deployed via the Day 6 rotation drill** (a write happening after the overlay is already active). None of this was connected anywhere in the curriculum.
+
+**Fix:** restructured the curriculum rather than just adding a warning — the overlay filesystem is no longer enabled on Day 1 at all. It's deferred to Day 5 (new Part A.0 in that day's walkthrough), once the complete persistence list is actually known, with explicit "note for Day 5" markers left at each point earlier in the week where a new persistence requirement gets created (Tailscale auth on Day 1, PIN hash and WiFi profiles on Days 2-3). Day 5 now includes setting up persistent storage for all three *before* enabling the overlay, plus a reboot-and-verify step. The Day 6 rotation drill now explicitly calls out that its certificate deployment is itself a write happening after the overlay is active, and requires a reboot-and-recheck to actually prove the deployment survives. Updated: [[Embedded Linux Deployment Concepts]], [[Week 4 Build Log]] (Days 1, 2-3, 5, 6), [[Week 4 Day 1 Walkthrough]], [[Week 4 Day 5 Walkthrough]], [[Week 4 Day 6 Walkthrough]], [[Week 4 Self-Check Questions]].
+
+### Not yet done
+- `docs/PROTOCOL.md` existed on disk but wasn't committed to git before this audit — fixed as part of this session's commits.
+- `revocation.c` has no thread-safety (no locking on its global state) — not currently a problem given single-threaded, load-once-at-startup usage, but worth revisiting if Week 4's ncurses UI ends up using a threaded design.
