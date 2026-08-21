@@ -6,7 +6,14 @@
 #include "revocation.h"
 
 #define MAX_REVOKED_SERIALS 64
-#define MAX_SERIAL_LEN      64  
+
+/* Must comfortably exceed the longest hex serial server.c's verify callback
+ * can ever hand us: SERIAL_BUF_SIZE there is 32 raw bytes -> 64 hex chars
+ * + a null terminator = 65 bytes minimum. 80 leaves real margin rather than
+ * sizing exactly to the wire and risking a silent off-by-one the next time
+ * either constant changes. (A real X.509 serial is at most 20 bytes / 40
+ * hex chars per RFC 5280, so this is generous headroom, not a tight fit.) */
+#define MAX_SERIAL_LEN       80
 
 static char revoked_serials[MAX_REVOKED_SERIALS][MAX_SERIAL_LEN];
 static int  revoked_count = 0;
@@ -43,6 +50,30 @@ int revocation_load(const char *filepath)
     }
 
     while (fgets(line, sizeof(line), fp) != NULL) {
+        size_t raw_len = strlen(line);
+        int truncated = (raw_len == sizeof(line) - 1 &&
+                          line[raw_len - 1] != '\n');
+
+        if (truncated) {
+            /* This line is longer than our read buffer. Without this
+             * check, fgets() would silently split it across two calls,
+             * and the leftover tail would get loaded as its own bogus,
+             * unrelated "revoked serial" entry on the next iteration.
+             * Discard the rest of the real line first so that doesn't
+             * happen, then skip this entry entirely - a truncated
+             * serial would never match a real one anyway, so partially
+             * loading it has no value and only obscures the warning. */
+            int c;
+            while ((c = fgetc(fp)) != '\n' && c != EOF) {
+                /* consume and discard the remainder of this line */
+            }
+            fprintf(stderr,
+                "revocation_load: warning - line exceeds %d chars, "
+                "skipping entry entirely (not partially loaded)\n",
+                (int)sizeof(line) - 1);
+            continue;
+        }
+
         strip_trailing_whitespace(line);
 
         if (line[0] == '\0') {
