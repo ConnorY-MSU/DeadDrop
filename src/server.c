@@ -35,10 +35,10 @@
 #include <wolfssl/ssl.h>
 
 #include "revocation.h"
+#include "message.h"
 
 #define SERVER_PORT 4433
 #define LISTEN_BACKLOG 1
-#define READ_BUF_SIZE 256
 
 #define SERIAL_BUF_SIZE 32
 
@@ -49,7 +49,11 @@
  * handles exactly one connection at a time - from accepting anyone else,
  * including the legitimate peer's own reconnect attempt. 30s is generous
  * for a real handshake/read on a slow mobile network, short enough that a
- * stalled connection doesn't lock everyone else out for long. */
+ * stalled connection doesn't lock everyone else out for long. It also
+ * doubles as the mechanism that eventually notices a peer whose network
+ * simply vanished (no FIN/RST ever arrives) rather than blocking forever -
+ * see client.c's reconnect loop, which depends on reads eventually erroring
+ * out instead of hanging indefinitely. */
 #define CONN_TIMEOUT_SECONDS 30
 
 static void set_socket_timeout(socket_t s)
@@ -158,6 +162,225 @@ static void parse_args(int argc, char *argv[],
             *revoked_path = argv[++i];
         }
     }
+}
+
+static const char *msg_type_name(uint8_t t)
+{
+    switch (t) {
+        case SL_MSG_TEXT_MESSAGE: return "TEXT_MESSAGE";
+        case SL_MSG_PING:         return "PING";
+        case SL_MSG_PONG:         return "PONG";
+        case SL_MSG_DISCONNECT:   return "DISCONNECT";
+        default:                  return "UNKNOWN";
+    }
+}
+
+typedef enum {
+    RECV_OK,        /* out_msg holds one fully validated message */
+    RECV_REJECTED,  /* a framed message arrived but failed validation */
+    RECV_CLOSED     /* peer closed, a read error occurred, or timeout */
+} recv_status;
+
+/*
+ * receive_one_message - block until exactly one complete message has
+ * been read off ssl and parsed (or the connection fails). Handles the
+ * case where a single wolfSSL_read() returns bytes belonging to more
+ * than one message: leftover bytes are kept in recv_buf/have across
+ * calls, and re-checked for another complete message before going back
+ * to wolfSSL_read() again.
+ *
+ * recv_buf must be at least SL_MAX_MSG_SIZE bytes. *have is the caller's
+ * persistent "how many valid bytes are currently in recv_buf" cursor -
+ * initialize to 0 before the first call for a given connection and don't
+ * touch it between calls.
+ */
+static recv_status receive_one_message(WOLFSSL *ssl, sl_session_state *state,
+                                        uint8_t *recv_buf, size_t *have,
+                                        sl_parsed_message *out_msg)
+{
+    for (;;) {
+        /* First, see if a complete message is already sitting in the
+         * buffer from a previous read (this is the "two messages in one
+         * read()" case). */
+        size_t consumed = 0;
+        sl_parse_result pr = sl_try_parse_message(state, recv_buf, *have,
+                                                   out_msg, &consumed);
+
+        if (pr == SL_PARSE_OK) {
+            memmove(recv_buf, recv_buf + consumed, *have - consumed);
+            *have -= consumed;
+            return RECV_OK;
+        }
+        if (pr == SL_PARSE_REJECTED) {
+            /* consumed may be 0 (implausible body_length - no safe
+             * resync point) or >0 (a well-framed but invalid message).
+             * Either way we treat rejection as fatal for this connection
+             * rather than trying to resynchronize on a stream we can no
+             * longer fully trust. */
+            if (consumed > 0) {
+                memmove(recv_buf, recv_buf + consumed, *have - consumed);
+                *have -= consumed;
+            }
+            return RECV_REJECTED;
+        }
+
+        /* SL_PARSE_INCOMPLETE: need more bytes. */
+        if (*have >= SL_MAX_MSG_SIZE) {
+            /* Buffer is completely full and still not a complete valid
+             * message - can't happen for a well-formed sender (body_length
+             * is capped, and the buffer is sized for the max possible
+             * message), so this means something is wrong upstream.
+             * Treat as fatal, same as any other rejection. */
+            return RECV_REJECTED;
+        }
+
+        {
+            int n = wolfSSL_read(ssl, (char *)(recv_buf + *have),
+                                  (int)(SL_MAX_MSG_SIZE - *have));
+            if (n <= 0) {
+                int err = wolfSSL_get_error(ssl, n);
+                char errbuf[80];
+                fprintf(stderr, "wolfSSL_read: %s\n",
+                        wolfSSL_ERR_error_string(err, errbuf));
+                return RECV_CLOSED;
+            }
+            *have += (size_t)n;
+        }
+    }
+}
+
+static int send_message(WOLFSSL *ssl, sl_session_state *state,
+                         uint8_t msg_type, const uint8_t *body,
+                         uint32_t body_len)
+{
+    uint8_t out_buf[SL_MAX_MSG_SIZE];
+    int total;
+    int rc;
+
+    total = sl_serialize_message(state, msg_type, body, body_len,
+                                  out_buf, sizeof(out_buf));
+    if (total < 0) {
+        fprintf(stderr, "send_message: sl_serialize_message failed "
+                         "(body_len=%u)\n", body_len);
+        return -1;
+    }
+
+    rc = wolfSSL_write(ssl, out_buf, total);
+    if (rc != total) {
+        int err = wolfSSL_get_error(ssl, rc);
+        char errbuf[80];
+        fprintf(stderr, "wolfSSL_write: %s\n",
+                wolfSSL_ERR_error_string(err, errbuf));
+        return -1;
+    }
+    return 0;
+}
+
+/* Handle one already-mTLS-authenticated connection end to end: derive the
+ * session's HMAC key, then loop receiving/validating/replying to framed
+ * messages until the peer sends DISCONNECT, the connection drops, or an
+ * invalid message is received. */
+static void handle_connection(WOLFSSL *ssl)
+{
+    sl_session_state state;
+    uint8_t *recv_buf;
+    size_t have = 0;
+
+    if (sl_session_init(ssl, &state) != 0) {
+        fprintf(stderr,
+            "sl_session_init failed - wolfSSL_export_keying_material "
+            "unavailable? (needs HAVE_KEYING_MATERIAL / "
+            "--enable-keying-material - see docs/BUILD.md)\n");
+        return;
+    }
+
+    recv_buf = malloc(SL_MAX_MSG_SIZE);
+    if (recv_buf == NULL) {
+        fprintf(stderr, "handle_connection: out of memory\n");
+        return;
+    }
+
+    for (;;) {
+        sl_parsed_message msg;
+        recv_status rs = receive_one_message(ssl, &state, recv_buf, &have,
+                                              &msg);
+
+        if (rs == RECV_CLOSED) {
+            printf("Connection closed.\n");
+            break;
+        }
+        if (rs == RECV_REJECTED) {
+            fprintf(stderr,
+                "Rejected an invalid message - closing connection.\n");
+            break;
+        }
+
+        /* rs == RECV_OK */
+        printf("Received %s (seq=%u, %u bytes)\n",
+               msg_type_name(msg.msg_type), msg.seq_num, msg.body_len);
+        /* stdout is fully block-buffered here (redirected to a file/pipe,
+         * not a TTY), so without an explicit flush this can sit invisible
+         * in the buffer indefinitely once the process goes back to
+         * blocking in accept() for the next connection - which looks
+         * identical, from the outside, to the process having hung. Bit
+         * me for real while testing DISCONNECT delivery: the message had
+         * actually arrived and been processed correctly the whole time,
+         * this line just hadn't been flushed to where I could see it. */
+        fflush(stdout);
+
+        if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
+            printf("Client message: %.*s\n", (int)msg.body_len, msg.body);
+            fflush(stdout);
+
+            {
+                /* "ack: " + original text, echoed back so the exchange is
+                 * visible on both ends. reply[] is sized for the worst
+                 * case (prefix + a full max-length body) so snprintf
+                 * itself never truncates - but the PROTOCOL.md body_length
+                 * cap (SL_MAX_BODY_LEN) is a separate, smaller limit than
+                 * this buffer's size, and a client message at or near that
+                 * cap would make "ack: " + body exceed it. Cap reply_len
+                 * to SL_MAX_BODY_LEN explicitly so this can never produce
+                 * a message sl_serialize_message() would refuse to send -
+                 * a message this close to the cap is already an edge case
+                 * on the sender's part, so truncating the echoed tail is
+                 * an acceptable, deliberate tradeoff versus dropping the
+                 * whole reply (and the connection) over it. */
+                char reply[7 + SL_MAX_BODY_LEN];
+                int reply_len = snprintf(reply, sizeof(reply), "ack: %.*s",
+                                          (int)msg.body_len, msg.body);
+                if (reply_len < 0) {
+                    reply_len = 0;
+                }
+                if ((size_t)reply_len > sizeof(reply) - 1) {
+                    reply_len = (int)sizeof(reply) - 1;
+                }
+                if ((uint32_t)reply_len > SL_MAX_BODY_LEN) {
+                    reply_len = (int)SL_MAX_BODY_LEN;
+                }
+                if (send_message(ssl, &state, SL_MSG_TEXT_MESSAGE,
+                                  (const uint8_t *)reply,
+                                  (uint32_t)reply_len) != 0) {
+                    break;
+                }
+            }
+        } else if (msg.msg_type == SL_MSG_PING) {
+            printf("Ping received - replying with PONG.\n");
+            fflush(stdout);
+            if (send_message(ssl, &state, SL_MSG_PONG, NULL, 0) != 0) {
+                break;
+            }
+        } else if (msg.msg_type == SL_MSG_PONG) {
+            printf("Pong received.\n");
+            fflush(stdout);
+        } else if (msg.msg_type == SL_MSG_DISCONNECT) {
+            printf("Peer sent DISCONNECT - closing cleanly.\n");
+            fflush(stdout);
+            break;
+        }
+    }
+
+    free(recv_buf);
 }
 
 int main(int argc, char *argv[])
@@ -337,6 +560,13 @@ int main(int argc, char *argv[])
 
         wolfSSL_set_fd(ssl, (int)client_sock);
 
+        /* See client.c's matching comment: wolfSSL frees its handshake
+         * arrays once the handshake completes, but handle_connection()
+         * needs them afterward (via sl_session_init() in message.c) to
+         * derive the per-session HMAC key. Must be called before
+         * wolfSSL_accept(). */
+        wolfSSL_KeepArrays(ssl);
+
         rc = wolfSSL_accept(ssl);
         if (rc != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(ssl, rc);
@@ -346,19 +576,16 @@ int main(int argc, char *argv[])
         } else {
             printf("mTLS handshake succeeded.\n");
             fflush(stdout);
+            handle_connection(ssl);
 
-            char buf[READ_BUF_SIZE];
-            int n = wolfSSL_read(ssl, buf, sizeof(buf) - 1);
-            if (n > 0) {
-                buf[n] = '\0';
-                printf("Client message: %s\n", buf);
-                fflush(stdout);
-            } else {
-                int err = wolfSSL_get_error(ssl, n);
-                char errbuf[80];
-                fprintf(stderr, "wolfSSL_read failed: %s\n",
-                        wolfSSL_ERR_error_string(err, errbuf));
-            }
+            /* See client.c's matching comment: a graceful close_notify
+             * here (rather than abruptly freeing/closing) avoids Winsock
+             * sending a hard RST when there's unread data still sitting
+             * in this socket's receive buffer, which could otherwise
+             * abort delivery of whatever this server just sent (e.g. an
+             * ack) before the client ever sees it. Best-effort, doesn't
+             * block waiting for the client's own close_notify in return. */
+            wolfSSL_shutdown(ssl);
         }
 
         wolfSSL_free(ssl);
