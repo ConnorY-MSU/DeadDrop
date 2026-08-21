@@ -984,3 +984,42 @@ Plain (non-sanitized) build's full five-binary unit test suite re-run once more 
 - Valgrind itself, specifically — genuinely unavailable on this platform (no native Windows build), same as Week 1; ASan+UBSan is this project's real substitute here, not a placeholder for "run it on Linux later," though Week 4's Pi hardware will incidentally make real Valgrind available for the first time if it's ever worth revisiting.
 - A real leak-detector confirmation for `server.c` under long-running/high-churn conditions — the network fuzz run's memory pattern is suggestive of no leak (non-monotonic, consistent with ASan quarantine churn) but not proven, since that needs a clean process exit `server.c` doesn't support yet (Week 4's graceful-shutdown work, already flagged in the earlier full-project audit).
 - `.gitignore` gained a `build_san/` entry (the sanitized-binary output directory) — a small housekeeping fix alongside today's real work, not itself a finding.
+
+## Week 4 prep — FNK0100 auxiliary hardware modules — 2026-08-21
+
+Prototyped ahead of the physical build (Pi hardware exists but has no OS installed yet), per an explicit request to get as much done as possible before Week 4 Day 1. **Read this whole section's status carefully before trusting anything in it as "working"**: everything here is Linux-only code (`/dev/i2c-1`, `<linux/i2c-dev.h>`, `fork()`/`execlp()`) with genuinely zero Windows equivalent, so **none of it has been compiled, let alone run, against anything real** — not even a syntax check (WSL setup was attempted and blocked on requiring admin elevation, a browser-style approval only the user can give, same category as the Tailscale login and Smart App Control situations earlier in this project). What follows is careful manual review and cross-referencing against real, sourced external references, not a test result.
+
+### `hw_expansion.c`/`.h` — case RGB status light
+
+I2C control (address `0x21`, bus 1) for the FNK0100's onboard expansion board (a Nuvoton MS51FB9AE microcontroller). Register map (`REG_LED_ALL=0x02`, `REG_LED_MODE=0x03`, etc.) pulled directly from Freenove's own published reference implementation (`api_expansion.py` in [Freenove/Freenove_Computer_Case_Kit_for_Raspberry_Pi](https://github.com/Freenove/Freenove_Computer_Case_Kit_for_Raspberry_Pi)), not guessed from the product description. `HW_STATUS_DISCONNECTED`/`CONNECTING`/`CONNECTED` map to red/amber/green.
+
+**One specific technical risk checked rather than assumed**: whether a raw `write()` to the I2C character device (this file's approach) produces the same on-wire bytes as Freenove's Python reference code, which uses `smbus.write_i2c_block_data()`. Confirmed against the actual Linux kernel SMBus protocol documentation (`docs.kernel.org/i2c/smbus-protocol.html`): "I2C Block Write" (what `write_i2c_block_data()` maps to) has wire format `Comm [A] Data [A] Data [A] ...` — explicitly no count byte, unlike the *standard* SMBus "Block Write" protocol — which is exactly what a raw `write()` of `[reg, data...]` produces. Verified against the protocol spec, not hardware.
+
+Wired into `client.c`'s reconnect loop and `server.c`'s accept loop (amber while attempting a handshake, green while an mTLS session is live, red otherwise). Compiles clean on Windows as an empty translation unit (`#ifdef __linux__` guards the whole file); the header provides no-op `static inline` stubs on non-Linux so `client.c`/`server.c` call `hw_expansion_*()` unconditionally without their own platform guards. **Live-tested that this wiring doesn't disturb the actual protocol**: full client/server exchange after wiring, byte-for-byte identical to before.
+
+### `hw_oled.c`/`.h`/`hw_oled_font.h` — native SSD1306 driver
+
+128×64 monochrome OLED, I2C address `0x3C` (confirmed via Freenove's `api_oled.py`, which uses `luma.oled.device.ssd1306` at that address). Text-only API (`hw_oled_draw_text(fd, line, text)`, 8 lines × 21 characters), since that's this project's actual requirement, not general graphics.
+
+**Font data**: the classic 5×7 bitmap font (256 characters × 5 bytes), copied **programmatically, not hand-retyped**, from Adafruit's own MIT-licensed [Adafruit-GFX-Library](https://github.com/adafruit/Adafruit-GFX-Library) (`glcdfont.c`) — confirmed exactly 1280 bytes extracted (`grep -c` on the hex literals), matching 256×5 exactly. Fabricating bitmap font bytes from memory was a real, specific risk worth avoiding here: a wrong byte would produce a silently garbled character, invisible without real hardware to look at.
+
+**Init sequence**: traced byte-for-byte against Adafruit_SSD1306's actual `begin()` source and its `SSD1306_*` command constants (both fetched directly), for the specific 128×64/internal-charge-pump configuration these small I2C OLED modules use. Manually counted as 26 bytes; **caught my own arithmetic being worth double-checking** and confirmed the real count by actually compiling a standalone test with `sizeof()` rather than trusting the hand count.
+
+Framebuffer approach: one 8-page × 128-column static buffer (matches the SSD1306's native GDDRAM layout in horizontal addressing mode), flushed to the display in 32-byte I2C write chunks (a conservative, widely-used chunk size, rather than assuming the full 1024-byte buffer fits in one I2C transaction on every adapter). Compiles clean on Windows (empty translation unit), including the embedded font header standing alone (`sizeof(hw_oled_font) == 1280`, checked by actually compiling and running a tiny test program, not asserted).
+
+### `hw_tts.c`/`.h` — optional text-to-speech
+
+Simplest of the three: the FNK0100's speakers are standard analog/optical audio out through the Pi's normal audio path (confirmed in Freenove's own component documentation — no I2C or other custom protocol for the speakers themselves), so this is `fork()`/`execlp("espeak-ng", ...)`, not a hardware register protocol.
+
+**One real correctness issue caught and fixed before it ever became a bug**: a naive single `fork()`+`exec()` with no `wait()` at all (since this needs to be fire-and-forget — never block message handling on speech synthesis finishing) would leave a zombie process table entry behind every time a message is spoken, for the entire life of the long-running server process — a real, if slow, resource leak. Used the standard double-fork technique instead: an intermediate child forks the actual `espeak-ng` process and exits immediately, orphaning it to be reaped automatically by init; the parent's single `waitpid()` call returns almost instantly (reaping the intermediate child, not waiting on speech synthesis).
+
+### Wired into `server.c` for real message notifications
+
+On an incoming `TEXT_MESSAGE`: a bounded, `NUL`-terminated preview (`msg.body` is length-prefixed per `PROTOCOL.md`, not a C string, so a real copy is made first — passing `msg.body` directly to either the OLED or TTS call would be a bug) is drawn to the OLED (`"New message:"` / preview text) and spoken aloud. **This is server-side only** — a genuine design question left open, not silently decided: this project's current protocol is asymmetric (client sends `TEXT_MESSAGE`, server echoes an `ack:` reply), so "new message from the other party" is unambiguous on the server side today. If the protocol ever becomes genuinely bidirectional, `client.c` would need the same wiring, which hasn't been added since that's a real design decision, not something to add speculatively.
+
+**Live-tested that this wiring doesn't disturb the actual protocol** (same as the RGB wiring): full client/server exchange, byte-for-byte identical server/client output to before the notification code existed. Full five-binary regression suite re-run clean.
+
+### Not yet done / explicitly deferred
+- All real hardware verification — everything above needs to actually run on the Pi with the real case attached before any of it can be called "working." Do not report this as tested or working anywhere until that's genuinely happened.
+- Fan speed control (`REG_FAN_MODE`/`REG_FAN_DUTY`, same expansion board) — not built, wasn't asked for (the request was specifically RGB-for-status, not cooling control).
+- Confirming `espeak-ng` is actually available on Raspberry Pi OS's default package repos (near-certain, but not independently confirmed the way the OLED/RGB protocol details were).

@@ -36,6 +36,9 @@
 
 #include "revocation.h"
 #include "message.h"
+#include "hw_expansion.h"
+#include "hw_oled.h"
+#include "hw_tts.h"
 
 #define SERVER_PORT 4433
 #define LISTEN_BACKLOG 1
@@ -279,8 +282,10 @@ static int send_message(WOLFSSL *ssl, sl_session_state *state,
 /* Handle one already-mTLS-authenticated connection end to end: derive the
  * session's HMAC key, then loop receiving/validating/replying to framed
  * messages until the peer sends DISCONNECT, the connection drops, or an
- * invalid message is received. */
-static void handle_connection(WOLFSSL *ssl)
+ * invalid message is received. oled_fd is passed in (rather than opened
+ * here) for the same reason hw_fd is in main() - it's a physical device
+ * with its own lifecycle independent of any one connection. */
+static void handle_connection(WOLFSSL *ssl, int oled_fd)
 {
     sl_session_state state;
     uint8_t *recv_buf;
@@ -331,6 +336,33 @@ static void handle_connection(WOLFSSL *ssl)
         if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
             printf("Client message: %.*s\n", (int)msg.body_len, msg.body);
             fflush(stdout);
+
+            /* Case OLED + TTS notification (no-op on non-Linux / hardware-
+             * absent, see hw_oled.h/hw_tts.h). msg.body is length-prefixed
+             * per PROTOCOL.md, NOT a NUL-terminated C string - both
+             * hw_oled_draw_text() (expects a real C string) and
+             * hw_tts_speak() (same) need a bounded, NUL-terminated copy
+             * made first; passing msg.body directly to either would read
+             * past msg.body_len looking for a terminator that isn't
+             * necessarily there. Bounded to a small preview length - the
+             * OLED line is 21 characters wide, and speaking a full 64KB
+             * message aloud would be its own bad idea regardless of what
+             * hw_tts_speak()'s own internal cap does. */
+            {
+                char preview[64];
+                size_t preview_len = msg.body_len;
+                if (preview_len > sizeof(preview) - 1) {
+                    preview_len = sizeof(preview) - 1;
+                }
+                memcpy(preview, msg.body, preview_len);
+                preview[preview_len] = '\0';
+
+                hw_oled_draw_text(oled_fd, 0, "New message:");
+                hw_oled_draw_text(oled_fd, 1, preview);
+                hw_oled_display(oled_fd);
+
+                hw_tts_speak(preview);
+            }
 
             {
                 /* "ack: " + original text, echoed back so the exchange is
@@ -397,6 +429,8 @@ int main(int argc, char *argv[])
     const char *key_path = NULL;
     const char *ca_path = NULL;
     const char *revoked_path = NULL;
+    int hw_fd;
+    int oled_fd;
 
     parse_args(argc, argv, &cert_path, &key_path, &ca_path, &revoked_path);
 
@@ -537,6 +571,24 @@ int main(int argc, char *argv[])
     printf("Listening on port %d...\n", SERVER_PORT);
     fflush(stdout);
 
+    /* Case RGB status light (no-op on non-Linux / hardware-absent - see
+     * hw_expansion.h). See client.c's matching comment for why this is
+     * opened once here rather than per-connection, and why MANUAL_RGB
+     * mode has to be set before a color write has any visible effect. */
+    hw_fd = hw_expansion_open();
+    hw_expansion_set_led_mode(hw_fd, HW_LED_MODE_MANUAL_RGB);
+    hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+
+    /* Case OLED (no-op on non-Linux / hardware-absent - see hw_oled.h),
+     * same "opened once, lives for the whole process" reasoning as the
+     * RGB light above. Shows a simple idle message rather than a blank
+     * screen, so it's obvious at a glance the service is actually
+     * running, not just that the screen happens to be off. */
+    oled_fd = hw_oled_open();
+    hw_oled_draw_text(oled_fd, 0, "SecureLink server");
+    hw_oled_draw_text(oled_fd, 1, "Waiting...");
+    hw_oled_display(oled_fd);
+
     for (;;) {
         socket_t client_sock = accept(listen_sock, NULL, NULL);
         if (client_sock == SOCKET_INVALID) {
@@ -576,7 +628,15 @@ int main(int argc, char *argv[])
         } else {
             printf("mTLS handshake succeeded.\n");
             fflush(stdout);
-            handle_connection(ssl);
+            hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
+            hw_oled_draw_text(oled_fd, 0, "SecureLink server");
+            hw_oled_draw_text(oled_fd, 1, "Connected");
+            hw_oled_display(oled_fd);
+            handle_connection(ssl, oled_fd);
+            hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+            hw_oled_draw_text(oled_fd, 0, "SecureLink server");
+            hw_oled_draw_text(oled_fd, 1, "Waiting...");
+            hw_oled_display(oled_fd);
 
             /* See client.c's matching comment: a graceful close_notify
              * here (rather than abruptly freeing/closing) avoids Winsock
@@ -605,6 +665,8 @@ int main(int argc, char *argv[])
      * a platform this can't currently be tested on. Revisit in Week 4
      * once this is building and running natively on the Pi. */
     CLOSE_SOCKET(listen_sock);
+    hw_expansion_close(hw_fd);
+    hw_oled_close(oled_fd);
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();
     revocation_free();

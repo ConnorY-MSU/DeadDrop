@@ -35,6 +35,7 @@
 #include <wolfssl/ssl.h>
 
 #include "message.h"
+#include "hw_expansion.h"
 
 /* Host/port are generic, sensible defaults (loopback, this project's
  * standard port) - not tied to any one machine, so they're fine to keep
@@ -309,7 +310,7 @@ static session_result run_interactive_session(WOLFSSL *ssl)
  * previous run of *failed* attempts had climbed to.
  */
 static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
-                                       int port, int *connected_ok)
+                                       int port, int *connected_ok, int hw_fd)
 {
     socket_t sock;
     struct sockaddr_in server_addr;
@@ -318,6 +319,12 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     session_result result;
 
     *connected_ok = 0;
+
+    /* Case RGB status light (no-op on non-Linux / hardware-absent, see
+     * hw_expansion.h) - amber for "attempting", set before the socket
+     * even opens so it's lit for the whole connect+handshake attempt,
+     * not just the TLS portion of it. */
+    hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTING);
 
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == SOCKET_INVALID) {
@@ -415,6 +422,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     }
     printf("mTLS handshake succeeded.\n");
     *connected_ok = 1;
+    hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
 
     result = run_interactive_session(ssl);
 
@@ -450,6 +458,7 @@ int main(int argc, char *argv[])
     const char *key_path = NULL;
     const char *ca_path = NULL;
     int reconnect_delay = RECONNECT_INITIAL_DELAY_SECONDS;
+    int hw_fd;
 
     parse_args(argc, argv, &host, &port, &cert_path, &key_path, &ca_path);
 
@@ -535,6 +544,19 @@ int main(int argc, char *argv[])
 
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
+    /* Case RGB status light (no-op on non-Linux / hardware-absent - see
+     * hw_expansion.h). Opened once here, kept open for the whole
+     * reconnect loop below (not re-opened per attempt), since it's a
+     * physical device with its own lifecycle independent of any one
+     * TCP/TLS session - and closed once at the very end of main().
+     * MANUAL_RGB mode must be set before hw_expansion_set_status_color()
+     * calls have any visible effect - the board's other modes
+     * (rainbow/breathing/etc.) would otherwise override a static color
+     * write. */
+    hw_fd = hw_expansion_open();
+    hw_expansion_set_led_mode(hw_fd, HW_LED_MODE_MANUAL_RGB);
+    hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+
     /* Reconnect loop. ctx (and the certs/keys/CA loaded into it) is
      * reused across attempts - only the TCP socket and WOLFSSL* are
      * per-connection. Every call into connect_and_run() creates a brand
@@ -546,7 +568,7 @@ int main(int argc, char *argv[])
     for (;;) {
         int connected_ok = 0;
         session_result result = connect_and_run(ctx, host, port,
-                                                  &connected_ok);
+                                                  &connected_ok, hw_fd);
 
         if (result == SESSION_USER_QUIT) {
             break;
@@ -562,6 +584,8 @@ int main(int argc, char *argv[])
             reconnect_delay = RECONNECT_INITIAL_DELAY_SECONDS;
         }
 
+        hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+
         fprintf(stderr, "Disconnected - retrying in %d second(s)...\n",
                 reconnect_delay);
         SLEEP_SECONDS(reconnect_delay);
@@ -571,6 +595,9 @@ int main(int argc, char *argv[])
             reconnect_delay = RECONNECT_MAX_DELAY_SECONDS;
         }
     }
+
+    hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+    hw_expansion_close(hw_fd);
 
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();
