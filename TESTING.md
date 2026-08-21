@@ -866,3 +866,121 @@ Full five-binary regression suite re-run after both fixes: `test_revocation`, `t
 - Re-running on real Pi hardware once it's up (Week 4) — today's numbers are dev-machine only, clearly labeled as such both in the program's own banner and here.
 - The required README write-up paragraph (numbers-grounded judgment on whether this is fast enough for the stated use case) — not written yet.
 - Confirming this was built as a plain, non-sanitized release build (it was — same `gcc -Wall -Wextra -g` line as `client.c`/`server.c`, no `-fsanitize=` flags — worth restating explicitly here since Day 5's sanitizer build is coming next and it would be easy to conflate the two).
+
+## Week 3, Day 5 — Full hardening pass — 2026-08-21
+
+Every binary rebuilt and re-run under AddressSanitizer + UndefinedBehaviorSanitizer, a full fuzz harness written and run against the protocol parser, a secrets audit, and a full regression re-check — the same discipline as Week 1 Day 5's hardening pass, applied to everything Weeks 2 and 3 added since.
+
+### Standard for "clean" (decided up front, per the walkthrough's own instruction, before running anything)
+
+**Zero tolerance** for any ASan report, any UBSan report, and any crash/hang, on any binary, under any test in this section — no exceptions, no "acceptable" category. (Valgrind's "still reachable vs. definitely lost" distinction doesn't apply here at all, since Valgrind isn't available and wasn't used — see below — but the equivalent standard under ASan/UBSan is the same as it's been since Week 1: the sanitizers either report a real problem or they don't, there's no analogous "acceptable leak category" to weigh for this toolset.)
+
+### Environment: no native Valgrind, same situation as Week 1
+
+Confirmed again rather than re-assumed: Valgrind has no native Windows build. Same fix as Week 1 — Clang/LLVM's ASan+UBSan via MSYS2's `clang64` environment, since GCC's MinGW port has no sanitizer runtime at all (`cannot find -lasan`, same finding as Week 1's `TESTING.md` entry).
+
+**New this week, not needed in Week 1**: `server.c`/`client.c`/`benchmark.c` link against wolfSSL, which is only built for the `UCRT64` environment (per `docs/BUILD.md`) — `clang64` has no wolfSSL of its own. Confirmed empirically that this combination actually works (not assumed): compiled and linked `client.c` under `clang64` against the `UCRT64`-built `libwolfssl.a` via `-isystem /c/msys64/ucrt64/include -L/c/msys64/ucrt64/lib`, then actually ran the resulting binary — it printed its usage message correctly with no ABI-mismatch symptoms. Two real environment issues hit and resolved along the way, neither a code bug:
+- **ASan runtime DLL not found at process start** (`libclang_rt.asan_dynamic-x86_64.dll: cannot open shared object file`) — same category of issue as Week 1's own ASan DLL note. Fixed by adding `/c/msys64/clang64/bin` to `PATH` before running any sanitized binary (that's where the DLL actually lives).
+- **`undefined symbol: clock_gettime64`** linking `benchmark.exe` specifically (the only file using `<time.h>`'s `clock_gettime()`) — MinGW-w64's UCRT `clock_gettime()` wrapper calls through to a symbol provided by `winpthreads`, which GCC's default link line pulls in automatically but Clang's didn't. Fixed with an explicit `-lwinpthread`.
+
+**Full build line used for every binary this week:**
+```bash
+export MSYSTEM=CLANG64 && source /etc/profile
+clang -Wall -Wextra -g -fsanitize=address -fsanitize=undefined \
+  -Iinclude -Isrc -isystem /c/msys64/ucrt64/include -c src/<file>.c -o build_san/<file>.o
+clang -g -fsanitize=address -fsanitize=undefined \
+  -L/c/msys64/ucrt64/lib -lwolfssl -lws2_32 -lcrypt32 [-lwinpthread for benchmark.exe only] \
+  build_san/<objects>.o -o build_san/<binary>.exe
+```
+`-isystem` (not `-I`) for the UCRT64 include path specifically to suppress a large volume of harmless `-Wpragma-pack` warnings from Windows SDK headers themselves (confirmed harmless — they're about header-internal struct packing pragmas in Microsoft's own headers, not anything in this project's code) while still surfacing any real warning from our own source. Result: **zero warnings across all 9 source files** compiled this way (`server`, `client`, `benchmark`, `message`, `hmac`, `sha256`, `aes128`, `revocation`, `debug`).
+
+### Sanitized unit tests — all 5 binaries, zero findings
+
+```
+test_revocation.exe: 8/8 PASS
+test_sha256.exe: 3/3 PASS
+test_aes128.exe: 12/12 PASS
+test_hmac.exe: 4/4 PASS
+test_message.exe: 29/29 PASS
+```
+No ASan or UBSan report on any of the five. This is real coverage `sha256`/`aes128` already had from Week 1 (re-confirmed clean under this week's slightly different toolchain path), plus genuinely new sanitizer coverage for `revocation.c`, `message.c`, and `hmac.c`, none of which had been run under a sanitizer before this week.
+
+### Sanitized integration tests: happy path + full Week 2 negative-test re-run
+
+Same four tests as Week 2 Day 5, same throwaway-PKI artifacts (`~/throwaway-pki/`, which survived from Week 2 and didn't need regenerating), re-run end to end against the **sanitized** `server.exe`/`client.exe` — proving the actual TLS handshake, verify-callback, and revocation-check code paths are memory-safe under real (if synthetic) adversarial certificate input, not just the pure-logic unit tests.
+
+**Happy path** — clean, verbatim:
+```
+Received TEXT_MESSAGE (seq=0, 25 bytes)
+Client message: sanitized happy path test
+Received DISCONNECT (seq=1, 0 bytes)
+Peer sent DISCONNECT - closing cleanly.
+```
+
+**Test 1 (no client cert)** — wolfSSL's own example client, `-x -v 4` (the `-v 4` matters: without it the example client defaults to TLS 1.2, which this TLS-1.3-only server rejects for a *version* mismatch, masking the actual no-cert test — caught this by comparing the rejection reason against Week 2's recorded result before accepting it). Matches Week 2 exactly: `Handshake failed: peer did not return a certificate`, no "checking serial" line (rejected before the verify callback ever runs).
+
+**Test 2 (wrong CA)**, **Test 3 (expired cert)**, **Test 4 (revoked cert)** — all matched Week 2's recorded results exactly (`certificate verify failed` / `ASN date error, current date is after expiration` / `is REVOKED - rejecting` respectively), each rejected for the same specific, distinct reason as before. One behavioral difference worth noting, not a bug: Week 3 Day 2's reconnect-with-backoff logic makes `client.c` retry automatically on a rejection now (it can't distinguish "deliberately rejected" from "transient failure" from its own side), so these negative tests now show 3-4 repeated rejection attempts in the log rather than Week 2's single one-shot attempt — same underlying rejection, just observed multiple times instead of once.
+
+**Confirm nothing broke** — revoked-serials list cleared, server restarted, happy path re-run clean one more time after all four negative tests, same as Week 2 Day 5's own closing step.
+
+**Zero ASan/UBSan reports across every one of these runs.**
+
+### Fuzzing `sl_try_parse_message()` — the one genuinely new tool this week
+
+Initial pass matched the walkthrough's own baseline example (200,000 iterations, 512-byte cap on pure-random buffers, five mutation strategies against one small base message). After that pass completed clean, explicitly asked to make this "super intensive" rather than just meeting the minimum bar — the intensified version below replaced it entirely, run under the same sanitized build (a fuzz loop with no sanitizer underneath only proves "didn't crash," not "is memory-safe" — every run in this section used the ASan/UBSan binary, never the plain one).
+
+**What's more intensive than the baseline pass:**
+- 10x the iteration count: 1,000,000 pure-random + 1,000,000 mutated (2,000,000+ total, vs. 200,000 before)
+- Pure-random buffers now span the **full valid message-size range** (up to `SL_MAX_MSG_SIZE`, ~64KB) instead of being capped at 512 bytes — the original range barely touched realistic message sizes at all
+- Mutation fuzzing now runs against **three base messages of very different sizes** (44-byte, 4KB, and `SL_MAX_BODY_LEN - 1` bodies), not just one ~44-byte message — a bug reachable only on large-message code paths (buffer-boundary arithmetic near the max) would never have been reachable by mutating only a small message
+- Three new mutation strategies added (stacked multi-mutation, extreme header field values, `body_length` pushed to exactly its cap or exactly 0) alongside the original five
+- A new deterministic fixed-edge-case pass — the same specific boundary inputs (empty buffer, one-byte-short-of-header, all-zero/all-`0xFF` buffers at several sizes, `body_length` at exactly the cap and exactly one over it) run every single time, guaranteed covered rather than left to chance
+
+**Results, verbatim:**
+```
+  Fixed edge cases             ok=0        rejected=7        incomplete=5        unexpected=0
+  Pure random                  ok=0        rejected=985711   incomplete=14289    unexpected=0
+  Mutated (3 base sizes)       ok=6586     rejected=700232   incomplete=293181   unexpected=0
+
+Total iterations: 2000011 in 524.85 seconds (3811/sec)
+```
+Zero "unexpected" (the parser never returned anything outside its own three defined outcomes) across all 2,000,011 iterations. The `ok=6586` on the mutated pass (0.66%) is the same understood, non-concerning phenomenon as the original pass's `ok=1014` — occasional no-op mutations (a `body_length` delta that happens to land on 0, or a stacked bit-flip that cancels itself out) leaving an already-validly-signed message exactly as valid as it started, not a forgery.
+
+**Two real bugs found — both in the fuzz harness itself, neither in `message.c`:**
+
+1. **`global-buffer-overflow`** (from the original, smaller pass): a hand-counted string literal length (`44`) that didn't match the actual string (`42` characters). `sl_serialize_message()` correctly copied exactly the length it was told to; the harness lied about that length. **Fixed** with `strlen()`.
+2. **`int-divide-by-zero`** (new, surfaced specifically by the intensified pass's new stacked-mutation strategy — this bug genuinely could not have been found by the original, smaller pass, since it didn't have a stacking strategy at all): the truncation mutation (`len = rand() % (int)len`) could reduce `len` to exactly 0, and a subsequent stacked pass's bit-flip mutation (`rand() % (int)len`) then divided by that zero. **Fixed** by guaranteeing truncation never produces an empty buffer (`len = 1 + rand() % (int)len`) — the empty-buffer case is already covered deterministically by the fixed-edge-case pass, so this doesn't lose any coverage.
+
+Both are exactly the kind of off-by-one/boundary bug this whole exercise exists to catch — just found in the test infrastructure both times instead of the code under test, and both fixed and re-verified clean before being counted as done.
+
+### Network-level fuzzing — a genuinely different test class, added for the same "make it intensive" reason
+
+`tests/fuzz_message.c` calls `sl_try_parse_message()` directly with a pre-assembled in-memory buffer — it structurally cannot exercise how the **real server process** behaves when malformed bytes arrive over an actual socket (TCP fragmentation, `wolfSSL_read()`'s own buffering, the accept loop, `receive_one_message()`'s accumulate-until-complete logic). `tests/fuzz_network.c` closes that gap: connects to an already-running sanitized `server.exe` for real, completes a genuine mTLS handshake, then sends one malformed post-handshake payload per connection (bypassing `sl_serialize_message()` entirely — six payload strategies: pure random, empty write, absurd claimed `body_length` with no body, garbage HMAC tag on an otherwise real-looking header, all-zero minimum-size buffer, and large near-max-payload random data) and confirms the server never crashes. One malformed payload per connection is a structural choice, not a limitation: `server.c`'s own policy is that any single rejected message is fatal to the whole connection, so a second payload on the same connection would never reach the parser again anyway.
+
+**A real bug found in this harness too, this one costing real time rather than tripping a sanitizer**: the first run stalled badly — only 219 of 3000 connections completed after roughly 15-20 minutes. Root cause: several of the random payload strategies can produce a buffer shorter than a complete message, which correctly makes the server block in `wolfSSL_read()` waiting for the rest of a message this harness never sends (it only writes once per iteration) — both sides then wait until the server's own 30-second `SO_RCVTIMEO` eventually forces the connection closed. Not a hang, not a memory-safety bug — a slow harness that didn't need to wait nearly that long to prove what it's actually proving. **Fixed** with a short (2-second) client-side socket timeout, deliberately much shorter than the server's own.
+
+**Full 3000-iteration run after the fix, verbatim:**
+```
+handshake_failures=0 server_closed_cleanly=3000 write_failures=0
+
+NETWORK FUZZING COMPLETE - this process did not crash.
+```
+All 3000 handshakes succeeded, all 3000 malformed payloads were rejected and the connection closed cleanly by the server every single time, zero write failures. Server log confirms the expected pattern throughout (`mTLS handshake succeeded.` → `Rejected an invalid message - closing connection.` or `wolfSSL_read: peer sent close notify alert`), and a direct grep of the server's log for `AddressSanitizer`/`UndefinedBehaviorSanitizer`/`ERROR` returned zero hits. Server process confirmed still running (`tasklist`) after all 3000 iterations, not assumed.
+
+**One honest methodology note, not glossed over**: server memory climbed noticeably during this run (roughly 10MB → 293MB) before *decreasing* again (293MB → 191MB → 230MB) over the back half of the run — non-monotonic, which is consistent with ASan's known allocation-quarantine behavior under heavy allocation churn (it deliberately delays reusing freed memory to catch use-after-free bugs) rather than an unbounded leak, but this wasn't independently confirmed with an actual leak-detector report, because it couldn't be: ASan's LeakSanitizer check runs at normal process exit, and `server.c`'s accept loop has no clean shutdown path (a known, already-documented gap from the earlier full-project audit, not new). The memory pattern is suggestive, not proof either way — a real leak-check here needs the graceful-shutdown work already flagged as deferred to Week 4.
+
+### Secrets audit
+
+```bash
+grep -rn "print_hex\|printf.*key\|printf.*secret" src/ include/
+```
+Three hits are file-path logging (`"...cert/key/CA loaded from %s / %s / %s\n"` in `client.c`/`server.c`/`benchmark.c` — these print *paths*, never key *contents*). `print_hex`'s only call sites, checked separately, are all in `tests/` (`test_aes128.c`, `test_hmac.c`, `test_sha256.c`), all against fixed public test vectors, all only printed on a failed assertion — never reachable from `server.c`/`client.c`/`benchmark.c`, which don't call `print_hex` at all. A separate targeted grep for the actual session-key variable (`hmac_key`) near any print function returned zero hits. **Clean.**
+
+### Full regression check
+
+Plain (non-sanitized) build's full five-binary unit test suite re-run once more after all of today's changes: `test_revocation`, `test_sha256`, `test_aes128`, `test_hmac`, `test_message` — all still clean.
+
+### Not yet done (Day 5)
+- Valgrind itself, specifically — genuinely unavailable on this platform (no native Windows build), same as Week 1; ASan+UBSan is this project's real substitute here, not a placeholder for "run it on Linux later," though Week 4's Pi hardware will incidentally make real Valgrind available for the first time if it's ever worth revisiting.
+- A real leak-detector confirmation for `server.c` under long-running/high-churn conditions — the network fuzz run's memory pattern is suggestive of no leak (non-monotonic, consistent with ASan quarantine churn) but not proven, since that needs a clean process exit `server.c` doesn't support yet (Week 4's graceful-shutdown work, already flagged in the earlier full-project audit).
+- `.gitignore` gained a `build_san/` entry (the sanitized-binary output directory) — a small housekeeping fix alongside today's real work, not itself a finding.

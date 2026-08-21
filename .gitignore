@@ -16,6 +16,7 @@ securelink
 
 # Debug/build directories
 build/
+build_san/
 bin/
 obj/
 
