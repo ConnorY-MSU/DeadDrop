@@ -621,3 +621,25 @@ Week 4 Day 1's overlay-filesystem decision was made before several later feature
 ### Not yet done
 - `docs/PROTOCOL.md` existed on disk but wasn't committed to git before this audit — fixed as part of this session's commits.
 - `revocation.c` has no thread-safety (no locking on its global state) — not currently a problem given single-threaded, load-once-at-startup usage, but worth revisiting if Week 4's ncurses UI ends up using a threaded design.
+
+### Re-scan — verifying the fixes themselves, not just re-reading the code
+
+A second pass specifically checking whether the audit's own fixes actually hold up, rather than trusting the first pass's reasoning.
+
+**Empirically proved the connection timeout (Finding 2) actually works, not just "didn't break the happy path."** Opened a raw TCP connection via bash's `/dev/tcp` that connects but never sends anything (no TLS handshake, simulating a stalled/malicious peer) and held it open past the 30-second timeout, while the server was live:
+```
+Raw TCP client connected.
+[... 30s elapses ...]
+Handshake failed: non-blocking socket wants data to be read
+```
+Then immediately ran a real client against the same server — it succeeded cleanly, confirming the server genuinely recovered and served the next connection rather than staying stuck:
+```
+Raw TCP client connected.       <- the stalled one
+Raw TCP client connected.       <- the real one, right after
+Verify callback: checking serial ... not revoked, proceeding.
+mTLS handshake succeeded.
+Client message: hello from client.c
+```
+**One thing worth flagging, not a bug:** the error string wolfSSL surfaces for this timeout (`non-blocking socket wants data to be read`, i.e. its internal `WANT_READ` condition) is the same shape of message normally meaning "retry me," not "this timed out and should be treated as fatal." Our code doesn't retry on it — correctly, in this context — but a future reader debugging server logs should know this specific message, in this specific spot, means the 30s timeout fired, not that something is misconfigured for non-blocking I/O.
+
+**Found one more, very minor, edge case in the truncation fix (Finding 4) while re-checking it by hand:** if the revoked-serials file's very last line is exactly 79 characters (one short of the 80-byte buffer) with no trailing newline (because the file simply ends there), the current logic would misidentify it as truncated and skip it, even though it's actually complete. Real revoked serials are ~40 hex characters, so this would need a file crafted to land exactly on that specific boundary to ever trigger — not fixed, given how narrow it is, but noted honestly rather than claiming the truncation fix is airtight in every conceivable case.
