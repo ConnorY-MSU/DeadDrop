@@ -1,0 +1,43 @@
+// SecureLink Tailscale ACL policy — Week 3, Day 3
+//
+// Scope: the two SecureLink devices (client + server) should be able to
+// reach *only each other*, on the SecureLink protocol port (4433, per
+// SERVER_PORT in src/server.c) — nothing else, and nothing else should be
+// able to reach them, even other devices later added to this same tailnet
+// for unrelated purposes.
+//
+// This is HuJSON (JSON + comments), which is what Tailscale's admin
+// console ACL editor expects — paste this whole file in directly.
+//
+// Apply now: this dev machine, tagged tag:securelink-client, via
+//   tailscale up --advertise-tags=tag:securelink-client
+// Apply later, once a Pi is actually running Tailscale (Week 4 Day 1+):
+//   tailscale up --advertise-tags=tag:securelink-server
+{
+	// Who is allowed to APPLY each tag to a device. Replace
+	// "autogroup:admin" with your specific Tailscale account's login
+	// (e.g. "you@example.com") if you'd rather scope it more tightly
+	// than "any tailnet admin" — for a solo two-device tailnet these are
+	// equivalent in practice, but the tighter form is worth knowing
+	// about for when this tailnet has more than one admin someday.
+	"tagOwners": {
+		"tag:securelink-client": ["autogroup:admin"],
+		"tag:securelink-server": ["autogroup:admin"]
+	},
+
+	// Once any custom rule exists here, Tailscale's default deny-all
+	// applies to everything NOT explicitly listed below — this single
+	// rule is therefore also what restricts these two devices from
+	// reaching (or being reached by) anything else on the tailnet, not
+	// just what it explicitly allows.
+	"acls": [
+		{
+			"action": "accept",
+			"src":    ["tag:securelink-client"],
+			// :4433 restricts this to the SecureLink protocol port
+			// specifically, not "any port on the server device" — the
+			// client only ever needs to reach this one port.
+			"dst":    ["tag:securelink-server:4433"]
+		}
+	]
+}

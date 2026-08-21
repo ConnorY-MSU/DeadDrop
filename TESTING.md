@@ -776,3 +776,46 @@ Full five-binary regression after adding both: `test_revocation` (8/8), `test_sh
 
 ### Not yet done
 - POSIX branch of the portability shim (`server.c`/`client.c`, from the earlier full-project audit) is still unverified on real Linux — unchanged by today's work, still deferred to Week 4 Day 1 by design.
+
+## Week 3, Day 3 (partial) — Tailscale prep, no second device yet — 2026-08-21
+
+Pi hardware exists but isn't running an OS yet (Week 4 Day 1), so there's no real second machine to test cross-network reachability against today. Did the parts of Day 3 that don't depend on one existing; the actual cross-network exchange and Wireshark capture are deferred (see `docs/PROTOCOL.md`'s new "Network transport and addressing" section and `docs/tailscale-acl.json`).
+
+**Tailscale installed on this dev machine:** `winget install tailscale.tailscale` (v1.102.2), confirmed via `tailscale.exe version`. Not yet authenticated (`tailscale status` → `Logged out`) — `tailscale up`'s browser-based login is inherently interactive and out of scope for automated setup; left for the user to complete.
+
+**`client.c`: `inet_pton()` replaced with `getaddrinfo()`-based resolution.** `inet_pton()` only parses numeric IP address text — it does zero name resolution, so it would have silently rejected a Tailscale MagicDNS hostname outright. This needed to change regardless of which addressing option (hardcoded IP vs. MagicDNS) eventually gets chosen, so made the change now rather than gating it on that decision. `getaddrinfo()` handles both a raw IP and a real hostname through the same code path.
+
+**Verified with both kinds of input, not just one:**
+```
+=== test with raw IP 127.0.0.1 ===
+Connected to server.
+mTLS handshake succeeded.
+Connected. Type a message and press Enter (or 'quit' to exit).
+> Server: ack: ip test
+=== test with hostname 'localhost' ===
+Connected to server.
+mTLS handshake succeeded.
+Connected. Type a message and press Enter (or 'quit' to exit).
+> Server: ack: hostname test
+```
+Server log confirms both were genuinely received and processed (`Received TEXT_MESSAGE ... Client message: ip test` / `... Client message: hostname test`), not just that the client printed something. `localhost` specifically is a real hostname resolution `inet_pton()` could never have performed — this is the concrete proof the swap actually does what it's for, not just that it compiles.
+
+Full five-binary regression suite re-run after the change: `test_revocation`, `test_sha256`, `test_aes128`, `test_hmac`, `test_message` — all still clean.
+
+**Tailscale ACL policy drafted** (`docs/tailscale-acl.json`): tag-based (`tag:securelink-client`/`tag:securelink-server`), restricts the two devices to reaching only each other on port 4433, default-deny for everything else once any custom rule exists. Written and ready to paste into the admin console now; applying `tag:securelink-server` to a Pi is deferred until one is actually running Tailscale.
+
+## Update — same day, authenticated and tagged for real
+
+User completed `tailscale up`'s interactive browser login and pasted `docs/tailscale-acl.json` into the admin console. Applied `tag:securelink-client` to this dev machine via `tailscale up --advertise-tags=tag:securelink-client` — **one real hiccup along the way, not glossed over**: the first attempt at this, run *before* the ACL policy had been pasted into the console, pushed the client into `BackendState: NeedsLogin` (requesting a tag that doesn't yet exist in `tagOwners` apparently requires a fresh interactive approval that a headless CLI call can't complete). Recovered with `tailscale up --reset --accept-risk=all` before the ACL was in place, confirmed back to a healthy `Running` state via `tailscale status`, then retried the tag *after* the ACL was actually pasted — this time it applied cleanly with no re-auth needed, confirmed via `tailscale up`'s own output (no `NeedsLogin`/`AuthURL` this time) and independently via:
+```
+tailscale whois 100.107.213.69
+  ...
+  Tags:          tag:securelink-client
+```
+Also visible as a side effect: `tailscale status` now shows this device by its tagged hostname (`lapbottom.taild5c2a6.ts.net`) rather than the personal login email it showed before tagging — consistent with a tagged device being identified by the tag/service rather than the user who happened to authenticate it, exactly the intended behavior for this ACL model.
+
+### Not yet done (Day 3)
+- A second device authenticated and tagged `tag:securelink-server`; confirming the ACL actually restricts traffic as intended (not just that this one device's tag looks right) needs that second device to exist.
+- Re-running the Day 2 interactive exchange over the real Tailscale path.
+- The `tshark`/Wireshark capture on the Tailscale interface.
+- The addressing decision itself (hardcoded IP vs. MagicDNS) — deferred until there's a real second device to decide it against.

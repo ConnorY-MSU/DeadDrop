@@ -20,6 +20,7 @@
     #include <sys/socket.h>
     #include <netinet/in.h>
     #include <arpa/inet.h>
+    #include <netdb.h>
     #include <unistd.h>
     #include <errno.h>
     typedef int socket_t;
@@ -324,13 +325,52 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
         return SESSION_DISCONNECTED;
     }
 
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons((unsigned short)port);
-    if (inet_pton(AF_INET, host, &server_addr.sin_addr) != 1) {
-        fprintf(stderr, "inet_pton failed for host '%s'\n", host);
-        CLOSE_SOCKET(sock);
-        return SESSION_DISCONNECTED;
+    /* getaddrinfo() rather than inet_pton(): inet_pton() only parses
+     * numeric IP address text and does zero name resolution, so it would
+     * reject a Tailscale MagicDNS hostname (e.g.
+     * "securelink-server.your-tailnet.ts.net") outright with no lookup
+     * attempted at all. getaddrinfo() handles both a raw IP (Week 3 Day
+     * 3's "hardcoded Tailscale IP" option) and a real hostname (the
+     * MagicDNS option) through the same code path, so this doesn't need
+     * to be revisited regardless of which addressing approach gets
+     * chosen - or if that choice changes later. */
+    {
+        struct addrinfo hints;
+        struct addrinfo *res = NULL;
+        struct addrinfo *rp;
+        char port_str[6];
+        int gai_rc;
+
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET; /* this project is IPv4-only throughout -
+                                     * struct sockaddr_in, not sockaddr_storage */
+        hints.ai_socktype = SOCK_STREAM;
+
+        snprintf(port_str, sizeof(port_str), "%d", port);
+
+        gai_rc = getaddrinfo(host, port_str, &hints, &res);
+        if (gai_rc != 0) {
+            fprintf(stderr, "getaddrinfo failed for host '%s': %s\n",
+                    host, gai_strerror(gai_rc));
+            CLOSE_SOCKET(sock);
+            return SESSION_DISCONNECTED;
+        }
+
+        memset(&server_addr, 0, sizeof(server_addr));
+        for (rp = res; rp != NULL; rp = rp->ai_next) {
+            if (rp->ai_family == AF_INET) {
+                memcpy(&server_addr, rp->ai_addr, sizeof(server_addr));
+                break;
+            }
+        }
+        freeaddrinfo(res);
+
+        if (rp == NULL) {
+            fprintf(stderr,
+                "getaddrinfo: no IPv4 address found for host '%s'\n", host);
+            CLOSE_SOCKET(sock);
+            return SESSION_DISCONNECTED;
+        }
     }
 
     rc = connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
