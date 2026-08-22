@@ -41,8 +41,13 @@
 #include "hw_tts.h"
 #include "session.h"
 #include "ui.h"
+#include "keyshare.h"
 
 #define SERVER_PORT 4433
+#define KEYSHARE_PORT 4434 /* mutual key-share protocol - see
+                               keyshare.h. Distinct from SERVER_PORT:
+                               this is a separate, minimal bootstrap
+                               protocol, not part of PROTOCOL.md. */
 #define LISTEN_BACKLOG 1
 
 #define SERIAL_BUF_SIZE 32
@@ -144,17 +149,30 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
 static void print_usage(const char *prog_name)
 {
     fprintf(stderr,
-        "Usage: %s -c <server_cert.pem> -k <server_key.pem> "
-        "-A <ca_cert.pem> -r <revoked_serials.txt>\n"
-        "All four arguments are required - there are no default paths,\n"
-        "since a hardcoded path baked into the binary would tie it to one\n"
-        "machine and break the moment this runs on a different device.\n",
+        "Usage: %s -c <server_cert.pem> -A <ca_cert.pem> "
+        "-r <revoked_serials.txt>\n"
+        "         (-k <server_key.pem> | -K <keyshare_dir> -P <peer_ip> "
+        "-N <peer_hostname>)\n"
+        "-c/-A/-r are always required. For the private key, use EITHER:\n"
+        "  -k <path>   a plain PEM key file (dev-machine testing, or a\n"
+        "              device without mutual key-share protection set up)\n"
+        "or:\n"
+        "  -K <dir> -P <peer_ip> -N <peer_hostname>\n"
+        "              the mutual key-share flow (see keyshare.h) - <dir>\n"
+        "              must contain key.enc, share_local.bin, and\n"
+        "              peer_custody_share.bin; <peer_ip>/<peer_hostname>\n"
+        "              identify the paired device to fetch the share from.\n"
+        "There are no default paths, since a hardcoded path baked into the\n"
+        "binary would tie it to one machine and break the moment this runs\n"
+        "on a different device.\n",
         prog_name);
 }
 
 static void parse_args(int argc, char *argv[],
                         const char **cert_path, const char **key_path,
-                        const char **ca_path, const char **revoked_path)
+                        const char **ca_path, const char **revoked_path,
+                        const char **keyshare_dir, const char **peer_ip,
+                        const char **peer_hostname)
 {
     int i;
     for (i = 1; i < argc - 1; i++) {
@@ -166,8 +184,87 @@ static void parse_args(int argc, char *argv[],
             *ca_path = argv[++i];
         } else if (strcmp(argv[i], "-r") == 0) {
             *revoked_path = argv[++i];
+        } else if (strcmp(argv[i], "-K") == 0) {
+            *keyshare_dir = argv[++i];
+        } else if (strcmp(argv[i], "-P") == 0) {
+            *peer_ip = argv[++i];
+        } else if (strcmp(argv[i], "-N") == 0) {
+            *peer_hostname = argv[++i];
         }
     }
+}
+
+/* load_private_key - either a plain PEM file (-k, dev-machine testing
+ * or a device without mutual key-share protection set up) or the
+ * mutual key-share flow (-K/-P/-N, see keyshare.h) - decrypted into a
+ * stack buffer, loaded via wolfSSL_CTX_use_PrivateKey_buffer(), and
+ * zeroed immediately after, rather than ever touching disk in
+ * plaintext. Returns 0 on success. */
+static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
+                             const char *keyshare_dir, const char *peer_ip,
+                             const char *peer_hostname)
+{
+    int rc;
+
+    if (keyshare_dir != NULL) {
+        char path_buf[600];
+        uint8_t K[KEYSHARE_LEN];
+        uint8_t pem_buf[8192];
+        long pem_len;
+
+        snprintf(path_buf, sizeof(path_buf), "%s/share_local.bin", keyshare_dir);
+        {
+            char custody_path[600];
+            char key_enc_path[600];
+            snprintf(custody_path, sizeof(custody_path),
+                      "%s/peer_custody_share.bin", keyshare_dir);
+            snprintf(key_enc_path, sizeof(key_enc_path), "%s/key.enc",
+                      keyshare_dir);
+
+            printf("Fetching this device's key-share from its paired "
+                    "device over Tailscale (retrying until it's "
+                    "reachable)...\n");
+            fflush(stdout);
+            rc = keyshare_reconstruct(path_buf, peer_ip, peer_hostname,
+                                        custody_path, KEYSHARE_PORT, K);
+            if (rc != 0) {
+                fprintf(stderr, "keyshare_reconstruct failed - check "
+                        "the -K directory's files exist and are "
+                        "readable\n");
+                return -1;
+            }
+            printf("Key-share reconstructed.\n");
+            fflush(stdout);
+
+            pem_len = keyshare_decrypt_private_key(key_enc_path, K, pem_buf,
+                                                     sizeof(pem_buf));
+            memset(K, 0, sizeof(K));
+            if (pem_len < 0) {
+                fprintf(stderr, "keyshare_decrypt_private_key failed - "
+                        "check the -K directory's key.enc file\n");
+                return -1;
+            }
+        }
+
+        rc = wolfSSL_CTX_use_PrivateKey_buffer(ctx, pem_buf, pem_len,
+                                                 WOLFSSL_FILETYPE_PEM);
+        memset(pem_buf, 0, sizeof(pem_buf));
+        if (rc != WOLFSSL_SUCCESS) {
+            fprintf(stderr,
+                "wolfSSL_CTX_use_PrivateKey_buffer failed (rc=%d)\n", rc);
+            return -1;
+        }
+        return 0;
+    }
+
+    rc = wolfSSL_CTX_use_PrivateKey_file(ctx, key_path, WOLFSSL_FILETYPE_PEM);
+    if (rc != WOLFSSL_SUCCESS) {
+        fprintf(stderr,
+            "wolfSSL_CTX_use_PrivateKey_file failed (rc=%d) - check "
+            "the -k path was given correctly\n", rc);
+        return -1;
+    }
+    return 0;
 }
 
 /* Message framing glue (receive_one_message/send_message), the
@@ -195,13 +292,26 @@ int main(int argc, char *argv[])
     const char *key_path = NULL;
     const char *ca_path = NULL;
     const char *revoked_path = NULL;
+    const char *keyshare_dir = NULL;
+    const char *peer_ip = NULL;
+    const char *peer_hostname = NULL;
     int hw_fd;
     int oled_fd;
 
-    parse_args(argc, argv, &cert_path, &key_path, &ca_path, &revoked_path);
+    parse_args(argc, argv, &cert_path, &key_path, &ca_path, &revoked_path,
+               &keyshare_dir, &peer_ip, &peer_hostname);
 
-    if (cert_path == NULL || key_path == NULL || ca_path == NULL ||
-        revoked_path == NULL) {
+    if (cert_path == NULL || ca_path == NULL || revoked_path == NULL) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (keyshare_dir != NULL) {
+        if (peer_ip == NULL || peer_hostname == NULL) {
+            fprintf(stderr, "-K requires -P and -N too\n");
+            print_usage(argv[0]);
+            return 1;
+        }
+    } else if (key_path == NULL) {
         print_usage(argv[0]);
         return 1;
     }
@@ -264,11 +374,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    rc = wolfSSL_CTX_use_PrivateKey_file(ctx, key_path, WOLFSSL_FILETYPE_PEM);
-    if (rc != WOLFSSL_SUCCESS) {
-        fprintf(stderr,
-            "wolfSSL_CTX_use_PrivateKey_file failed (rc=%d) - check "
-            "the -k path was given correctly\n", rc);
+    if (load_private_key(ctx, key_path, keyshare_dir, peer_ip,
+                          peer_hostname) != 0) {
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -276,6 +383,12 @@ int main(int argc, char *argv[])
 #endif
         return 1;
     }
+    /* Deliberately NOT calling keyshare_stop_listener() here - see its
+     * doc comment in keyshare.h for the real deadlock this caused the
+     * first time around. The listener stays up for this process's
+     * whole lifetime, so the peer can fetch its own share from THIS
+     * device at any later point too, including after its own
+     * independent reboot. */
 
     rc = wolfSSL_CTX_load_verify_locations(ctx, ca_path, NULL);
     if (rc != WOLFSSL_SUCCESS) {
