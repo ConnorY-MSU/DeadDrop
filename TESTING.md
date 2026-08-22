@@ -1381,7 +1381,23 @@ Replaces the secure-element chip plan with a software-only scheme: each device's
 
 ### Not yet done
 - The one-time setup tool's output has never been run through the Day 6 rotation drill yet (regenerate + redistribute a share pair for an already-deployed device) - deferred to Day 6 itself.
-- Retry-with-backoff was exercised implicitly (both devices did wait through real retry cycles before the ACL was fixed) but not deliberately tested as its own scenario (e.g., killing one device mid-session and confirming the other's *next* independent reboot still recovers) - worth a dedicated test before calling Day 4 fully closed out.
-- File permissions on `~/keyshare/*` were set to `600` manually during this test; not yet folded into an automated provisioning step.
+
+### Retry-with-backoff, tested as its own dedicated scenario — 2026-08-22
+
+The earlier test above exercised retry incidentally (both devices happened to wait through real retry cycles before the ACL was fixed). This is a deliberate, isolated repeat, specifically to prove the "peer currently unreachable" boot path in isolation, not bundled with debugging something else.
+
+**Setup**: `bravo`'s client started first (in `-K`/keyshare mode), with `alpha`'s server deliberately *not* running yet.
+
+**Observed**: `bravo` printed its one-time "Fetching this device's key-share from its paired device over Tailscale (retrying until it's reachable)..." message and then genuinely blocked - confirmed via `ps` that the process was alive and idle, not crashed, roughly 12 seconds in (mid-way through the 1s→2s→4s→8s→16s→30s-capped backoff climb in `keyshare_reconstruct()`). No per-attempt log line is expected or printed between retries - that's by design, not a bug (see `src/keyshare.c`'s retry loop).
+
+**Recovery**: `alpha`'s server was started roughly 13 seconds after `bravo`. `alpha` came up almost immediately, since `bravo`'s own share-listener had been running the whole time it was retrying (a device's listener starts before its own reconstruct loop begins, so a peer can always find it even mid-retry). `bravo`'s very next scheduled retry attempt then succeeded: `Key-share reconstructed.` appeared in its log, followed by a full mTLS handshake and `Connected to server` on screen.
+
+**Full proof, not just "it unblocked"**: sent a real message from `bravo` (`retry-with-backoff test message`) after recovery and confirmed it displayed correctly on `alpha`'s screen (`client: retry-with-backoff test message`), with `alpha`'s verify callback log showing the same revocation check passing as every prior successful connection - proving this wasn't a degraded/partial recovery, the session is fully functional afterward.
+
+This closes the "not yet done" gap from the first Day 4 test above - retry-with-backoff is now verified as its own scenario, independent of the ACL/listener-lifetime debugging it was previously entangled with.
+
+### File permissions - folded into a real provisioning step — 2026-08-22
+
+Previously done ad hoc (`chmod 600` typed by hand during live testing, per the entry above). Added `docs/provision-permissions.sh`: locks `~/pki` and `~/keyshare` to `700` (directory) and `600` (every regular file inside), idempotent, safe to re-run any time (e.g. after Day 6's rotation drill deploys a new certificate). Deployed and run on both `alpha` and `bravo`; verified via `ls -la` on both that every file/directory landed at the intended mode. Skips gracefully (prints a note, doesn't error) if a device only uses one of the two directories.
 
 **Not yet done**: Phase 2 (the distinctive Flipper Zero/Cyberpunk 2077-style aesthetic) - deliberately deferred, per the user's own two-phase framing. An actual reboot-cycle re-verification of the font persistence, same as the still-open `con2fbmap` one.
