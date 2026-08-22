@@ -206,13 +206,21 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* SECURITY: nothing printed from here through ui_init() below
+     * includes a filesystem path, deliberately - confirmed via real
+     * physical-console testing that this output is genuinely visible
+     * on the touchscreen (this project's whole point), not just a
+     * development-time convenience. A device meant to sit somewhere
+     * semi-public shouldn't hand a casual observer the exact on-disk
+     * layout of its own private key material - real info found and
+     * fixed the same day it was noticed, not a hypothetical concern. */
     rc = revocation_load(revoked_path);
     if (rc != 0) {
         fprintf(stderr,
-            "Warning: revocation_load(\"%s\") failed - all certs will "
-            "be treated as revoked until this is fixed.\n", revoked_path);
+            "Warning: loading the revoked-serials list failed - all "
+            "certs will be treated as revoked until this is fixed.\n");
     } else {
-        printf("Loaded revoked-serials list: %s\n", revoked_path);
+        printf("Loaded revoked-serials list.\n");
     }
 
 #ifdef _WIN32
@@ -246,8 +254,8 @@ int main(int argc, char *argv[])
     rc = wolfSSL_CTX_use_certificate_file(ctx, cert_path, WOLFSSL_FILETYPE_PEM);
     if (rc != WOLFSSL_SUCCESS) {
         fprintf(stderr,
-            "wolfSSL_CTX_use_certificate_file failed (rc=%d) for %s\n",
-            rc, cert_path);
+            "wolfSSL_CTX_use_certificate_file failed (rc=%d) - check "
+            "the -c path was given correctly\n", rc);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -259,8 +267,8 @@ int main(int argc, char *argv[])
     rc = wolfSSL_CTX_use_PrivateKey_file(ctx, key_path, WOLFSSL_FILETYPE_PEM);
     if (rc != WOLFSSL_SUCCESS) {
         fprintf(stderr,
-            "wolfSSL_CTX_use_PrivateKey_file failed (rc=%d) for %s\n",
-            rc, key_path);
+            "wolfSSL_CTX_use_PrivateKey_file failed (rc=%d) - check "
+            "the -k path was given correctly\n", rc);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -272,8 +280,8 @@ int main(int argc, char *argv[])
     rc = wolfSSL_CTX_load_verify_locations(ctx, ca_path, NULL);
     if (rc != WOLFSSL_SUCCESS) {
         fprintf(stderr,
-            "wolfSSL_CTX_load_verify_locations failed (rc=%d) for %s\n",
-            rc, ca_path);
+            "wolfSSL_CTX_load_verify_locations failed (rc=%d) - check "
+            "the -A path was given correctly\n", rc);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -282,8 +290,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("wolfSSL initialized; cert/key/CA loaded from %s / %s / %s\n",
-           cert_path, key_path, ca_path);
+    printf("wolfSSL initialized; certificate, key, and CA loaded.\n");
     wolfSSL_CTX_set_verify(ctx,
         WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
         my_verify_callback);
