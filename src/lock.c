@@ -1,0 +1,201 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "lock.h"
+#include "sha256.h"
+
+#ifdef _WIN32
+    #include <direct.h>
+    #define MKDIR(path) _mkdir(path)
+#else
+    #include <sys/stat.h>
+    #include <sys/types.h>
+    #include <unistd.h>
+    #define MKDIR(path) mkdir((path), 0700)
+#endif
+
+#define LOCK_SALT_LEN 16
+#define LOCK_HASH_LEN 32
+#define LOCK_FILE_LEN (LOCK_SALT_LEN + LOCK_HASH_LEN)
+
+int lock_pin_file_path(char *buf, size_t buf_size)
+{
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (home == NULL) {
+        home = getenv("USERPROFILE");
+    }
+#endif
+    if (home == NULL) {
+        return -1;
+    }
+    if ((size_t)snprintf(buf, buf_size, "%s/.securelink/pin_hash", home)
+            >= buf_size) {
+        return -1;
+    }
+    return 0;
+}
+
+/* Directory portion of lock_pin_file_path()'s result, so the file can
+ * actually be created - MKDIR on an already-existing directory is
+ * treated as success (not every platform/libc agrees on the errno for
+ * "already exists", so this checks by trying to open a file in it
+ * afterward instead of inspecting MKDIR's own return value). */
+static int ensure_pin_dir(const char *pin_path)
+{
+    char dir[512];
+    char *slash;
+
+    if (snprintf(dir, sizeof(dir), "%s", pin_path) >= (int)sizeof(dir)) {
+        return -1;
+    }
+    slash = strrchr(dir, '/');
+    if (slash == NULL) {
+        return 0; /* no directory component - nothing to create */
+    }
+    *slash = '\0';
+    MKDIR(dir);
+    return 0;
+}
+
+/*
+ * fill_random - fill buf with unpredictable bytes, suitable for a
+ * salt (does not need to be secret, just unpredictable enough that two
+ * devices don't collide and a precomputed rainbow table doesn't help
+ * an attacker). /dev/urandom is the standard, always-available source
+ * on Linux for exactly this kind of use - not blocking, not something
+ * that needs the stronger guarantees /dev/random makes. The rand()-
+ * based fallback only exists so this file compiles and runs on the
+ * non-Linux dev machine too (the lock screen itself is a Linux/ncurses-
+ * only UI feature - see ui.h - so this path is never exercised for
+ * anything that actually needs to be secure).
+ */
+static void fill_random(uint8_t *buf, size_t len)
+{
+#ifdef __linux__
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f != NULL) {
+        size_t got = fread(buf, 1, len, f);
+        fclose(f);
+        if (got == len) {
+            return;
+        }
+    }
+#endif
+    {
+        static int seeded = 0;
+        size_t i;
+        if (!seeded) {
+            srand((unsigned int)time(NULL));
+            seeded = 1;
+        }
+        for (i = 0; i < len; i++) {
+            buf[i] = (uint8_t)(rand() & 0xFF);
+        }
+    }
+}
+
+static void hash_salted_pin(const uint8_t *salt, const char *pin,
+                             size_t pin_len, uint8_t out_digest[LOCK_HASH_LEN])
+{
+    sha256_context ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, salt, LOCK_SALT_LEN);
+    sha256_update(&ctx, (const uint8_t *)pin, pin_len);
+    sha256_final(&ctx, out_digest);
+}
+
+int lock_pin_exists(void)
+{
+    char path[512];
+    FILE *f;
+
+    if (lock_pin_file_path(path, sizeof(path)) != 0) {
+        return 0;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
+int lock_set_pin(const char *pin, size_t pin_len)
+{
+    char path[512];
+    uint8_t file_data[LOCK_FILE_LEN];
+    FILE *f;
+
+    if (pin == NULL || pin_len < LOCK_PIN_MIN_LEN ||
+        pin_len > LOCK_PIN_MAX_LEN) {
+        return -1;
+    }
+    if (lock_pin_file_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    if (ensure_pin_dir(path) != 0) {
+        return -1;
+    }
+
+    fill_random(file_data, LOCK_SALT_LEN);
+    hash_salted_pin(file_data, pin, pin_len, file_data + LOCK_SALT_LEN);
+
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        return -1;
+    }
+    {
+        size_t written = fwrite(file_data, 1, LOCK_FILE_LEN, f);
+        fclose(f);
+        if (written != LOCK_FILE_LEN) {
+            return -1;
+        }
+    }
+#ifndef _WIN32
+    chmod(path, 0600); /* owner read/write only - see this file's top comment */
+#endif
+    return 0;
+}
+
+int lock_check_pin(const char *pin, size_t pin_len)
+{
+    char path[512];
+    uint8_t file_data[LOCK_FILE_LEN];
+    uint8_t computed[LOCK_HASH_LEN];
+    FILE *f;
+    size_t got;
+    int i;
+    uint8_t diff;
+
+    if (pin == NULL) {
+        return 0;
+    }
+    if (lock_pin_file_path(path, sizeof(path)) != 0) {
+        return 0;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    got = fread(file_data, 1, LOCK_FILE_LEN, f);
+    fclose(f);
+    if (got != LOCK_FILE_LEN) {
+        return 0;
+    }
+
+    hash_salted_pin(file_data, pin, pin_len, computed);
+
+    /* Constant-time-ish comparison - not because this gate's threat
+     * model demands defending against a remote timing side-channel
+     * (there isn't one; the comparison happens locally against
+     * physically-typed input), but because it costs nothing here and
+     * is the correct habit for comparing secret digests generally. */
+    diff = 0;
+    for (i = 0; i < LOCK_HASH_LEN; i++) {
+        diff |= (uint8_t)(computed[i] ^ file_data[LOCK_SALT_LEN + i]);
+    }
+    return diff == 0;
+}

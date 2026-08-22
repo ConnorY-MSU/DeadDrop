@@ -1227,7 +1227,37 @@ New `include/ui.h`/`src/ui.c` module, `__linux__`-gated real ncurses implementat
 ### Build notes
 `ui.c` needs `pkg-config --cflags ncurses` (`-D_DEFAULT_SOURCE -D_XOPEN_SOURCE=600`) specifically for its compile step, and links against `-lncurses -ltinfo` in addition to this project's existing libs. Confirmed via `pkg-config --cflags --libs ncurses` on both Pis rather than assumed. `tmux` was installed on both Pis specifically to drive/inspect the ncurses UI programmatically for this testing (`tmux send-keys` / `tmux capture-pane`) - a testing-only tool, not a project runtime dependency.
 
+### Display hierarchy made explicit — 2026-08-21
+Following the user's request, the touchscreen/ncurses UI is now explicitly documented (in `ui.h`'s and `hw_oled.h`'s top comments, and in the build log) as the **primary** display - full status, full history, real interaction. The 128x64 OLED is explicitly **secondary** - small, glanceable, brief-preview-only, never a substitute. This governs what belongs where going forward, not just a naming choice.
+
+## Week 4, Days 2-3 (Part E) — lock screen — 2026-08-21
+
+New `include/lock.h`/`src/lock.c`: salted-hash PIN storage using the project's own Week 1 `sha256.c` (a legitimate, deliberate use of the hand-rolled primitive in the shipped product - see `lock.h`'s comment). Pure logic, no ncurses dependency at all, verified in isolation first via a throwaway ad-hoc test program (set/check/wrong-PIN/wrong-length/overwrite, all passed) before touching `ui.c` - the same "isolate before integrate" discipline used throughout this project.
+
+Real decisions made and documented in `ui.c`'s lock-screen block comment, per `ncurses UI Concepts.md`:
+- **Hidden/visible**: message history and the compose line hidden while locked; status bar (connection state) stays visible and untouched by lock state.
+- **Entry point**: Ctrl+L, one discoverable keybinding doing double duty - "lock now" if a PIN exists, "start setting a PIN" if none does yet. A device with no PIN configured starts unlocked with an in-history hint, rather than demanding PIN setup before it's otherwise usable.
+- **Lock timing**: locked by default on boot whenever a PIN has ever been set; 120-second inactivity auto-lock otherwise (reasoning: long enough not to interrupt someone actively reading/replying, short enough that walking away doesn't leave content exposed for long).
+- **Rate limiting**: yes - a short, increasing delay (1s, 2s, ... capped at 5s) after each wrong PIN, even though the actual threat model (physical possession already required to reach this screen at all) doesn't strictly demand it - cheap to implement, real speed bump against a scripted/macro attempt.
+- **Decoupling**: the lock-screen state machine touches only ncurses windows and `lock.c` - never a socket, a `WOLFSSL*`, or `sl_session_state*` - so there's no code path by which it could disrupt the network/crypto layer.
+
+**Implementation subtlety worth recording**: hiding history while still receiving requires care with ncurses' own model. `ui_add_history()` always `wprintw()`s into `history_win`'s buffer regardless of lock state (the receiver thread's behavior must never change based on UI state), but only calls `wrefresh()` when NOT locked. The lock overlay is drawn and `wrefresh()`'d once, at lock time, and then simply never gets overwritten on the physical screen (since no further `wrefresh(history_win)` happens) even though real messages keep accumulating in the window's off-screen buffer underneath. Unlocking calls `touchwin(history_win)` before `wrefresh()` - required, not optional, since ncurses' normal diff-based refresh can otherwise miss content that changed while that window wasn't the one being refreshed.
+
+### Verified end-to-end on real two-Pi hardware, including the decoupling proof test the walkthrough specifically asks for
+1. First run, no PIN configured: correctly started unlocked with the "No PIN set" hint.
+2. Ctrl+L → set PIN flow (enter, confirm, mismatch-retry path all exercised) → "PIN set" confirmation.
+3. Ctrl+L again → correctly locked, history hidden, status bar unaffected ("Connected to client" stayed visible).
+4. **Sent a real message from `bravo` while `alpha` was locked** - `alpha`'s screen stayed on the lock prompt throughout, exactly as designed.
+5. Wrong PIN on `alpha` → correct rate-limit message ("Wrong PIN (wait 1s before next try)").
+6. Correct PIN after the cooldown → unlocked, and **the message that arrived while locked was immediately visible** - the actual decoupling proof.
+7. Sent one more message each direction after unlocking - connection fully healthy, nothing about the lock cycle degraded it.
+
+### A real architecture gap found via this testing, not yet resolved
+Ctrl+L and typed characters appeared to do nothing on the very first attempt - not a lock-screen bug: `ui_poll_line()` (and therefore all lock-screen interaction, including first-time PIN setup) is only ever called from *inside* `run_symmetric_session()`'s sender loop, which doesn't exist until a connection is established. `server.c`'s accept loop blocks in `accept()` indefinitely with no input polling at all while waiting for a peer; `client.c`'s reconnect loop is similarly unresponsive during its backoff sleep. Confirmed by reproducing: input sent before a connection existed sat queued in the pty and was only processed once `bravo` connected and `run_symmetric_session()` started reading it.
+
+**Practically**: on this project's real target topology (two Pis on the same Tailscale mesh, normally connected to each other most of the time), this mostly affects the boot-up window before the first connection lands and any reconnect gaps - not the steady state. But it's a real, honest limitation for a device meant to work as a standalone kiosk: someone can't set up or check a PIN, or manually lock the screen, while the device happens to be disconnected. Not fixed yet - flagged for a decision on the right approach (e.g., a dedicated idle-input-polling thread active only between sessions, since `server.c`'s blocking `accept()` in particular would need restructuring to poll rather than block indefinitely) rather than guessed at and bolted on without thinking through the concurrency implications with the same care the rest of this project's threading work has had.
+
 ### Not yet done (Days 2-3, remaining)
-- The lock screen (Part E): hidden/visible state design, salted-hash PIN storage via the Week 1 SHA-256 implementation, lock timing, rate-limiting decision, and the decoupling proof test (lock → send from peer → unlock → confirm received).
+- The architecture gap above - interacting with the lock screen while no connection is active.
 - The WiFi setup screen (Part H): scan/select/connect via `nmcli`, the "no network found" prompt, tested against a genuinely new network.
 - Whether/how the RGB status light and OLED hook into this new ncurses UI, rather than remaining a separate layer - still an open question carried forward from Day 1.

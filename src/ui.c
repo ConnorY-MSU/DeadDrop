@@ -21,6 +21,9 @@
 #include <ncurses.h>
 #include <pthread.h>
 #include <unistd.h> /* usleep() - see ui_poll_line()'s comment */
+#include <time.h>
+
+#include "lock.h"
 
 /* --- Module state -------------------------------------------------------
  *
@@ -65,11 +68,120 @@ static int ui_active = 0;
 static char input_buf[UI_INPUT_MAX];
 static size_t input_len = 0;
 
+/* --- Lock screen (Week 4 Days 2-3 Part E) -------------------------------
+ *
+ * Real design decisions, per ncurses UI Concepts.md - see lock.h for the
+ * PIN storage side of this:
+ * - HIDDEN VS VISIBLE: message history and the compose line are hidden
+ *   while locked; the status bar (connection state) stays visible and
+ *   fully independent of lock state - the device should still visibly
+ *   prove it's doing its job from across the room. See ui_add_history()
+ *   below for exactly how "hidden but still received" is implemented.
+ * - ENTRY POINT: Ctrl+L, a single discoverable keybinding doing double
+ *   duty - "lock now" if a PIN exists and the UI is unlocked, "start
+ *   setting a PIN" if none exists yet. A device with no PIN configured
+ *   starts unlocked (nothing to protect) with an in-history hint on how
+ *   to set one, rather than being permanently un-lockable or demanding
+ *   PIN setup before the device is otherwise usable.
+ * - LOCK TIMING: locked by default on boot whenever a PIN has ever been
+ *   set (checked once in ui_init() via lock_pin_exists()). Inactivity
+ *   auto-lock after UI_INACTIVITY_TIMEOUT_SECONDS of no keystrokes -
+ *   chosen as a middle ground: long enough that someone actively reading
+ *   or replying to messages isn't constantly re-locked, short enough
+ *   that walking away doesn't leave message content exposed for long.
+ * - RATE LIMITING: yes, a short, increasing delay after each wrong PIN
+ *   (capped at 5s) - decided even though the actual threat model here
+ *   (ncurses UI Concepts.md: reaching this screen at all already
+ *   requires physical possession of a powered, connected device) doesn't
+ *   strictly demand it, because it costs almost nothing to implement and
+ *   adds a real speed bump against a scripted/macro brute-force attempt
+ *   via a physically attached keyboard.
+ * - DECOUPLING: this state machine touches ONLY ncurses windows and the
+ *   pure lock.c PIN-hash module - it never receives a socket, a
+ *   WOLFSSL*, or a sl_session_state*, so there is no code path by which
+ *   it COULD disrupt the network/crypto layer, rate-limiting included.
+ *   Proven, not just asserted, via a real cross-device test - see
+ *   TESTING.md.
+ */
+typedef enum {
+    UI_MODE_NORMAL,
+    UI_MODE_LOCKED,
+    UI_MODE_SET_PIN_NEW,
+    UI_MODE_SET_PIN_CONFIRM
+} ui_mode_t;
+
+static ui_mode_t ui_mode = UI_MODE_NORMAL;
+static int pin_configured = 0; /* cached lock_pin_exists(), see ui_init() */
+
+static char pin_entry_buf[LOCK_PIN_MAX_LEN + 1];
+static size_t pin_entry_len = 0;
+static char pin_first_entry_buf[LOCK_PIN_MAX_LEN + 1]; /* holds the first
+    of two entries during UI_MODE_SET_PIN_NEW -> _CONFIRM */
+static size_t pin_first_entry_len = 0;
+
+static int wrong_attempt_count = 0;
+static time_t next_allowed_check_time = 0;
+
+#define UI_INACTIVITY_TIMEOUT_SECONDS 120
+static time_t last_activity_time = 0;
+
+/* Must be called with ui_mutex held. Replaces history_win's PHYSICAL
+ * content with a locked banner, then STOPS refreshing history_win (see
+ * ui_add_history() below) until unlock - real incoming messages keep
+ * being written into history_win's off-screen buffer the whole time via
+ * wprintw() there, regardless of lock state (the receiver thread calling
+ * ui_add_history() never changes behavior based on lock state - see this
+ * block's DECOUPLING note above), they just don't reach the physical
+ * screen until wrefresh(history_win) happens again at unlock. */
+static void draw_locked_overlay_locked(void)
+{
+    werase(history_win);
+    mvwprintw(history_win, 0, 0,
+              "Locked. Messages are still being received normally in the "
+              "background.\nEnter your PIN below and press Enter to "
+              "unlock.");
+    wrefresh(history_win);
+}
+
+/* Mode-aware input-line redraw - replaces the old single-purpose
+ * "redraw the compose line" function. Must be called with ui_mutex held. */
 static void redraw_input_locked(void)
 {
-    werase(input_win);
-    mvwprintw(input_win, 0, 0, "> %s", input_buf);
-    wrefresh(input_win);
+    size_t i;
+
+    switch (ui_mode) {
+    case UI_MODE_LOCKED:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "Enter PIN to unlock: ");
+        for (i = 0; i < pin_entry_len; i++) {
+            waddch(input_win, '*');
+        }
+        wrefresh(input_win);
+        break;
+    case UI_MODE_SET_PIN_NEW:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "Set a PIN (min %d chars): ",
+                  LOCK_PIN_MIN_LEN);
+        for (i = 0; i < pin_entry_len; i++) {
+            waddch(input_win, '*');
+        }
+        wrefresh(input_win);
+        break;
+    case UI_MODE_SET_PIN_CONFIRM:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "Confirm PIN: ");
+        for (i = 0; i < pin_entry_len; i++) {
+            waddch(input_win, '*');
+        }
+        wrefresh(input_win);
+        break;
+    case UI_MODE_NORMAL:
+    default:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "> %s", input_buf);
+        wrefresh(input_win);
+        break;
+    }
 }
 
 void ui_init(const char *peer_label)
@@ -98,14 +210,36 @@ void ui_init(const char *peer_label)
 
     input_len = 0;
     input_buf[0] = '\0';
+    pin_entry_len = 0;
+    pin_entry_buf[0] = '\0';
+    pin_first_entry_len = 0;
+    wrong_attempt_count = 0;
+    next_allowed_check_time = 0;
+    last_activity_time = time(NULL);
+
+    /* Locked by default on boot whenever a PIN has ever been set on this
+     * device (non-negotiable per the build log); a device with no PIN
+     * configured yet starts unlocked - see this block's top comment. */
+    pin_configured = lock_pin_exists();
+    ui_mode = pin_configured ? UI_MODE_LOCKED : UI_MODE_NORMAL;
 
     ui_active = 1;
 
-    ui_set_statusf("Connecting to %s...", peer_label ? peer_label : "?");
-    wrefresh(history_win);
     pthread_mutex_lock(&ui_mutex);
+    if (ui_mode == UI_MODE_LOCKED) {
+        draw_locked_overlay_locked();
+    } else {
+        wrefresh(history_win);
+    }
     redraw_input_locked();
     pthread_mutex_unlock(&ui_mutex);
+
+    ui_set_statusf("Connecting to %s...", peer_label ? peer_label : "?");
+
+    if (!pin_configured) {
+        ui_add_history(NULL, "No PIN set - press Ctrl+L to set one and "
+                              "enable the lock screen.");
+    }
 }
 
 void ui_set_status(const char *status_text)
@@ -149,7 +283,16 @@ void ui_add_history(const char *prefix, const char *text)
     } else {
         wprintw(history_win, "%s\n", text != NULL ? text : "");
     }
-    wrefresh(history_win);
+    /* Always write into history_win's buffer (above), regardless of lock
+     * state - see this file's lock-screen block comment's DECOUPLING
+     * note: the receiver thread calling this must never behave
+     * differently based on UI lock state. Only the PHYSICAL screen
+     * update is gated: while locked, skip wrefresh() so the
+     * accumulating real content stays invisible behind the lock overlay
+     * (drawn once, at lock time) until unlock explicitly reveals it. */
+    if (ui_mode != UI_MODE_LOCKED) {
+        wrefresh(history_win);
+    }
     redraw_input_locked();
     pthread_mutex_unlock(&ui_mutex);
 }
@@ -187,12 +330,32 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
 
     while (elapsed_ms < timeout_ms) {
         int ch;
+        const char *pending_history_msg = NULL; /* see below - can't call
+            ui_add_history() while ui_mutex is already held (non-recursive
+            mutex), so a permanent-history confirmation gets queued here
+            and added AFTER unlocking this slice's critical section */
         int slice_ms = UI_POLL_SLICE_MS;
         if (elapsed_ms + slice_ms > timeout_ms) {
             slice_ms = timeout_ms - elapsed_ms;
         }
 
         pthread_mutex_lock(&ui_mutex);
+
+        /* Inactivity auto-lock - see this file's lock-screen block
+         * comment for the chosen timeout and reasoning. Only relevant
+         * when currently unlocked AND a PIN actually exists to lock
+         * with (locking a device with nothing configured to unlock
+         * again would just be a permanent, pointless lockout). */
+        if (ui_mode == UI_MODE_NORMAL && pin_configured &&
+            difftime(time(NULL), last_activity_time) >=
+                UI_INACTIVITY_TIMEOUT_SECONDS) {
+            ui_mode = UI_MODE_LOCKED;
+            pin_entry_len = 0;
+            pin_entry_buf[0] = '\0';
+            draw_locked_overlay_locked();
+            redraw_input_locked();
+        }
+
         wtimeout(input_win, slice_ms);
         ch = wgetch(input_win);
 
@@ -214,41 +377,197 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
         {
             ui_poll_result result = UI_POLL_TIMEOUT;
 
-            if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-                if (out_line != NULL && out_line_size > 0) {
-                    size_t n = input_len;
-                    if (n >= out_line_size) {
-                        n = out_line_size - 1;
-                    }
-                    memcpy(out_line, input_buf, n);
-                    out_line[n] = '\0';
+            if (ch == 12 && ui_mode != UI_MODE_LOCKED) {
+                /* Ctrl+L (ASCII 12) - the lock screen's single
+                 * discoverable entry point, doing double duty per this
+                 * file's lock-screen block comment. Ignored while
+                 * already LOCKED (nothing meaningful for it to do) or
+                 * mid-PIN-setup (avoid an inconsistent half-entered
+                 * state). */
+                if (pin_configured) {
+                    ui_mode = UI_MODE_LOCKED;
+                    pin_entry_len = 0;
+                    pin_entry_buf[0] = '\0';
+                    draw_locked_overlay_locked();
+                } else if (ui_mode == UI_MODE_NORMAL) {
+                    ui_mode = UI_MODE_SET_PIN_NEW;
+                    pin_entry_len = 0;
+                    pin_entry_buf[0] = '\0';
                 }
-                input_len = 0;
-                input_buf[0] = '\0';
                 redraw_input_locked();
-                result = UI_POLL_LINE;
-            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-                if (input_len > 0) {
-                    input_len--;
-                    input_buf[input_len] = '\0';
+            } else if (ui_mode == UI_MODE_NORMAL) {
+                last_activity_time = time(NULL);
+                if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    if (out_line != NULL && out_line_size > 0) {
+                        size_t n = input_len;
+                        if (n >= out_line_size) {
+                            n = out_line_size - 1;
+                        }
+                        memcpy(out_line, input_buf, n);
+                        out_line[n] = '\0';
+                    }
+                    input_len = 0;
+                    input_buf[0] = '\0';
                     redraw_input_locked();
+                    result = UI_POLL_LINE;
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    if (input_len > 0) {
+                        input_len--;
+                        input_buf[input_len] = '\0';
+                        redraw_input_locked();
+                    }
+                } else if (ch >= 32 && ch < 127) {
+                    if (input_len + 1 < sizeof(input_buf)) {
+                        input_buf[input_len++] = (char)ch;
+                        input_buf[input_len] = '\0';
+                        redraw_input_locked();
+                    }
+                    /* else: silently drop the keystroke once
+                     * UI_INPUT_MAX is hit - an honest, deliberate cap
+                     * (see its #define), not a bug. */
                 }
-            } else if (ch >= 32 && ch < 127) {
-                if (input_len + 1 < sizeof(input_buf)) {
-                    input_buf[input_len++] = (char)ch;
-                    input_buf[input_len] = '\0';
+                /* Any other key (arrows, function keys, resize, etc.):
+                 * ignored - out of scope for this project's UI, see
+                 * ui.h's touch/keyboard scope note for the same kind
+                 * of deliberate, documented limit. */
+            } else if (ui_mode == UI_MODE_LOCKED) {
+                if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    time_t now = time(NULL);
+                    if (now < next_allowed_check_time) {
+                        char msg[64];
+                        snprintf(msg, sizeof(msg),
+                                 "Please wait %ld more second(s).",
+                                 (long)(next_allowed_check_time - now));
+                        werase(input_win);
+                        mvwprintw(input_win, 0, 0, "%s", msg);
+                        wrefresh(input_win);
+                    } else if (lock_check_pin(pin_entry_buf, pin_entry_len)) {
+                        ui_mode = UI_MODE_NORMAL;
+                        wrong_attempt_count = 0;
+                        next_allowed_check_time = 0;
+                        last_activity_time = time(NULL);
+                        /* Reveal history_win: it was never wrefresh()'d
+                         * while locked (see ui_add_history()), so
+                         * touchwin() is needed to force a full redraw -
+                         * ncurses' normal diff-based refresh could
+                         * otherwise miss content that changed while
+                         * this window wasn't the one being refreshed. */
+                        touchwin(history_win);
+                        wrefresh(history_win);
+                        redraw_input_locked();
+                    } else {
+                        int delay;
+
+                        wrong_attempt_count++;
+                        delay = wrong_attempt_count;
+                        if (delay > 5) {
+                            delay = 5;
+                        }
+                        next_allowed_check_time = time(NULL) + delay;
+
+                        {
+                            char msg[64];
+                            snprintf(msg, sizeof(msg),
+                                     "Wrong PIN (wait %ds before next "
+                                     "try).", delay);
+                            werase(input_win);
+                            mvwprintw(input_win, 0, 0, "%s", msg);
+                            wrefresh(input_win);
+                        }
+                    }
+                    pin_entry_len = 0;
+                    pin_entry_buf[0] = '\0';
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    if (pin_entry_len > 0) {
+                        pin_entry_len--;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                } else if (ch >= 32 && ch < 127) {
+                    if (pin_entry_len + 1 < sizeof(pin_entry_buf)) {
+                        pin_entry_buf[pin_entry_len++] = (char)ch;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                }
+            } else if (ui_mode == UI_MODE_SET_PIN_NEW) {
+                if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    if (pin_entry_len < LOCK_PIN_MIN_LEN) {
+                        char msg[64];
+                        snprintf(msg, sizeof(msg),
+                                 "Too short - min %d chars. Try again:",
+                                 LOCK_PIN_MIN_LEN);
+                        werase(input_win);
+                        mvwprintw(input_win, 0, 0, "%s", msg);
+                        wrefresh(input_win);
+                        pin_entry_len = 0;
+                        pin_entry_buf[0] = '\0';
+                    } else {
+                        memcpy(pin_first_entry_buf, pin_entry_buf,
+                               pin_entry_len);
+                        pin_first_entry_len = pin_entry_len;
+                        pin_entry_len = 0;
+                        pin_entry_buf[0] = '\0';
+                        ui_mode = UI_MODE_SET_PIN_CONFIRM;
+                        redraw_input_locked();
+                    }
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    if (pin_entry_len > 0) {
+                        pin_entry_len--;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                } else if (ch >= 32 && ch < 127) {
+                    if (pin_entry_len + 1 < sizeof(pin_entry_buf)) {
+                        pin_entry_buf[pin_entry_len++] = (char)ch;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                }
+            } else if (ui_mode == UI_MODE_SET_PIN_CONFIRM) {
+                if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    if (pin_entry_len == pin_first_entry_len &&
+                        memcmp(pin_entry_buf, pin_first_entry_buf,
+                               pin_entry_len) == 0) {
+                        lock_set_pin(pin_first_entry_buf,
+                                     pin_first_entry_len);
+                        pin_configured = 1;
+                        pending_history_msg =
+                            "PIN set. Ctrl+L to lock now, or it will "
+                            "lock automatically after inactivity.";
+                    } else {
+                        pending_history_msg =
+                            "PINs didn't match - PIN not changed. "
+                            "Press Ctrl+L to try again.";
+                    }
+                    ui_mode = UI_MODE_NORMAL;
+                    last_activity_time = time(NULL);
+                    memset(pin_first_entry_buf, 0,
+                           sizeof(pin_first_entry_buf));
+                    pin_first_entry_len = 0;
+                    pin_entry_len = 0;
+                    pin_entry_buf[0] = '\0';
                     redraw_input_locked();
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    if (pin_entry_len > 0) {
+                        pin_entry_len--;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                } else if (ch >= 32 && ch < 127) {
+                    if (pin_entry_len + 1 < sizeof(pin_entry_buf)) {
+                        pin_entry_buf[pin_entry_len++] = (char)ch;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
                 }
-                /* else: silently drop the keystroke once UI_INPUT_MAX
-                 * is hit - an honest, deliberate cap (see its #define),
-                 * not a bug. */
             }
-            /* Any other key (arrows, function keys, resize, etc.):
-             * ignored - out of scope for this project's UI, see ui.h's
-             * touch/keyboard scope note for the same kind of
-             * deliberate, documented limit. */
 
             pthread_mutex_unlock(&ui_mutex);
+
+            if (pending_history_msg != NULL) {
+                ui_add_history(NULL, pending_history_msg);
+            }
 
             if (result == UI_POLL_LINE) {
                 return result;

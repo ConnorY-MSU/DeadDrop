@@ -9,6 +9,15 @@
  * 2-3). Real design decisions made and documented here, per
  * ncurses UI Concepts.md:
  *
+ * - DISPLAY HIERARCHY: this is the PRIMARY display - the 4.3" DSI
+ *   touchscreen shows this UI's full status bar, full scrolling message
+ *   history, and the actual compose line. The FNK0100's small 128x64
+ *   OLED (hw_oled.h) is explicitly SECONDARY: a brief, glanceable
+ *   notification surface for when someone isn't right in front of the
+ *   touchscreen, never a substitute for it. Concretely, this governs
+ *   what belongs where: full text, full history, and real interaction
+ *   belong here; short previews and at-a-glance status belong on the
+ *   OLED. See hw_oled.h's matching comment.
  * - CONCURRENCY: reuses session.c's existing threaded design rather
  *   than introducing a second, competing concurrency model. session.c
  *   already has a receiver thread (always processing incoming

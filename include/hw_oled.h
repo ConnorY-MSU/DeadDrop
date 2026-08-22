@@ -5,16 +5,25 @@
  * hw_oled - native C driver for the FNK0100 case's SSD1306-compatible
  * 128x64 monochrome OLED (I2C address 0x3C, bus 1 - confirmed from
  * Freenove's own api_oled.py, not guessed). Week 4 physical-build
- * addition, same status as hw_expansion.h: written against real,
- * sourced references (the SSD1306 init sequence and the embedded font
- * in hw_oled_font.h both traced to Adafruit's own MIT-licensed
- * Adafruit_SSD1306/Adafruit-GFX-Library source, not reconstructed from
- * memory), but NOT yet compiled or run against real hardware - see
- * hw_expansion.h's fuller status note, which applies identically here.
+ * addition, written against real, sourced references (the SSD1306 init
+ * sequence and the embedded font in hw_oled_font.h both traced to
+ * Adafruit's own MIT-licensed Adafruit_SSD1306/Adafruit-GFX-Library
+ * source, not reconstructed from memory). Confirmed working on real
+ * hardware, both units, 2026-08-21 - see TESTING.md.
  *
- * Text-only API, deliberately - "display when a new message comes
- * through" is this project's actual requirement, not general graphics,
- * so this doesn't implement arbitrary pixel/line drawing.
+ * DISPLAY HIERARCHY - explicit, not incidental: this 128x64 OLED is
+ * the SECONDARY display. The FNK0100's 4.3" DSI touchscreen (driven by
+ * the real ncurses UI, see ui.h) is the PRIMARY display - full status
+ * bar, full scrolling message history, the actual compose line. This
+ * OLED exists purely for small, glanceable, at-a-distance signals (a
+ * brief "new message" preview, a couple of short status lines) that
+ * don't require walking up to and reading the touchscreen - it is
+ * never meant to duplicate or substitute for the primary UI's full
+ * content, and callers should keep whatever they draw here short and
+ * secondary in nature (the 21-character-wide preview used elsewhere in
+ * this codebase is the right scale to aim for). Text-only API,
+ * deliberately - "brief glanceable notification," not general graphics,
+ * is this module's actual scope.
  */
 
 #define HW_OLED_WIDTH   128
