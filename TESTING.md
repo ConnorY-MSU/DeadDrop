@@ -1095,6 +1095,82 @@ build/:        all artifacts survived (server, client, test_message, etc. all pr
 
 ### Not yet done (Day 1)
 - Key expiry disable for both Pis in the Tailscale admin console — handed to the user, not yet confirmed.
-- I2C not yet enabled (`raspi-config` → Interface Options → I2C) — needed before any of the hardware modules can be verified against real silicon, not just confirmed to compile and fail gracefully.
 - Per-device PKI identities for `alpha`/`bravo` (currently reusing the shared dev-machine test cert pair for the connectivity proof) — real, worth doing, not done today.
 - `espeak-ng` not yet installed on either Pi.
+
+## Loose-end close-out — real I2C hardware verification — 2026-08-21
+
+`raspi-config nonint do_i2c 0` on both — `/dev/i2c-1` present immediately on both, no reboot needed. `i2c-tools` installed, `sudo i2cdetect -y 1` run on both — **both expected addresses responded, exactly matching what the code was written against, not assumed**:
+```
+20: -- 21 -- -- -- -- -- -- -- -- -- -- -- -- -- --
+30: -- -- -- -- -- -- -- -- -- -- -- -- 3c -- -- --
+```
+(`0x21` = FNK0100 expansion board, `0x3c` = SSD1306 OLED — identical on both Pis.)
+
+**Ran `server` on `alpha` for real, against real silicon, for the first time.** No I2C errors in the log at all (previously, before I2C was enabled, both `hw_expansion_open` and `hw_oled_open` logged and continued gracefully — now both succeeded silently). Per the code, this means `HW_STATUS_DISCONNECTED` (red) was written to the RGB light and the full SSD1306 init sequence plus `"SecureLink server"` / `"Waiting..."` were written to the OLED.
+
+**User visually confirmed, in person, on the real device**: OLED genuinely displaying `"SecureLink server" / "Waiting..."`, RGB light genuinely red. Exact match to the code's design, on the very first real-hardware attempt — the I2C wire-protocol reasoning (cross-checked against the kernel's own SMBus docs), the FNK0100's register map (sourced from Freenove's own code), the SSD1306 init sequence (traced from Adafruit's own source), and the embedded font table (copied programmatically, not retyped) all turned out correct with zero fixes needed.
+
+**Dynamic behavior also confirmed for real**, not just the static at-rest state: connected `bravo`→`alpha` (this time over the real Tailscale connection, `100.124.177.123`, not just LAN) and held the session open for ~20 seconds specifically so the user could watch the transition, not just infer it from a fast exchange. **User confirmed both units' RGB lights went green while connected** (`HW_STATUS_CONNECTED`, correctly triggered on both the client and server side).
+
+**One real, expected asymmetry found and confirmed by the user in person**: `bravo`'s OLED stayed dark the whole time. Checked why rather than assumed: `client.c` only ever includes `hw_expansion.h` (RGB), never `hw_oled.h` — this was today's earlier deliberate design decision (OLED notifications wired server-side only, since the protocol is currently asymmetric: client sends, server receives/replies). **Explicitly re-decided, not left as an open question, now that it was visible in person**: staying server-side only for now, revisit if/when the protocol becomes genuinely bidirectional.
+
+**Net result: every piece of the FNK0100 hardware work built "blind" earlier today is now confirmed working against real hardware, zero fixes needed.** This is a genuinely rare, clean outcome for code that could never be compiled, let alone tested, before this exact session — worth stating plainly rather than downplaying.
+
+## Symmetric two-way communication redesign — 2026-08-21
+
+Following the OLED asymmetry finding above, the user reconsidered the protocol shape itself: **"wait i want it to be symetric, both contact both. two-way communication"** — not client-sends/server-echoes with an auto-generated "ack: " reply, but a real chat where either side can type and send at any time, and both sides display incoming messages the moment they arrive regardless of whether the local user is actively typing. Design decisions made explicitly (via direct choice, not assumed):
+- **Concurrency: threads**, not non-blocking I/O — one thread permanently dedicated to receiving, the calling thread free to poll stdin.
+- **Timing: now**, at the client.c/server.c level — not deferred into the Days 2-3 ncurses UI work.
+- **Server autonomy: "receiving always works, replying is optional"** — the server must keep displaying/logging incoming messages with zero human present (preserving this project's zero-manual-steps unattended-operation goal), but a human *can* type a reply at any time if one is at the keyboard.
+
+### wolfSSL thread-safety, researched before any code was written
+wolfSSL's own docs/forums are explicit: concurrent `wolfSSL_read()`/`wolfSSL_write()` on the *same* `WOLFSSL*` from two threads is unsafe (single shared I/O buffer). Fix: `wolfSSL_write_dup(WOLFSSL*)` (needs `HAVE_WRITE_DUP` / `--enable-writedup`) — turns the original object read-only and hands back a genuinely separate write-only object. Rebuilt wolfSSL with this flag on **all three machines** (dev, `alpha`, `bravo`) and confirmed via `nm ... | grep write_dup` showing the real compiled symbol on each, before writing any session code against it.
+
+A second, less obvious thread-safety issue found and fixed during design (not by trial and error): a receiver thread (auto-replying PONG to an incoming PING) and the local user's send both go out through the *same* write-dup'd object — splitting "serialize the message" and "write it to the wire" into two separate critical sections would let one thread's write reach the wire out of seq_num order, or worse, let two `wolfSSL_write()` calls genuinely interleave mid-record. Fixed by having a single `send_mutex` in `session.c` wrap the entire serialize+write pair as one atomic unit, for either sender. Never held around the receiver's blocking `wolfSSL_read()` — an idle peer can't stall the ability to type and send.
+
+### Architecture
+`include/session.h` / `src/session.c` — a new, genuinely shared module (`run_symmetric_session()`), used identically by both `client.c` and `server.c` — a deliberate deviation from this project's established "duplicate small glue functions rather than share them" convention, justified by the size (~200 lines) and thread-safety-criticality of this specific piece (see `session.h`'s own design comment for the full reasoning). `client.c`'s old `run_interactive_session()` (609→~470 lines) and `server.c`'s old `handle_connection()` (678→~430 lines) — including the auto-"ack: "-echo behavior — are gone entirely, replaced by a single call into `run_symmetric_session()`. Client-side OLED (`hw_oled.h`) is wired in for the first time as part of this change — the earlier server-side-only OLED decision was explicitly tied to the old asymmetric protocol, which no longer exists.
+
+### Dev-machine build verification
+`session.c` compiles clean (`-Wall -Wextra`, zero warnings) standalone and linked into both `client.exe`/`server.exe` on the Windows/MinGW dev machine, `-lpthread` added to both link lines. Confirms winpthreads (MinGW-w64's real POSIX pthread implementation) works for this code, not just a synthetic test program.
+
+### Real two-Pi-hardware verification — full pass, first attempt
+Copied the four changed/new files to both Pis' existing checkouts (git history not yet caught up to this — see below) and built natively on both:
+```
+gcc -Wall -Wextra -g -Iinclude -Isrc -c src/session.c src/client.c src/server.c
+gcc ... -o build/server ... -lwolfssl -lpthread -lm
+gcc ... -o build/client ... -lwolfssl -lpthread -lm
+```
+**New, previously-undocumented Linux-vs-Windows link requirement found**: linking against `libwolfssl.a` on Linux needs `-lm` explicitly (`DiscreteLogWorkFactor()` in `wolfcrypt/src/dh.c` calls `pow()`/`log()`) — Windows's link line never needed this. Not related to the pthread work at all; just never surfaced until this was the first time this exact object set was linked fresh on the Pi.
+
+Ran a real, live, timed two-way exchange between the two physically separate Pis (`alpha` as server, `bravo` as client, real LAN via mDNS resolution — same setup as the earlier real-hardware connectivity proof), each side's stdin fed through a FIFO with scripted timed writes to simulate a human typing without needing two people at two keyboards simultaneously. Actual captured output, both sides, unedited:
+
+**`alpha` (server) log:**
+```
+mTLS handshake succeeded.
+Connected to client. Type a message and press Enter (or 'quit' to exit).
+Incoming messages from client display automatically at any time.
+client: hello from bravo (client)
+client sent DISCONNECT.
+Connection to client lost.
+```
+
+**`bravo` (client) log:**
+```
+mTLS handshake succeeded.
+Connected to server. Type a message and press Enter (or 'quit' to exit).
+Incoming messages from server display automatically at any time.
+server: hello from alpha (server)
+server: second message from server
+```
+
+Confirms, on real hardware, all at once:
+- **No auto-ack** — the server's log shows the client's message arriving with no "ack: " reply generated (compare to the Day-1-era log further up this file, where `handle_connection()` still auto-echoed).
+- **"Receiving always works, replying is optional"** — `bravo` displayed both of `alpha`'s messages (sent at the server's own pace) without `bravo`'s own send loop being involved at all; `alpha` displayed `bravo`'s message the moment it arrived, independent of whatever `alpha`'s own scheduled input was doing.
+- **`wolfSSL_write_dup()` genuinely safe under real concurrent use** — the receiver thread was reading continuously on both machines while each machine's own send path was independently active; zero corruption, zero garbled frames, zero HMAC/seq_num rejections in either direction.
+- **Clean quit propagation** — `bravo`'s "quit" produced a real `DISCONNECT` the server received and handled correctly (`client sent DISCONNECT.` / `Connection to client lost.`), and `bravo`'s own process exited cleanly (exit code 0) rather than hanging or needing to be killed.
+
+**Not yet visually confirmed**: whether the client-side OLED wiring (new this session) actually renders on `bravo`'s screen during a real session — the test above only captured console/log output, not what's physically on either screen. Also not yet re-tested: `bravo`'s touchscreen cable check and the coordinated reboot the user asked for before this redesign work started — still outstanding from before this section.
+
+**Repo sync note**: this test ran against files copied directly (`scp`) into each Pi's existing checkout, deliberately ahead of committing — consistent with this project's discipline of proving something works before documenting/committing it as done. Both Pis' git history will be caught up (`git pull` after this work is pushed) as a follow-up, not yet done as of this section.

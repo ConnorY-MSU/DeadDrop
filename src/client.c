@@ -36,6 +36,8 @@
 
 #include "message.h"
 #include "hw_expansion.h"
+#include "hw_oled.h"
+#include "session.h"
 
 /* Host/port are generic, sensible defaults (loopback, this project's
  * standard port) - not tied to any one machine, so they're fine to keep
@@ -107,189 +109,12 @@ static void parse_args(int argc, char *argv[],
     }
 }
 
-/* --- Message framing glue: identical shape to server.c's, duplicated
- * rather than factored into a third file - see server.c's comment above
- * receive_one_message() for why that's the deliberate choice here, same
- * as the portability shim above. --- */
-
-typedef enum {
-    RECV_OK,
-    RECV_REJECTED,
-    RECV_CLOSED
-} recv_status;
-
-static recv_status receive_one_message(WOLFSSL *ssl, sl_session_state *state,
-                                        uint8_t *recv_buf, size_t *have,
-                                        sl_parsed_message *out_msg)
-{
-    for (;;) {
-        size_t consumed = 0;
-        sl_parse_result pr = sl_try_parse_message(state, recv_buf, *have,
-                                                   out_msg, &consumed);
-
-        if (pr == SL_PARSE_OK) {
-            memmove(recv_buf, recv_buf + consumed, *have - consumed);
-            *have -= consumed;
-            return RECV_OK;
-        }
-        if (pr == SL_PARSE_REJECTED) {
-            if (consumed > 0) {
-                memmove(recv_buf, recv_buf + consumed, *have - consumed);
-                *have -= consumed;
-            }
-            return RECV_REJECTED;
-        }
-
-        if (*have >= SL_MAX_MSG_SIZE) {
-            return RECV_REJECTED;
-        }
-
-        {
-            int n = wolfSSL_read(ssl, (char *)(recv_buf + *have),
-                                  (int)(SL_MAX_MSG_SIZE - *have));
-            if (n <= 0) {
-                int err = wolfSSL_get_error(ssl, n);
-                char errbuf[80];
-                fprintf(stderr, "wolfSSL_read: %s\n",
-                        wolfSSL_ERR_error_string(err, errbuf));
-                return RECV_CLOSED;
-            }
-            *have += (size_t)n;
-        }
-    }
-}
-
-static int send_message(WOLFSSL *ssl, sl_session_state *state,
-                         uint8_t msg_type, const uint8_t *body,
-                         uint32_t body_len)
-{
-    uint8_t out_buf[SL_MAX_MSG_SIZE];
-    int total;
-    int rc;
-
-    total = sl_serialize_message(state, msg_type, body, body_len,
-                                  out_buf, sizeof(out_buf));
-    if (total < 0) {
-        fprintf(stderr, "send_message: sl_serialize_message failed "
-                         "(body_len=%u)\n", body_len);
-        return -1;
-    }
-
-    rc = wolfSSL_write(ssl, out_buf, total);
-    if (rc != total) {
-        int err = wolfSSL_get_error(ssl, rc);
-        char errbuf[80];
-        fprintf(stderr, "wolfSSL_write: %s\n",
-                wolfSSL_ERR_error_string(err, errbuf));
-        return -1;
-    }
-    return 0;
-}
-
-/* --- Interactive session --- */
-
-typedef enum {
-    SESSION_USER_QUIT,   /* user typed quit/exit or closed stdin (EOF) */
-    SESSION_DISCONNECTED /* a send/receive failed or an invalid message
-                           * arrived - caller should reconnect */
-} session_result;
-
-/*
- * run_interactive_session - prompt for a line, send it as TEXT_MESSAGE,
- * wait for the server's reply, display it, repeat. Runs until the user
- * quits or the connection fails in either direction.
- */
-static session_result run_interactive_session(WOLFSSL *ssl)
-{
-    sl_session_state state;
-    uint8_t *recv_buf;
-    char line[SL_MAX_BODY_LEN];
-    session_result result;
-
-    if (sl_session_init(ssl, &state) != 0) {
-        fprintf(stderr,
-            "sl_session_init failed - wolfSSL_export_keying_material "
-            "unavailable? (needs HAVE_KEYING_MATERIAL / "
-            "--enable-keying-material - see docs/BUILD.md)\n");
-        return SESSION_DISCONNECTED;
-    }
-
-    recv_buf = malloc(SL_MAX_MSG_SIZE);
-    if (recv_buf == NULL) {
-        fprintf(stderr, "run_interactive_session: out of memory\n");
-        return SESSION_DISCONNECTED;
-    }
-
-    printf("Connected. Type a message and press Enter (or 'quit' to exit).\n");
-
-    for (;;) {
-        size_t have = 0;
-        size_t len;
-
-        printf("> ");
-        fflush(stdout);
-
-        if (fgets(line, sizeof(line), stdin) == NULL) {
-            /* EOF on stdin (e.g. Ctrl-D / Ctrl-Z) - treat the same as
-             * an explicit quit. */
-            printf("\n");
-            send_message(ssl, &state, SL_MSG_DISCONNECT, NULL, 0);
-            result = SESSION_USER_QUIT;
-            break;
-        }
-
-        len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
-
-        if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
-            send_message(ssl, &state, SL_MSG_DISCONNECT, NULL, 0);
-            result = SESSION_USER_QUIT;
-            break;
-        }
-
-        if (send_message(ssl, &state, SL_MSG_TEXT_MESSAGE,
-                          (const uint8_t *)line, (uint32_t)len) != 0) {
-            result = SESSION_DISCONNECTED;
-            break;
-        }
-
-        {
-            sl_parsed_message msg;
-            recv_status rs = receive_one_message(ssl, &state, recv_buf,
-                                                  &have, &msg);
-
-            if (rs == RECV_CLOSED) {
-                fprintf(stderr, "Connection lost.\n");
-                result = SESSION_DISCONNECTED;
-                break;
-            }
-            if (rs == RECV_REJECTED) {
-                fprintf(stderr,
-                    "Received an invalid message from server - "
-                    "disconnecting.\n");
-                result = SESSION_DISCONNECTED;
-                break;
-            }
-
-            if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
-                printf("Server: %.*s\n", (int)msg.body_len, msg.body);
-            } else if (msg.msg_type == SL_MSG_PONG) {
-                printf("(pong received)\n");
-            } else if (msg.msg_type == SL_MSG_DISCONNECT) {
-                printf("Server is disconnecting.\n");
-                result = SESSION_DISCONNECTED;
-                break;
-            } else {
-                printf("(unexpected message type 0x%02x)\n", msg.msg_type);
-            }
-        }
-    }
-
-    free(recv_buf);
-    return result;
-}
+/* Message framing glue (receive_one_message/send_message) and the
+ * interactive session loop that used to live here (single-threaded,
+ * client-sends/server-echoes only) have moved to session.h/session.c -
+ * see session.h's design comment for why this specific piece became a
+ * genuinely shared module instead of staying duplicated between
+ * client.c and server.c the way the small portability shim above does. */
 
 /*
  * connect_and_run - one full connection attempt: TCP connect, mTLS
@@ -310,7 +135,8 @@ static session_result run_interactive_session(WOLFSSL *ssl)
  * previous run of *failed* attempts had climbed to.
  */
 static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
-                                       int port, int *connected_ok, int hw_fd)
+                                       int port, int *connected_ok, int hw_fd,
+                                       int oled_fd)
 {
     socket_t sock;
     struct sockaddr_in server_addr;
@@ -423,8 +249,15 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     printf("mTLS handshake succeeded.\n");
     *connected_ok = 1;
     hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
+    hw_oled_draw_text(oled_fd, 0, "SecureLink client");
+    hw_oled_draw_text(oled_fd, 1, "Connected");
+    hw_oled_display(oled_fd);
 
-    result = run_interactive_session(ssl);
+    result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "server");
+
+    hw_oled_draw_text(oled_fd, 0, "SecureLink client");
+    hw_oled_draw_text(oled_fd, 1, "Waiting...");
+    hw_oled_display(oled_fd);
 
     /* Graceful TLS shutdown (sends a close_notify) rather than abruptly
      * freeing the session and closing the socket. Without this, closing
@@ -459,6 +292,7 @@ int main(int argc, char *argv[])
     const char *ca_path = NULL;
     int reconnect_delay = RECONNECT_INITIAL_DELAY_SECONDS;
     int hw_fd;
+    int oled_fd;
 
     parse_args(argc, argv, &host, &port, &cert_path, &key_path, &ca_path);
 
@@ -557,6 +391,16 @@ int main(int argc, char *argv[])
     hw_expansion_set_led_mode(hw_fd, HW_LED_MODE_MANUAL_RGB);
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
 
+    /* Case OLED (no-op on non-Linux / hardware-absent - see hw_oled.h),
+     * opened once here and kept open for the whole reconnect loop, same
+     * "physical device, own lifecycle" reasoning as hw_fd above. Client-
+     * side OLED is new as of the two-way redesign - previously only the
+     * server had one wired up. */
+    oled_fd = hw_oled_open();
+    hw_oled_draw_text(oled_fd, 0, "SecureLink client");
+    hw_oled_draw_text(oled_fd, 1, "Waiting...");
+    hw_oled_display(oled_fd);
+
     /* Reconnect loop. ctx (and the certs/keys/CA loaded into it) is
      * reused across attempts - only the TCP socket and WOLFSSL* are
      * per-connection. Every call into connect_and_run() creates a brand
@@ -568,7 +412,8 @@ int main(int argc, char *argv[])
     for (;;) {
         int connected_ok = 0;
         session_result result = connect_and_run(ctx, host, port,
-                                                  &connected_ok, hw_fd);
+                                                  &connected_ok, hw_fd,
+                                                  oled_fd);
 
         if (result == SESSION_USER_QUIT) {
             break;
@@ -598,6 +443,7 @@ int main(int argc, char *argv[])
 
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
     hw_expansion_close(hw_fd);
+    hw_oled_close(oled_fd);
 
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();

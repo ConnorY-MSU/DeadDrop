@@ -39,6 +39,7 @@
 #include "hw_expansion.h"
 #include "hw_oled.h"
 #include "hw_tts.h"
+#include "session.h"
 
 #define SERVER_PORT 4433
 #define LISTEN_BACKLOG 1
@@ -167,253 +168,16 @@ static void parse_args(int argc, char *argv[],
     }
 }
 
-static const char *msg_type_name(uint8_t t)
-{
-    switch (t) {
-        case SL_MSG_TEXT_MESSAGE: return "TEXT_MESSAGE";
-        case SL_MSG_PING:         return "PING";
-        case SL_MSG_PONG:         return "PONG";
-        case SL_MSG_DISCONNECT:   return "DISCONNECT";
-        default:                  return "UNKNOWN";
-    }
-}
-
-typedef enum {
-    RECV_OK,        /* out_msg holds one fully validated message */
-    RECV_REJECTED,  /* a framed message arrived but failed validation */
-    RECV_CLOSED     /* peer closed, a read error occurred, or timeout */
-} recv_status;
-
-/*
- * receive_one_message - block until exactly one complete message has
- * been read off ssl and parsed (or the connection fails). Handles the
- * case where a single wolfSSL_read() returns bytes belonging to more
- * than one message: leftover bytes are kept in recv_buf/have across
- * calls, and re-checked for another complete message before going back
- * to wolfSSL_read() again.
- *
- * recv_buf must be at least SL_MAX_MSG_SIZE bytes. *have is the caller's
- * persistent "how many valid bytes are currently in recv_buf" cursor -
- * initialize to 0 before the first call for a given connection and don't
- * touch it between calls.
- */
-static recv_status receive_one_message(WOLFSSL *ssl, sl_session_state *state,
-                                        uint8_t *recv_buf, size_t *have,
-                                        sl_parsed_message *out_msg)
-{
-    for (;;) {
-        /* First, see if a complete message is already sitting in the
-         * buffer from a previous read (this is the "two messages in one
-         * read()" case). */
-        size_t consumed = 0;
-        sl_parse_result pr = sl_try_parse_message(state, recv_buf, *have,
-                                                   out_msg, &consumed);
-
-        if (pr == SL_PARSE_OK) {
-            memmove(recv_buf, recv_buf + consumed, *have - consumed);
-            *have -= consumed;
-            return RECV_OK;
-        }
-        if (pr == SL_PARSE_REJECTED) {
-            /* consumed may be 0 (implausible body_length - no safe
-             * resync point) or >0 (a well-framed but invalid message).
-             * Either way we treat rejection as fatal for this connection
-             * rather than trying to resynchronize on a stream we can no
-             * longer fully trust. */
-            if (consumed > 0) {
-                memmove(recv_buf, recv_buf + consumed, *have - consumed);
-                *have -= consumed;
-            }
-            return RECV_REJECTED;
-        }
-
-        /* SL_PARSE_INCOMPLETE: need more bytes. */
-        if (*have >= SL_MAX_MSG_SIZE) {
-            /* Buffer is completely full and still not a complete valid
-             * message - can't happen for a well-formed sender (body_length
-             * is capped, and the buffer is sized for the max possible
-             * message), so this means something is wrong upstream.
-             * Treat as fatal, same as any other rejection. */
-            return RECV_REJECTED;
-        }
-
-        {
-            int n = wolfSSL_read(ssl, (char *)(recv_buf + *have),
-                                  (int)(SL_MAX_MSG_SIZE - *have));
-            if (n <= 0) {
-                int err = wolfSSL_get_error(ssl, n);
-                char errbuf[80];
-                fprintf(stderr, "wolfSSL_read: %s\n",
-                        wolfSSL_ERR_error_string(err, errbuf));
-                return RECV_CLOSED;
-            }
-            *have += (size_t)n;
-        }
-    }
-}
-
-static int send_message(WOLFSSL *ssl, sl_session_state *state,
-                         uint8_t msg_type, const uint8_t *body,
-                         uint32_t body_len)
-{
-    uint8_t out_buf[SL_MAX_MSG_SIZE];
-    int total;
-    int rc;
-
-    total = sl_serialize_message(state, msg_type, body, body_len,
-                                  out_buf, sizeof(out_buf));
-    if (total < 0) {
-        fprintf(stderr, "send_message: sl_serialize_message failed "
-                         "(body_len=%u)\n", body_len);
-        return -1;
-    }
-
-    rc = wolfSSL_write(ssl, out_buf, total);
-    if (rc != total) {
-        int err = wolfSSL_get_error(ssl, rc);
-        char errbuf[80];
-        fprintf(stderr, "wolfSSL_write: %s\n",
-                wolfSSL_ERR_error_string(err, errbuf));
-        return -1;
-    }
-    return 0;
-}
-
-/* Handle one already-mTLS-authenticated connection end to end: derive the
- * session's HMAC key, then loop receiving/validating/replying to framed
- * messages until the peer sends DISCONNECT, the connection drops, or an
- * invalid message is received. oled_fd is passed in (rather than opened
- * here) for the same reason hw_fd is in main() - it's a physical device
- * with its own lifecycle independent of any one connection. */
-static void handle_connection(WOLFSSL *ssl, int oled_fd)
-{
-    sl_session_state state;
-    uint8_t *recv_buf;
-    size_t have = 0;
-
-    if (sl_session_init(ssl, &state) != 0) {
-        fprintf(stderr,
-            "sl_session_init failed - wolfSSL_export_keying_material "
-            "unavailable? (needs HAVE_KEYING_MATERIAL / "
-            "--enable-keying-material - see docs/BUILD.md)\n");
-        return;
-    }
-
-    recv_buf = malloc(SL_MAX_MSG_SIZE);
-    if (recv_buf == NULL) {
-        fprintf(stderr, "handle_connection: out of memory\n");
-        return;
-    }
-
-    for (;;) {
-        sl_parsed_message msg;
-        recv_status rs = receive_one_message(ssl, &state, recv_buf, &have,
-                                              &msg);
-
-        if (rs == RECV_CLOSED) {
-            printf("Connection closed.\n");
-            break;
-        }
-        if (rs == RECV_REJECTED) {
-            fprintf(stderr,
-                "Rejected an invalid message - closing connection.\n");
-            break;
-        }
-
-        /* rs == RECV_OK */
-        printf("Received %s (seq=%u, %u bytes)\n",
-               msg_type_name(msg.msg_type), msg.seq_num, msg.body_len);
-        /* stdout is fully block-buffered here (redirected to a file/pipe,
-         * not a TTY), so without an explicit flush this can sit invisible
-         * in the buffer indefinitely once the process goes back to
-         * blocking in accept() for the next connection - which looks
-         * identical, from the outside, to the process having hung. Bit
-         * me for real while testing DISCONNECT delivery: the message had
-         * actually arrived and been processed correctly the whole time,
-         * this line just hadn't been flushed to where I could see it. */
-        fflush(stdout);
-
-        if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
-            printf("Client message: %.*s\n", (int)msg.body_len, msg.body);
-            fflush(stdout);
-
-            /* Case OLED + TTS notification (no-op on non-Linux / hardware-
-             * absent, see hw_oled.h/hw_tts.h). msg.body is length-prefixed
-             * per PROTOCOL.md, NOT a NUL-terminated C string - both
-             * hw_oled_draw_text() (expects a real C string) and
-             * hw_tts_speak() (same) need a bounded, NUL-terminated copy
-             * made first; passing msg.body directly to either would read
-             * past msg.body_len looking for a terminator that isn't
-             * necessarily there. Bounded to a small preview length - the
-             * OLED line is 21 characters wide, and speaking a full 64KB
-             * message aloud would be its own bad idea regardless of what
-             * hw_tts_speak()'s own internal cap does. */
-            {
-                char preview[64];
-                size_t preview_len = msg.body_len;
-                if (preview_len > sizeof(preview) - 1) {
-                    preview_len = sizeof(preview) - 1;
-                }
-                memcpy(preview, msg.body, preview_len);
-                preview[preview_len] = '\0';
-
-                hw_oled_draw_text(oled_fd, 0, "New message:");
-                hw_oled_draw_text(oled_fd, 1, preview);
-                hw_oled_display(oled_fd);
-
-                hw_tts_speak(preview);
-            }
-
-            {
-                /* "ack: " + original text, echoed back so the exchange is
-                 * visible on both ends. reply[] is sized for the worst
-                 * case (prefix + a full max-length body) so snprintf
-                 * itself never truncates - but the PROTOCOL.md body_length
-                 * cap (SL_MAX_BODY_LEN) is a separate, smaller limit than
-                 * this buffer's size, and a client message at or near that
-                 * cap would make "ack: " + body exceed it. Cap reply_len
-                 * to SL_MAX_BODY_LEN explicitly so this can never produce
-                 * a message sl_serialize_message() would refuse to send -
-                 * a message this close to the cap is already an edge case
-                 * on the sender's part, so truncating the echoed tail is
-                 * an acceptable, deliberate tradeoff versus dropping the
-                 * whole reply (and the connection) over it. */
-                char reply[7 + SL_MAX_BODY_LEN];
-                int reply_len = snprintf(reply, sizeof(reply), "ack: %.*s",
-                                          (int)msg.body_len, msg.body);
-                if (reply_len < 0) {
-                    reply_len = 0;
-                }
-                if ((size_t)reply_len > sizeof(reply) - 1) {
-                    reply_len = (int)sizeof(reply) - 1;
-                }
-                if ((uint32_t)reply_len > SL_MAX_BODY_LEN) {
-                    reply_len = (int)SL_MAX_BODY_LEN;
-                }
-                if (send_message(ssl, &state, SL_MSG_TEXT_MESSAGE,
-                                  (const uint8_t *)reply,
-                                  (uint32_t)reply_len) != 0) {
-                    break;
-                }
-            }
-        } else if (msg.msg_type == SL_MSG_PING) {
-            printf("Ping received - replying with PONG.\n");
-            fflush(stdout);
-            if (send_message(ssl, &state, SL_MSG_PONG, NULL, 0) != 0) {
-                break;
-            }
-        } else if (msg.msg_type == SL_MSG_PONG) {
-            printf("Pong received.\n");
-            fflush(stdout);
-        } else if (msg.msg_type == SL_MSG_DISCONNECT) {
-            printf("Peer sent DISCONNECT - closing cleanly.\n");
-            fflush(stdout);
-            break;
-        }
-    }
-
-    free(recv_buf);
-}
+/* Message framing glue (receive_one_message/send_message), the
+ * msg_type_name() logger helper, and the per-connection message loop
+ * that used to live here (handle_connection() - which auto-echoed every
+ * TEXT_MESSAGE as "ack: <text>") have moved to session.h/session.c.
+ * That auto-ack behavior is gone entirely now, not just relocated: real
+ * two-way chat means a human's own typed reply is the acknowledgment,
+ * the same way client.c never needed one either. See session.h's design
+ * comment for why this piece became a genuinely shared module instead of
+ * staying duplicated between client.c and server.c the way the small
+ * portability shim above does. */
 
 int main(int argc, char *argv[])
 {
@@ -632,7 +396,7 @@ int main(int argc, char *argv[])
             hw_oled_draw_text(oled_fd, 0, "SecureLink server");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
-            handle_connection(ssl, oled_fd);
+            run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "client");
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
             hw_oled_draw_text(oled_fd, 0, "SecureLink server");
             hw_oled_draw_text(oled_fd, 1, "Waiting...");
