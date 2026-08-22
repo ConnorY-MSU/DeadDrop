@@ -24,6 +24,7 @@
 #include <time.h>
 
 #include "lock.h"
+#include "wifi.h"
 
 /* --- Module state -------------------------------------------------------
  *
@@ -107,12 +108,22 @@ typedef enum {
     UI_MODE_NORMAL,
     UI_MODE_LOCKED,
     UI_MODE_SET_PIN_NEW,
-    UI_MODE_SET_PIN_CONFIRM
+    UI_MODE_SET_PIN_CONFIRM,
+    UI_MODE_WIFI_SCANNING,
+    UI_MODE_WIFI_SELECT,
+    UI_MODE_WIFI_PASSWORD,
+    UI_MODE_WIFI_CONNECTING
 } ui_mode_t;
 
 static ui_mode_t ui_mode = UI_MODE_NORMAL;
 static int pin_configured = 0; /* cached lock_pin_exists(), see ui_init() */
 
+/* The general masked-entry buffer: used for lock-PIN entry/setup AND
+ * (further below) WiFi password entry - never both at once, since
+ * ui_mode is mutually exclusive between those. Reused rather than
+ * given a second buffer to avoid static-buffer proliferation for what
+ * is mechanically the same "accumulate masked characters" behavior
+ * either way. */
 static char pin_entry_buf[LOCK_PIN_MAX_LEN + 1];
 static size_t pin_entry_len = 0;
 static char pin_first_entry_buf[LOCK_PIN_MAX_LEN + 1]; /* holds the first
@@ -124,6 +135,49 @@ static time_t next_allowed_check_time = 0;
 
 #define UI_INACTIVITY_TIMEOUT_SECONDS 120
 static time_t last_activity_time = 0;
+
+/* --- WiFi setup screen (Week 4 Days 2-3 Part H) --------------------------
+ *
+ * Real design decisions, per Field WiFi and Network Resilience
+ * Concepts.md - see wifi.h for the nmcli side:
+ * - ENTRY POINT: Ctrl+W (ASCII 23), a second discoverable keybinding
+ *   alongside Ctrl+L - only takes effect from UI_MODE_NORMAL (entering)
+ *   or from within an active WIFI_* mode (cancelling back to normal).
+ *   Deliberately does nothing while UI_MODE_LOCKED, same reasoning as
+ *   Ctrl+L there - a locked screen shouldn't expose a path to change
+ *   network settings without unlocking first.
+ * - SESSION IMPACT: unlike the lock screen (which never touches
+ *   connectivity at all), changing networks fundamentally requires
+ *   dropping the current interface - some interruption here is
+ *   genuinely unavoidable, not a design flaw to route around. This
+ *   deliberately does NOT attempt a special graceful teardown of an
+ *   active session first: client.c's existing reconnect-with-backoff
+ *   loop (Week 3 Day 2, already tested) picks up cleanly once the new
+ *   network is live, and PROTOCOL.md's seq_num already resets per
+ *   session with no changes needed - adding a bespoke teardown path
+ *   here for a rare, user-initiated operation would be real added
+ *   complexity for no real benefit over what already exists.
+ * - SLOW OPERATIONS OFF THE LOCK: wifi_scan()/wifi_connect() can each
+ *   take several real seconds (a live network operation, not a local
+ *   computation) - see ui_poll_line()'s pending_action handling, which
+ *   runs these AFTER releasing ui_mutex, exactly the same "never hold
+ *   the lock across something slow" discipline as session.c's
+ *   send_mutex and this file's own earlier ui_mutex-starvation fix.
+ */
+static wifi_network wifi_scan_results[WIFI_SCAN_MAX_RESULTS];
+static int wifi_scan_count = 0;
+static char wifi_selected_ssid[WIFI_SSID_MAX];
+static int wifi_selected_secured = 0;
+static char wifi_pending_password[LOCK_PIN_MAX_LEN + 1]; /* copied out of
+    pin_entry_buf (reused here as the general masked-entry buffer - see
+    its own declaration comment) right before ui_mutex is released, so
+    the deferred connect call in ui_poll_line() has it after unlocking */
+
+typedef enum {
+    UI_PENDING_NONE,
+    UI_PENDING_WIFI_SCAN,
+    UI_PENDING_WIFI_CONNECT
+} ui_pending_action;
 
 /* Must be called with ui_mutex held. Replaces history_win's PHYSICAL
  * content with a locked banner, then STOPS refreshing history_win (see
@@ -173,6 +227,33 @@ static void redraw_input_locked(void)
         for (i = 0; i < pin_entry_len; i++) {
             waddch(input_win, '*');
         }
+        wrefresh(input_win);
+        break;
+    case UI_MODE_WIFI_SCANNING:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0,
+                  "Scanning for WiFi networks... (Ctrl+W to cancel)");
+        wrefresh(input_win);
+        break;
+    case UI_MODE_WIFI_SELECT:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0,
+                  "Select network number (Ctrl+W to cancel): %s", input_buf);
+        wrefresh(input_win);
+        break;
+    case UI_MODE_WIFI_PASSWORD:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "Password for %s (Ctrl+W to cancel): ",
+                  wifi_selected_ssid);
+        for (i = 0; i < pin_entry_len; i++) {
+            waddch(input_win, '*');
+        }
+        wrefresh(input_win);
+        break;
+    case UI_MODE_WIFI_CONNECTING:
+        werase(input_win);
+        mvwprintw(input_win, 0, 0, "Connecting to %s...",
+                  wifi_selected_ssid);
         wrefresh(input_win);
         break;
     case UI_MODE_NORMAL:
@@ -334,6 +415,11 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
             ui_add_history() while ui_mutex is already held (non-recursive
             mutex), so a permanent-history confirmation gets queued here
             and added AFTER unlocking this slice's critical section */
+        ui_pending_action pending_action = UI_PENDING_NONE; /* same idea
+            as pending_history_msg, but for a slow (real seconds, a live
+            network operation) wifi_scan()/wifi_connect() call that must
+            never run while ui_mutex is held - see this file's WiFi
+            block comment's SLOW OPERATIONS note */
         int slice_ms = UI_POLL_SLICE_MS;
         if (elapsed_ms + slice_ms > timeout_ms) {
             slice_ms = timeout_ms - elapsed_ms;
@@ -377,20 +463,48 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
         {
             ui_poll_result result = UI_POLL_TIMEOUT;
 
-            if (ch == 12 && ui_mode != UI_MODE_LOCKED) {
+            if (ch == 12 && ui_mode == UI_MODE_NORMAL) {
                 /* Ctrl+L (ASCII 12) - the lock screen's single
                  * discoverable entry point, doing double duty per this
-                 * file's lock-screen block comment. Ignored while
-                 * already LOCKED (nothing meaningful for it to do) or
-                 * mid-PIN-setup (avoid an inconsistent half-entered
-                 * state). */
+                 * file's lock-screen block comment. Only takes effect
+                 * from UI_MODE_NORMAL - restricted here (rather than
+                 * the earlier, looser "anything but LOCKED") so it
+                 * can't jump into locking out from the middle of a
+                 * WiFi-setup flow either; pressed from any other mode
+                 * it's simply not one of that mode's own recognized
+                 * keys, a harmless no-op. */
                 if (pin_configured) {
                     ui_mode = UI_MODE_LOCKED;
                     pin_entry_len = 0;
                     pin_entry_buf[0] = '\0';
                     draw_locked_overlay_locked();
-                } else if (ui_mode == UI_MODE_NORMAL) {
+                } else {
                     ui_mode = UI_MODE_SET_PIN_NEW;
+                    pin_entry_len = 0;
+                    pin_entry_buf[0] = '\0';
+                }
+                redraw_input_locked();
+            } else if (ch == 23 &&
+                       (ui_mode == UI_MODE_NORMAL ||
+                        ui_mode == UI_MODE_WIFI_SCANNING ||
+                        ui_mode == UI_MODE_WIFI_SELECT ||
+                        ui_mode == UI_MODE_WIFI_PASSWORD ||
+                        ui_mode == UI_MODE_WIFI_CONNECTING)) {
+                /* Ctrl+W (ASCII 23) - the WiFi setup screen's single
+                 * discoverable entry point (see this file's WiFi block
+                 * comment), doubling as "cancel" when already
+                 * somewhere in that flow. Deliberately excludes
+                 * UI_MODE_LOCKED and the PIN-setup modes - same
+                 * "don't jump modes mid-flow" reasoning as Ctrl+L
+                 * above, plus a locked screen shouldn't expose a path
+                 * to touch network settings without unlocking first. */
+                if (ui_mode == UI_MODE_NORMAL) {
+                    ui_mode = UI_MODE_WIFI_SCANNING;
+                    pending_action = UI_PENDING_WIFI_SCAN;
+                } else {
+                    ui_mode = UI_MODE_NORMAL;
+                    input_len = 0;
+                    input_buf[0] = '\0';
                     pin_entry_len = 0;
                     pin_entry_buf[0] = '\0';
                 }
@@ -561,12 +675,154 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                         redraw_input_locked();
                     }
                 }
+            } else if (ui_mode == UI_MODE_WIFI_SELECT) {
+                /* Reuses input_buf (the normal, UNMASKED compose
+                 * buffer) rather than pin_entry_buf - a network list
+                 * index isn't sensitive, and this keeps the "masked
+                 * buffer" naming honest for what actually goes in it
+                 * elsewhere. Digits only, not general printable ASCII -
+                 * a tighter, more honest restriction than the compose
+                 * line's since only a number is ever meaningful here. */
+                if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    int idx = atoi(input_buf) - 1; /* shown 1-based to
+                        the person typing, stored 0-based internally */
+                    input_len = 0;
+                    input_buf[0] = '\0';
+                    if (idx < 0 || idx >= wifi_scan_count) {
+                        werase(input_win);
+                        mvwprintw(input_win, 0, 0,
+                                  "Invalid selection - try again "
+                                  "(Ctrl+W to cancel):");
+                        wrefresh(input_win);
+                    } else {
+                        snprintf(wifi_selected_ssid,
+                                  sizeof(wifi_selected_ssid), "%s",
+                                  wifi_scan_results[idx].ssid);
+                        wifi_selected_secured =
+                            wifi_scan_results[idx].secured;
+                        if (wifi_selected_secured) {
+                            ui_mode = UI_MODE_WIFI_PASSWORD;
+                            pin_entry_len = 0;
+                            pin_entry_buf[0] = '\0';
+                        } else {
+                            ui_mode = UI_MODE_WIFI_CONNECTING;
+                            wifi_pending_password[0] = '\0';
+                            pending_action = UI_PENDING_WIFI_CONNECT;
+                        }
+                        redraw_input_locked();
+                    }
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    if (input_len > 0) {
+                        input_len--;
+                        input_buf[input_len] = '\0';
+                        redraw_input_locked();
+                    }
+                } else if (ch >= '0' && ch <= '9') {
+                    if (input_len + 1 < sizeof(input_buf)) {
+                        input_buf[input_len++] = (char)ch;
+                        input_buf[input_len] = '\0';
+                        redraw_input_locked();
+                    }
+                }
+            } else if (ui_mode == UI_MODE_WIFI_PASSWORD) {
+                if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
+                    snprintf(wifi_pending_password,
+                              sizeof(wifi_pending_password), "%s",
+                              pin_entry_buf);
+                    pin_entry_len = 0;
+                    pin_entry_buf[0] = '\0';
+                    ui_mode = UI_MODE_WIFI_CONNECTING;
+                    pending_action = UI_PENDING_WIFI_CONNECT;
+                    redraw_input_locked();
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    if (pin_entry_len > 0) {
+                        pin_entry_len--;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                } else if (ch >= 32 && ch < 127) {
+                    if (pin_entry_len + 1 < sizeof(pin_entry_buf)) {
+                        pin_entry_buf[pin_entry_len++] = (char)ch;
+                        pin_entry_buf[pin_entry_len] = '\0';
+                        redraw_input_locked();
+                    }
+                }
             }
+            /* UI_MODE_WIFI_SCANNING / UI_MODE_WIFI_CONNECTING: transient
+             * states with no direct key handling of their own beyond
+             * the Ctrl+W cancel above - nothing meaningful to type
+             * while a scan/connect is actually in progress (see this
+             * loop's pending_action handling just below, which runs
+             * them synchronously to completion before this function
+             * returns - see this file's WiFi block comment). */
 
             pthread_mutex_unlock(&ui_mutex);
 
             if (pending_history_msg != NULL) {
                 ui_add_history(NULL, pending_history_msg);
+            }
+
+            if (pending_action == UI_PENDING_WIFI_SCAN) {
+                int n = wifi_scan(wifi_scan_results, WIFI_SCAN_MAX_RESULTS);
+                wifi_scan_count = (n > 0) ? n : 0;
+
+                pthread_mutex_lock(&ui_mutex);
+                if (wifi_scan_count > 0) {
+                    int i;
+                    wprintw(history_win,
+                            "WiFi networks found (Ctrl+W to cancel):\n");
+                    for (i = 0; i < wifi_scan_count; i++) {
+                        wprintw(history_win, "  %d) %s%s\n", i + 1,
+                                wifi_scan_results[i].ssid,
+                                wifi_scan_results[i].secured
+                                    ? " (secured)" : " (open)");
+                    }
+                    wrefresh(history_win);
+                    ui_mode = UI_MODE_WIFI_SELECT;
+                    input_len = 0;
+                    input_buf[0] = '\0';
+                } else {
+                    ui_mode = UI_MODE_NORMAL;
+                }
+                redraw_input_locked();
+                pthread_mutex_unlock(&ui_mutex);
+
+                if (wifi_scan_count <= 0) {
+                    ui_add_history(NULL,
+                        "WiFi scan found no networks (or nmcli failed) "
+                        "- Ctrl+W to try again.");
+                }
+            } else if (pending_action == UI_PENDING_WIFI_CONNECT) {
+                char errbuf[256];
+                char ssid_copy[WIFI_SSID_MAX];
+                int rc;
+
+                snprintf(ssid_copy, sizeof(ssid_copy), "%s",
+                          wifi_selected_ssid);
+                rc = wifi_connect(wifi_selected_ssid,
+                                    wifi_pending_password[0] != '\0'
+                                        ? wifi_pending_password : NULL,
+                                    errbuf, sizeof(errbuf));
+                /* Zero the password out of memory as soon as it's no
+                 * longer needed, rather than leaving a stale copy
+                 * sitting in a static buffer for the rest of the
+                 * process's life. */
+                memset(wifi_pending_password, 0,
+                       sizeof(wifi_pending_password));
+
+                pthread_mutex_lock(&ui_mutex);
+                ui_mode = UI_MODE_NORMAL;
+                redraw_input_locked();
+                pthread_mutex_unlock(&ui_mutex);
+
+                if (rc == 0) {
+                    ui_add_historyf(NULL,
+                        "Connected to WiFi network \"%s\".", ssid_copy);
+                } else {
+                    ui_add_historyf(NULL,
+                        "Failed to connect to \"%s\": %s", ssid_copy,
+                        errbuf);
+                }
             }
 
             if (result == UI_POLL_LINE) {
@@ -606,9 +862,24 @@ static pthread_t idle_thread;
 static volatile int idle_thread_running = 0;
 static volatile int idle_thread_should_stop = 0;
 
+/* How often the idle thread runs wifi_has_connectivity() to drive the
+ * "no network found" prompt (Field WiFi and Network Resilience
+ * Concepts.md) - a real subprocess spawn each time (see wifi.c), not
+ * free, so this is deliberately much coarser than the 200ms input-poll
+ * granularity rather than run on every idle-loop iteration. Only ever
+ * WRITES the status bar when there's genuinely no connectivity -
+ * leaves it alone otherwise, so it doesn't fight with client.c's/
+ * server.c's own more specific status updates ("Disconnected -
+ * retrying in Ns...", "Listening on port...") for ownership of that
+ * line on every normal cycle; the two can still occasionally race for
+ * a moment right at a state transition, an accepted minor cosmetic
+ * tradeoff, not a functional one. */
+#define UI_CONNECTIVITY_CHECK_SECONDS 15
+
 static void *idle_input_thread_main(void *arg)
 {
     char dummy[256];
+    time_t last_connectivity_check = 0;
     (void)arg;
 
     while (!idle_thread_should_stop) {
@@ -622,6 +893,15 @@ static void *idle_input_thread_main(void *arg)
         }
         /* UI_POLL_TIMEOUT: normal, keep looping. UI_POLL_QUIT: never
          * returned by the real ncurses ui_poll_line() - see ui.h. */
+
+        if (difftime(time(NULL), last_connectivity_check) >=
+                UI_CONNECTIVITY_CHECK_SECONDS) {
+            last_connectivity_check = time(NULL);
+            if (!wifi_has_connectivity()) {
+                ui_set_status("No network found - press Ctrl+W to set "
+                               "up WiFi.");
+            }
+        }
     }
     return NULL;
 }

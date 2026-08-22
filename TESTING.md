@@ -1272,5 +1272,29 @@ The two functions are temporally mutually exclusive with an active session by co
 7. Ctrl+L worked again immediately - confirms the idle thread properly resumed after the session ended, not just started once at boot.
 
 ### Not yet done (Days 2-3, remaining)
-- The WiFi setup screen (Part H): scan/select/connect via `nmcli`, the "no network found" prompt, tested against a genuinely new network.
 - Whether/how the RGB status light and OLED hook into this new ncurses UI, rather than remaining a separate layer - still an open question carried forward from Day 1.
+
+## Week 4, Days 2-3 (Part H) — WiFi setup screen — 2026-08-21
+
+New `include/wifi.h`/`src/wifi.c`: a thin wrapper around `nmcli`, used by a new WiFi setup mode in `ui.c`. Every `nmcli` invocation goes through `fork()`+`execvp()` with an explicit argv array - deliberately never `system()`/`popen()` with a shell-interpreted command string, since both an SSID (whatever a nearby access point broadcasts - real untrusted input) and a WiFi password (typed by whoever is at the device) are genuinely attacker-influenceable, and this avoids the entire shell-metacharacter-injection question by construction rather than by careful escaping.
+
+Real decisions, per `Field WiFi and Network Resilience Concepts.md`:
+- **Entry point**: Ctrl+W, a second discoverable keybinding alongside Ctrl+L - doubles as "cancel" from within the flow. Deliberately excluded from `UI_MODE_LOCKED` and the PIN-setup modes (same "don't jump modes mid-flow" reasoning applied to both keybindings now).
+- **Session impact**: no special graceful teardown of an active session before switching networks - changing networks fundamentally requires dropping the interface, and `client.c`'s existing tested reconnect-with-backoff loop (Week 3 Day 2) already picks this up cleanly, with `PROTOCOL.md`'s per-session `seq_num` reset requiring no changes. Chose not to add a bespoke teardown path for a rare, user-initiated operation.
+- **Flow**: scan → numbered list (reusing `input_buf`, unmasked, since a list index isn't sensitive) → password entry for secured networks (reusing the same masked buffer as PIN entry, since `ui_mode` makes the two mutually exclusive) → connect → explicit success/failure reported to history, with `nmcli`'s own specific error text on failure rather than a generic message.
+- **Never blocking the UI thread**: `wifi_scan()`/`wifi_connect()` are real, multi-second network operations - both run through a "pending action" mechanism that defers the actual call until *after* `ui_mutex` is released, the same "never hold the lock across something slow" discipline as `session.c`'s `send_mutex` and this file's own earlier `ui_mutex`-starvation fix. Honestly documented tradeoff: since this runs synchronously within the same `ui_poll_line()` call rather than on its own thread, the scan/connect duration does delay that call's return to its caller (the sender loop or the idle thread) - acceptable for a rare, deliberate action, unlike the routine per-slice polling the earlier fix addressed.
+- **"No network found"**: the idle-input thread (see the idle-input-thread entry above) now also runs `wifi_has_connectivity()` every 15 seconds and sets the status bar to "No network found - press Ctrl+W to set up WiFi." when there's none - deliberately coarser than the 200ms input-poll granularity (a real subprocess spawn each time), and only ever *writes* the status bar when disconnected, so it doesn't fight `client.c`'s/`server.c`'s own more specific status updates for ownership of that line except for a possible brief cosmetic flicker right at a state transition.
+
+### Verified on real hardware (alpha), deliberately scoped around the risk to my own SSH access
+`wifi_scan()`/`wifi_has_connectivity()` are read-only and were tested directly first, safely: found the real network (`BDH-public`) already known from Day 1, connectivity check accurate.
+
+`wifi_connect()`'s failure path was verified in isolation, safely, using a **nonexistent SSID** rather than a wrong password on a real network - `nmcli` fails at lookup ("Error: Parameter '...' is neither SSID nor BSSID") before ever touching the active connection, so this carried no risk to the SSH session being used to test it, and it did survive intact (confirmed via `nmcli general status` immediately after).
+
+The full UI flow was then verified live, stopping deliberately short of an actual submit against the real network (to avoid the real risk that a wrong password or a network change could drop the very SSH session running the test):
+1. Ctrl+W with **no connection active at all** (idle-thread path) → scan ran and rendered a real, numbered list of 10 nearby networks correctly.
+2. Selected network 1 (`BDH-public`) → correctly prompted for its password.
+3. Typed a test password → correctly masked (6 characters shown as 6 asterisks).
+4. Cancelled via Ctrl+W rather than submitting → cleanly returned to normal mode, no connection attempt made, SSH session and existing WiFi connection unaffected.
+5. Re-entered, selected an out-of-range network number (99) → correctly showed "Invalid selection - try again" and stayed in selection mode.
+
+**Not yet done**: an actual successful connect to a genuinely new network, per the walkthrough's own explicit requirement. Deliberately left for the user to do physically at the device (pressing Ctrl+W and joining, e.g., a phone hotspot themselves) rather than risking remote SSH access over it - the safer and, for this specific screen, more authentic test of the real field-use scenario anyway.
