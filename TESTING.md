@@ -1401,3 +1401,80 @@ This closes the "not yet done" gap from the first Day 4 test above - retry-with-
 Previously done ad hoc (`chmod 600` typed by hand during live testing, per the entry above). Added `docs/provision-permissions.sh`: locks `~/pki` and `~/keyshare` to `700` (directory) and `600` (every regular file inside), idempotent, safe to re-run any time (e.g. after Day 6's rotation drill deploys a new certificate). Deployed and run on both `alpha` and `bravo`; verified via `ls -la` on both that every file/directory landed at the intended mode. Skips gracefully (prints a note, doesn't error) if a device only uses one of the two directories.
 
 **Not yet done**: Phase 2 (the distinctive Flipper Zero/Cyberpunk 2077-style aesthetic) - deliberately deferred, per the user's own two-phase framing. An actual reboot-cycle re-verification of the font persistence, same as the still-open `con2fbmap` one.
+
+## Week 4 Day 5 — overlay filesystem, persistence, systemd service — 2026-08-22
+
+Genuinely the highest-risk day of the whole project so far: enabling a root overlay filesystem on live, already-provisioned hardware, and installing a systemd unit that takes over the physical console. Three real, serious bugs were found - one of them caused an extended (~20+ minute) outage on both devices simultaneously, requiring a physical power cycle and the user directly typing diagnostic commands on the console. Documenting the full sequence, not a cleaned-up version, since the debugging path here is itself the valuable part.
+
+### Design: persistence via a real filesystem outside the overlay, not overlay exclusions
+
+Checked `overlayroot`'s actual config/manpage directly on-device (not assumed): it has no per-directory exclusion option. `recurse=0` is the real mechanism - it keeps *every other mounted filesystem* real and writable, only `/` itself becomes the RAM-backed overlay. Design: a 96MB ext4 image (`/boot/firmware/persist.img`) stored on the boot partition (a genuinely separate partition, never touched by the root overlay regardless of `recurse`), loop-mounted at `/persist`, with the five paths that need to survive a reboot bind-mounted from it:
+
+- `/var/lib/tailscale` - node auth state (Tailscale key expiry is already disabled, but the state itself still needs to survive or it re-auths from scratch every boot)
+- `$HOME/.securelink` - PIN salt+hash
+- `/etc/NetworkManager/system-connections` - WiFi profiles joined later via the Days 2-3 UI
+- `$HOME/pki` - cert/key, **and** `revoked_serials.txt` (deliberately relocated here from `~/securelink/`, so a cert rotation's revocation-list update persists too)
+- `$HOME/keyshare` - the keyshare-mode encrypted key + shares
+
+New scripts: `docs/setup-persist-overlay.sh` (idempotent - creates the image, migrates existing real content in on first run, adds the fstab entries) and `docs/enable-overlay.sh` (the actual `overlayroot=tmpfs:recurse=0` cmdline edit, kept as a separate, deliberate step).
+
+### Verified in the safe order: persistence first, alone, before overlay
+
+Ran `setup-persist-overlay.sh` on both, rebooted both (with overlay still off - a `nofail` bind-mount failing would just degrade gracefully to the original non-persisted directory, never block boot). Confirmed on both: all 5 bind mounts active (`mount | grep persist`), all files intact, Tailscale reconnected without re-auth, zero failed units. This is the same "prove the plumbing before adding the risky part" discipline used throughout this project.
+
+### Overlay enabled, proven with a real experiment, not just documentation
+
+On `alpha`: wrote a marker file into a persisted path (`~/pki/overlay_test_marker.txt`) *and* a non-persisted path (`~/overlay_ephemeral_test.txt`) before the overlay-enable reboot, to prove both halves of the claim - persisted paths survive, everything else genuinely doesn't. First attempt's "ephemeral" result was a methodology bug on my part (the file was written *before* overlay activated, so it was already baked into the frozen lower layer - not a real ephemeral-write test at all). Corrected: wrote the marker *while overlay was already active*, rebooted again, confirmed it was genuinely gone (`No such file or directory`) while the persisted marker survived. Same two-part test repeated and passed cleanly on `bravo`.
+
+### Real bug 1 - masking `systemd-remount-fs.service` globally broke root-writability on non-overlay boots
+
+`systemd-remount-fs.service` (which transitions root from its initial state to the full read-write state fstab specifies) fails on every overlay-active boot with `fsconfig() failed: overlay: No changes allowed in reconfigure` - cosmetic (root is already correctly read-write via the overlay's own tmpfs upper layer) but costs ~20-25s of retry/backoff at boot. Masked it to fix that - but masked it **globally**, not conditionally on overlay actually being active. Consequence, discovered directly (`mount | grep ' / '` showing `ro`, `sed: couldn't open temporary file: Read-only file system` when trying to edit `/etc/fstab`): on a later **non-overlay** boot (done deliberately, to install the systemd unit persistently), root got stuck permanently read-only, since the one service responsible for the real read-write remount was disabled. Fixed with `mount -o remount,rw /` (bypasses the masked service directly) to recover immediately, then `systemctl unmask systemd-remount-fs.service` on both devices to properly revert the over-broad fix. **Decision**: accept the cosmetic ~20s overlay-boot delay rather than mask this service again - the risk of quietly breaking non-overlay maintenance boots isn't worth the cosmetic win, especially having just been burned by it directly.
+
+### Real bug 2 - a boot-ordering race crashed NetworkManager, causing an extended real outage on both devices
+
+The most serious incident of the day. After installing the systemd service files and disabling `getty@tty1` on both, rebooted both together (needed anyway, since `alpha` blocks on fetching its key-share from `bravo`). **Both devices went unreachable** - not via mDNS, not via raw Tailscale IP, not via ICMP ping - for over 20 minutes. Diagnosed step by step, entirely through the user's own eyes and typed commands, since I had zero remote access:
+
+1. User confirmed both were genuinely booted (shell prompt visible, auto-login worked) - ruled out a boot failure.
+2. `hostname -I` on-device showed `127.0.1.1` (the Debian `/etc/hosts` self-referencing loopback fallback, not a real DHCP lease) - confirmed this was specifically a networking failure, not a boot failure.
+3. A full physical power cycle (not just a soft reboot) did **not** fix it - ruled out a transient/stuck-state issue.
+4. `journalctl -u NetworkManager -b` (typed and pasted by the user, since I had no other way to see it) showed the real cause: NetworkManager crashing repeatedly (`Main process exited, code=killed`, `Start request repeated too quickly` - systemd's own restart-storm protection giving up after 5 failures in quick succession).
+
+**Root cause**: the `/etc/NetworkManager/system-connections` bind mount had no explicit ordering relative to `NetworkManager.service`. `NetworkManager.service` starts very early in boot (often before `local-fs.target`'s own mounts, including `/persist`, are guaranteed complete) - the bind mount could race NetworkManager's own startup, most plausibly corrupting its inotify-based directory watch on that path mid-initialization. **Confirmed empirically**: `sudo umount /etc/NetworkManager/system-connections` (live, no reboot) + `systemctl restart NetworkManager` immediately restored connectivity on `bravo`; the same live fix restored `alpha`.
+
+**Permanent fix**: added explicit systemd ordering directly on the fstab bind-mount line - `x-systemd.requires-mounts-for=/persist,x-systemd.before=NetworkManager.service` - forcing the bind mount to fully complete before NetworkManager is even allowed to start, closing the race by construction rather than by luck. Verified via two full, isolated reboots (`alpha` alone first, then `bravo`): root correctly read-write, NetworkManager active with `wlan0` connected on the very first attempt each time, zero failed units, Tailscale reconnected cleanly.
+
+### Real bug 3 - `After=cloud-init.target` created a genuine systemd dependency cycle, silently deleting the service's own start job every boot
+
+Separately (after the NetworkManager fix), noticed the console displayed our app's own early output interleaved with *later* cloud-init boot messages, visually corrupting the screen (confirmed by reading `/dev/vcs1` directly - the real virtual-console text buffer - rather than relying on descriptions of what the physical screen showed). Added `After=cloud-init.target` to fix the interleaving. Result: the service **never started at boot at all** - `systemctl status` showed `inactive (dead)`, zero journal entries, yet manually running `systemctl start securelink-alpha.service` worked perfectly (proving the unit itself was fine). Root cause, found directly in the journal: `multi-user.target: Found ordering cycle on securelink-alpha.service/start` / `Job securelink-alpha.service/start deleted to break ordering cycle` - `cloud-init.target`'s own chain has a `Before=multi-user.target` relationship that, combined with this unit's own `WantedBy=multi-user.target`, closed a genuine cycle. Systemd's cycle-breaker resolves this by silently deleting the job, with no error surfaced anywhere obvious - which is exactly why it looked like "nothing is wrong" while nothing was actually running. Adding `Wants=cloud-init.target` alongside `After=` did not resolve the cycle either (same silent failure). **Decision**: dropped the `cloud-init.target` ordering entirely. Reliable auto-start matters far more than a few seconds of cosmetic console text-bleed, which ncurses' own periodic redraws self-heal anyway once real content updates arrive.
+
+### Full verification after all three fixes - genuine cold-boot-to-connected proof
+
+Rebooted both together. Both `securelink-alpha.service`/`securelink-bravo.service` came up `active (running)` automatically, zero failed units, no cycle warning in the journal. Read `/dev/vcs1` directly on both (not relying on a description of the physical screen) - both showed a fully completed, correct session with **zero manual intervention of any kind**:
+
+```
+alpha: Connected to client
+       Verify callback: checking serial 68A7E95F... against revocation list.
+       Verify callback: serial 68A7E95F... not revoked, proceeding.
+
+bravo: Connected to server
+       connect() failed: 111   [x2 - expected: alpha's server wasn't
+                                 listening yet in bravo's first two
+                                 reconnect attempts; bravo's own
+                                 reconnect-with-backoff correctly
+                                 recovered]
+```
+
+Sent a real message from `bravo` using an ad-hoc `uinput`-based synthetic-keyboard test tool (no physical keyboard attached yet) and confirmed it displayed correctly on `alpha`'s real console (`client: ...`) - the exact text was garbled due to a timing bug in the throwaway test tool itself (key-tap speed, not a real app bug), but the end-to-end delivery proof stands regardless. This is the actual Day 6 "cold power-on, zero manual steps, both connect automatically" milestone, achieved a day early as a direct result of getting the systemd service correctly installed.
+
+### Crash recovery, tested for real
+
+`kill -9` on the running `server` process's PID on `alpha` while it was live-connected. Confirmed via `systemctl status`: a fresh process (new PID) was `active (running)` again within ~1 second (`RestartSec=5` gave headroom, actual recovery was faster). Confirmed via `/dev/vcs1` that the fresh process genuinely re-ran its full startup sequence (re-fetched its key-share, re-completed the mTLS handshake, reached the same healthy `Connected to client` state) rather than just restarting into a stuck state - this was the actual crash-recovery scenario the Day 5 checklist calls for, not just "the process exists again."
+
+### Systemd unit design decisions
+
+`docs/securelink-alpha.service` / `docs/securelink-bravo.service`: `User=connor`/`Group=connor` (not root), `TTYPath=/dev/tty1` with `TTYReset=yes`/`TTYVHangup=yes`/`TTYVTDisallocate=yes` (ncurses needs to own the terminal exclusively, which is why `getty@tty1` had to be disabled *and masked*, not just stopped), `Restart=always`/`RestartSec=5` (field-deployed, unattended - a crash shouldn't leave a dead screen until someone physically power-cycles it, but a 5s floor avoids hammering the log/CPU if something's systematically broken). **Clock-sync-before-cert-validation decision**: deliberately *not* gated via `After=time-sync.target` - checked directly on-device that `time-sync.target` is never actually reached unless `systemd-time-wait-sync.service` is separately enabled (disabled by default on this image, and enabling it would add a real, possibly lengthy boot-time NTP wait, working against "zero manual steps, fast to a usable session"). Relying instead on `client.c`'s existing reconnect-with-backoff loop, which already retries any handshake failure including the specific clock-skew failure mode (`ASN date error, current date is after expiration` - the exact string seen in Week 2 Day 5's expired-cert negative test) - the system self-heals past a wrong-clock boot via normal retry once NTP catches up, with zero extra boot-ordering machinery (and zero risk of another ordering-cycle surprise like bug 3 above).
+
+### Not yet done
+- Overlay-filesystem persistence has not yet been tested through a Day 6 certificate-rotation drill (deploying a new cert while overlay is active, confirming it survives a reboot) - that's explicitly Day 6's own task.
+- The mobility drill (moving a device to a different network mid-session) hasn't been run since enabling overlay/persistence - worth re-confirming the WiFi-profile persistence path specifically, given how much churn today's NetworkManager incident involved.
+- Cold-boot-to-ready timing hasn't been formally measured/recorded yet (Day 6 asks for this explicitly).

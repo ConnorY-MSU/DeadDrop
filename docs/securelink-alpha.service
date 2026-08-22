@@ -1,0 +1,96 @@
+[Unit]
+Description=SecureLink encrypted communication terminal (server role - alpha)
+# Real network matters before this starts (mTLS needs a genuinely
+# reachable peer over Tailscale). Also waits for the DSI console
+# framebuffer fix so ncurses draws on the actual touchscreen, not
+# whichever port the kernel happened to enumerate first this boot.
+#
+# CLOCK-SYNC-BEFORE-CERT-VALIDATION DECISION (see Field WiFi and
+# Network Resilience Concepts in the vault): deliberately NOT gated
+# via After=time-sync.target here. Checked directly on this device:
+# time-sync.target is never actually reached unless
+# systemd-time-wait-sync.service is separately enabled (disabled by
+# default on this image) - and enabling it would add a real, possibly
+# lengthy boot-time wait for NTP, working against "boots to a usable
+# session with zero manual steps." Went with the other sanctioned
+# option instead: client.c's existing reconnect-with-backoff loop
+# already retries ANY handshake failure, including the specific
+# clock-skew failure mode (`ASN date error, current date is after
+# expiration` - the exact error string seen in Week 2 Day 5's expired-
+# cert negative test) - so a wrong-clock boot self-heals via normal
+# retry once NTP catches up, with no extra boot-ordering machinery.
+#
+# REAL BUG FOUND VIA LIVE TESTING: without After=cloud-init.target,
+# this service started while cloud-init's own final boot stage
+# (cloud-final.service) was still writing plain-text boot messages to
+# the same physical console (tty1) - those stray writes landed on top
+# of ncurses' already-active screen buffer and visually corrupted the
+# display (looked "blank" from the outside; confirmed via `cat
+# /dev/vcs1` that both our own early screen content AND late cloud-init
+# log lines were interleaved on the same VT). cloud-init.target is
+# reached only after every cloud-init stage, including cloud-final,
+# has finished - ordering after it stops this race for good.
+#
+# SECOND AND THIRD REAL BUGS FOUND, both via live testing, both now
+# reverted: adding After=cloud-init.target alone left the unit NEVER
+# STARTING at all (systemd's own log: "Found ordering cycle on
+# securelink-alpha.service/start" / "Job ... deleted to break ordering
+# cycle starting with multi-user.target/start" - cloud-init.target's
+# own chain has a Before=multi-user.target relationship that,
+# combined with our own WantedBy=multi-user.target, closes a real
+# cycle; systemd's cycle-breaker silently deletes the job rather than
+# fail loudly, which is why it looked like nothing was wrong but
+# nothing ever ran). Adding Wants=cloud-init.target on top did not fix
+# the cycle either. DECISION: dropped the cloud-init ordering entirely
+# - reliable auto-start matters far more than the cosmetic console
+# text-bleed it was meant to prevent, and ncurses' own periodic
+# redraws self-heal that corruption within a few seconds anyway once
+# real content updates. Documented as a known, accepted cosmetic
+# artifact rather than chased further.
+After=network-online.target tailscaled.service fix-console-fb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=connor
+Group=connor
+WorkingDirectory=/home/connor/securelink
+
+# Real key material lives under the persisted ~/pki (Day 5 overlay
+# work) via the mutual key-share flow (Day 4) rather than a plain -k
+# PEM file - see keyshare.h for what -K/-P/-N mean. revoked_serials.txt
+# was deliberately relocated into ~/pki so it rides along on the same
+# persisted, bind-mounted path (a cert rotation's revocation-list
+# update needs to survive a reboot too, not just the cert swap).
+ExecStart=/home/connor/securelink/build/server \
+    -c /home/connor/pki/server_cert.pem \
+    -A /home/connor/pki/ca_cert.pem \
+    -K /home/connor/keyshare \
+    -P 100.103.41.44 \
+    -N securelink-bravo \
+    -r /home/connor/pki/revoked_serials.txt
+
+# ncurses needs to own a real terminal, not systemd's default
+# /dev/null stdio - this is the same tty getty@tty1 normally owns,
+# which is why that unit must be disabled (not just stopped) before
+# enabling this one, or the two fight over the same device.
+Environment=TERM=linux
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+# The device is meant to run unattended in the field - if the process
+# dies (crash, kill -9, transient hardware hiccup), it should come
+# back on its own rather than leave the screen dead until someone
+# physically power-cycles it. 5s avoids a tight crash-loop hammering
+# the log/CPU if something is systematically broken, while still
+# recovering fast for a real transient fault.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

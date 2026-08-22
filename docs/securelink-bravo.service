@@ -1,0 +1,44 @@
+[Unit]
+Description=SecureLink encrypted communication terminal (client role - bravo)
+# See securelink-alpha.service's comments - identical reasoning,
+# mirrored role, including the clock-sync decision (no
+# After=time-sync.target - relying on client.c's own reconnect-with-
+# backoff loop to self-heal past a wrong-clock boot instead) and the
+# cloud-init console race found via live testing on alpha, and the
+# real ordering-cycle bug that attempting to fix it caused
+# (After=cloud-init.target created a genuine systemd dependency cycle
+# with multi-user.target, silently deleting this unit's start job
+# every boot with zero error output - see alpha's comment for the
+# full story). Deliberately NOT ordering after cloud-init.target here.
+After=network-online.target tailscaled.service fix-console-fb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=connor
+Group=connor
+WorkingDirectory=/home/connor/securelink
+
+ExecStart=/home/connor/securelink/build/client \
+    -h 100.124.177.123 \
+    -p 4433 \
+    -c /home/connor/pki/client_cert.pem \
+    -A /home/connor/pki/ca_cert.pem \
+    -K /home/connor/keyshare \
+    -P 100.124.177.123 \
+    -N securelink-alpha
+
+Environment=TERM=linux
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
