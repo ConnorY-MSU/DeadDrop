@@ -1173,4 +1173,33 @@ Confirms, on real hardware, all at once:
 
 **Not yet visually confirmed**: whether the client-side OLED wiring (new this session) actually renders on `bravo`'s screen during a real session — the test above only captured console/log output, not what's physically on either screen. Also not yet re-tested: `bravo`'s touchscreen cable check and the coordinated reboot the user asked for before this redesign work started — still outstanding from before this section.
 
-**Repo sync note**: this test ran against files copied directly (`scp`) into each Pi's existing checkout, deliberately ahead of committing — consistent with this project's discipline of proving something works before documenting/committing it as done. Both Pis' git history will be caught up (`git pull` after this work is pushed) as a follow-up, not yet done as of this section.
+**Repo sync note**: this test ran against files copied directly (`scp`) into each Pi's existing checkout, deliberately ahead of committing — consistent with this project's discipline of proving something works before documenting/committing it as done. Committed as `5848d8d`, pushed, and both Pis' git checkouts pulled clean at that commit the same day.
+
+## Real hardware follow-up — DSI console-binding fix, speaker confirmation, and a real timeout bug found in the two-way redesign — 2026-08-21
+
+Same day, continued session, after the user got both touchscreens physically working.
+
+### `alpha`'s touchscreen: not a hardware fault, a DRM enumeration-order coincidence
+After both Pis were rebooted, `bravo`'s touchscreen showed console text correctly but `alpha`'s stayed on/backlit with nothing displayed. Diagnosed properly rather than re-checking cables again: both Pis' DSI panels were detected fine at the kernel level (`card1-DSI-2: connected`, `/dev/fb1` present, `rp1dsi_bind succeeded` in `dmesg` — identical on both). The actual difference: **which physical output got numbered `fb0` vs `fb1` by the DRM/KMS driver differs between the two otherwise-identical boards** — a probe-order coincidence, not a fault:
+- `bravo`: `fb0` = DSI touchscreen, `fb1` = HDMI. Console (`con2fbmap 1` → framebuffer 0) lands on the touchscreen → works.
+- `alpha`: `fb0` = HDMI (nothing plugged in), `fb1` = DSI touchscreen. Console lands on HDMI, going nowhere visible, while the touchscreen sits powered but blank.
+
+Fixed live with `sudo con2fbmap 1 1` (remaps VT1 to `fb1`) — confirmed by the user immediately after. **Not yet made persistent across reboots** — since the fb0/fb1 assignment is enumeration-order-dependent and not guaranteed stable, a numeric `fbcon=map:N` kernel parameter would be just as fragile; the durable fix needs a boot-time script that identifies the DSI framebuffer by name (`drm-rp1-dsidrmf` via `/sys/class/graphics/fb*/name`) rather than by index, and remaps dynamically. Flagged as follow-up work, not done yet.
+
+### Speaker test: confirmed working, with a real driver/wiring subtlety understood first
+`aplay -l` showed only the two HDMI ALSA codecs, no dedicated case-speaker device — expected, not a bug: per Freenove's own documentation ([FNK0100 docs](https://docs.freenove.com/projects/fnk0100/en/latest/), confirmed via web search rather than assumed), the Raspberry Pi 5 removed its onboard analog audio jack entirely, so the case's Case Adapter Board doesn't have its own DAC — it electrically taps the HDMI audio signal instead ("audio separation circuit"). A known GitHub issue ([Freenove/Freenove_Computer_Case_Kit_for_Raspberry_Pi#4](https://github.com/Freenove/Freenove_Computer_Case_Kit_for_Raspberry_Pi/issues/4)) reports other users hitting silent output tied to a `vc4_hdmi.c` "Packet RAM" kernel warning on Pi 5 — checked for it first (`dmesg | grep -i 'packet ram\|infoframe'` — none present on `alpha`). Ran `speaker-test -D plughw:0,0` (HDMI0's codec) — **user confirmed audible sound** on the second, longer attempt. `espeak-ng` was already installed on both Pis (a Day-1 loose end resolved without extra action needed).
+
+### A real bug found and fixed: spurious ~30-second disconnects during idle periods
+Testing the two-way redesign with the physical OLEDs in mind (holding a session open longer so the user could walk over and look at both screens) surfaced a genuine bug: a live two-way session between `alpha` and `bravo` disconnected and reconnected several times within under a minute of real idle time, with the server repeatedly sending an unprompted `DISCONNECT`.
+
+**Root cause, confirmed by reading the code, not guessed**: `client.c`/`server.c` both call `set_socket_timeout()` (`SO_RCVTIMEO` = `CONN_TIMEOUT_SECONDS` = 30s) on the raw socket *before* the TLS handshake, to bound a stalled connect/handshake attempt. That made sense for the old synchronous send-then-wait-for-one-reply protocol, where a long idle read genuinely meant something was wrong — but it was never cleared afterward, so it stayed in effect for the receiver thread's entire life under the new design. Under "receiving always works," the receiver thread blocking in `wolfSSL_read()` for a long time during a normal idle chat is *expected*, not a failure — but `receiver_recv_one()` in `session.c` treated any `wolfSSL_read()` returning ≤0 (including a benign `SO_RCVTIMEO` expiry, indistinguishable at that call site from a real closed connection) as `RTHREAD_RECV_CLOSED`, ending the session roughly every 30 seconds of real idle time.
+
+**Fix**: `run_symmetric_session()` now clears `SO_RCVTIMEO` on the raw socket (to 0 / infinite) as its first action, before starting the receiver thread — see `session.h`'s "IMPORTANT for callers" comment for the full reasoning, including why `SO_SNDTIMEO` is deliberately left untouched (a stuck *send*, unlike an idle read, staying blocked for 30s is still a legitimate "something's wrong" signal, and is what's left providing dead-network detection now).
+
+**Verified via a real, timestamped 50-second idle test between the two physical Pis** — connection held healthy continuously from handshake (`t=7`) through the full ~47 seconds of idle time, well past where the old bug would have killed it around `t=30`–`37`:
+```
+[t=7]  mTLS handshake succeeded.
+[t=11] client: hello from bravo t=5
+[t=55] (still the same session - killed only by the test's own 55s external timeout)
+```
+Rebuilt and redeployed to both Pis, confirmed clean compiles (`-Wall -Wextra`) on both before retesting.

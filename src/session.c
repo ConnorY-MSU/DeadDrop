@@ -40,6 +40,31 @@
  * enough to feel responsive, long enough not to busy-loop. */
 #define STDIN_POLL_MS 500
 
+/*
+ * clear_recv_timeout - undo client.c/server.c's pre-handshake SO_RCVTIMEO
+ * (CONN_TIMEOUT_SECONDS) on the raw socket. See session.h's "IMPORTANT
+ * for callers" comment above run_symmetric_session() for the full
+ * reasoning: that timeout exists to bound a stalled connect/handshake,
+ * but a receiver thread legitimately blocking in wolfSSL_read() for a
+ * long time during an idle chat is normal, not a failure - leaving the
+ * old timeout in place would silently disconnect and reconnect roughly
+ * every CONN_TIMEOUT_SECONDS of real idle time. A value of 0 means "no
+ * timeout, block indefinitely" on both Windows and POSIX. SO_SNDTIMEO is
+ * deliberately left alone - see the header comment. */
+static void clear_recv_timeout(socket_t s)
+{
+#ifdef _WIN32
+    DWORD timeout_ms = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
+               (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+}
+
 /* --- stdin_ready: platform-specific bounded poll ---------------------
  *
  * Needed because a plain blocking fgets() can't be interrupted by
@@ -323,6 +348,12 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             "--enable-keying-material - see docs/BUILD.md)\n");
         return SESSION_DISCONNECTED;
     }
+
+    /* See session.h's "IMPORTANT for callers" comment: must happen before
+     * the receiver thread starts blocking in wolfSSL_read(), or it could
+     * legitimately hit the old pre-handshake timeout during its very
+     * first idle wait. */
+    clear_recv_timeout(sock);
 
     ctx.state = &state;
     ctx.ssl_read = ssl;

@@ -99,4 +99,25 @@ typedef enum {
 session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                                       int oled_fd, const char *peer_label);
 
+/*
+ * IMPORTANT for callers: client.c/server.c both apply a receive timeout
+ * (SO_RCVTIMEO, CONN_TIMEOUT_SECONDS) to the raw socket before the TLS
+ * handshake, to bound a stalled connect/handshake. That made sense for
+ * the old synchronous send-then-wait-for-one-reply protocol, where a
+ * long idle read genuinely meant something was wrong. It does NOT make
+ * sense once run_symmetric_session() is running: the receiver thread
+ * blocking in wolfSSL_read() for a long time is the NORMAL, expected
+ * state ("receiving always works" - the peer may simply not have typed
+ * anything yet), not a failure. run_symmetric_session() clears
+ * SO_RCVTIMEO on `sock` itself (to 0 / infinite) as its first action,
+ * specifically so callers don't have to remember to do this - a caller
+ * forgetting this would see spurious disconnects roughly every
+ * CONN_TIMEOUT_SECONDS of real idle time, which is exactly the bug this
+ * comment exists to prevent someone from reintroducing. SO_SNDTIMEO is
+ * left untouched - a stuck *send* (not merely an idle read) staying
+ * blocked for CONN_TIMEOUT_SECONDS is still a reasonable "something is
+ * genuinely wrong" signal, and is the mechanism left in place for this
+ * session to eventually notice a peer whose network truly vanished.
+ */
+
 #endif /* SESSION_H */
