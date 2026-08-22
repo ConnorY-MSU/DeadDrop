@@ -140,4 +140,37 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
  */
 void ui_shutdown(void);
 
+/*
+ * IDLE INPUT - real gap found via live hardware testing of the lock
+ * screen (see TESTING.md), fixed here: ui_poll_line() (and therefore
+ * ALL lock-screen interaction - Ctrl+L, PIN entry, first-time PIN
+ * setup) was only ever called from inside run_symmetric_session()'s
+ * sender loop, meaning a person could not interact with the lock
+ * screen at all while a device was disconnected/reconnecting -
+ * server.c's accept() in particular blocks indefinitely with no input
+ * polling while idle.
+ *
+ * ui_start_idle_input() spawns a dedicated thread that calls
+ * ui_poll_line() in a loop, servicing lock-screen keys the same way an
+ * active session's sender loop would, whenever no session is active.
+ * Any line actually "submitted" while idle (Enter pressed with nothing
+ * to send it through) is not sent anywhere - there's no connection -
+ * a brief note is added to history explaining that instead of silently
+ * dropping typed input.
+ *
+ * ui_start_idle_input()/ui_stop_idle_input() are temporally mutually
+ * exclusive with an active session by construction: the idle thread
+ * and run_symmetric_session()'s own sender loop must never both be
+ * reading input_win at the same time. It is the CALLER's job
+ * (client.c's reconnect loop, server.c's accept loop) to maintain that
+ * invariant - call ui_stop_idle_input() immediately before starting a
+ * session and ui_start_idle_input() again immediately after it ends.
+ *
+ * No-ops on non-Linux (the fallback path has no lock screen at all -
+ * see ui.c) - safe to call unconditionally from client.c/server.c on
+ * either platform.
+ */
+void ui_start_idle_input(void);
+void ui_stop_idle_input(void);
+
 #endif /* UI_H */

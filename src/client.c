@@ -255,7 +255,13 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     hw_oled_draw_text(oled_fd, 1, "Connected");
     hw_oled_display(oled_fd);
 
+    /* Stop the idle-input thread before run_symmetric_session() starts
+     * its own reader on the same input_win, and resume it immediately
+     * after - see ui.h's "IDLE INPUT" comment. These two calls must
+     * bracket every run_symmetric_session() call exactly like this. */
+    ui_stop_idle_input();
     result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "server");
+    ui_start_idle_input();
 
     hw_oled_draw_text(oled_fd, 0, "SecureLink client");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
@@ -391,6 +397,14 @@ int main(int argc, char *argv[])
      * since it can fail before there's any UI to report through. */
     ui_init("server");
 
+    /* Lock-screen interaction (Ctrl+L, PIN entry) needs to work even
+     * while disconnected/reconnecting, not just inside an active
+     * session - see ui.h's "IDLE INPUT" comment. Started here, once,
+     * covering the reconnect loop's idle periods; connect_and_run()
+     * brackets each run_symmetric_session() call with the matching
+     * stop/start pair. */
+    ui_start_idle_input();
+
     /* Case RGB status light (no-op on non-Linux / hardware-absent - see
      * hw_expansion.h). Opened once here, kept open for the whole
      * reconnect loop below (not re-opened per attempt), since it's a
@@ -457,6 +471,7 @@ int main(int argc, char *argv[])
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
+    ui_stop_idle_input();
     ui_shutdown();
 
     wolfSSL_CTX_free(ctx);

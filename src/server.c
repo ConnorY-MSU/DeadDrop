@@ -365,6 +365,14 @@ int main(int argc, char *argv[])
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
+    /* Lock-screen interaction (Ctrl+L, PIN entry) needs to work even
+     * while no client has connected yet - accept() below blocks
+     * indefinitely with no input polling of its own - see ui.h's
+     * "IDLE INPUT" comment. Started here, once, covering every gap
+     * between connections; each run_symmetric_session() call below is
+     * bracketed with the matching stop/start pair. */
+    ui_start_idle_input();
+
     for (;;) {
         socket_t client_sock = accept(listen_sock, NULL, NULL);
         if (client_sock == SOCKET_INVALID) {
@@ -406,7 +414,14 @@ int main(int argc, char *argv[])
             hw_oled_draw_text(oled_fd, 0, "SecureLink server");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
+            /* Stop the idle-input thread before run_symmetric_session()
+             * starts its own reader on the same input_win, and resume
+             * it immediately after - see ui.h's "IDLE INPUT" comment.
+             * These two calls must bracket every run_symmetric_session()
+             * call exactly like this. */
+            ui_stop_idle_input();
             run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "client");
+            ui_start_idle_input();
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
             hw_oled_draw_text(oled_fd, 0, "SecureLink server");
             hw_oled_draw_text(oled_fd, 1, "Waiting...");
@@ -442,6 +457,7 @@ int main(int argc, char *argv[])
     CLOSE_SOCKET(listen_sock);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
+    ui_stop_idle_input();
     ui_shutdown();
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();

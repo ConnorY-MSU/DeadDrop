@@ -585,10 +585,67 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
 
 void ui_shutdown(void)
 {
+    /* Belt-and-suspenders: if the idle thread is somehow still running
+     * (a caller forgot to bracket a session with
+     * ui_stop_idle_input()/ui_start_idle_input(), or is exiting
+     * abnormally), stop it before endwin() rather than leaving it
+     * reading from a window that's about to be torn down. */
+    ui_stop_idle_input();
     if (ui_active) {
         ui_active = 0;
         endwin();
     }
+}
+
+/* --- Idle input - see ui.h's "IDLE INPUT" comment for the full why.
+ * Runs ui_poll_line() on a dedicated thread whenever no session is
+ * active, so lock-screen interaction (Ctrl+L, PIN entry, first-time
+ * PIN setup) works even while client.c/server.c are disconnected or
+ * blocked in accept()/a reconnect backoff sleep. --- */
+static pthread_t idle_thread;
+static volatile int idle_thread_running = 0;
+static volatile int idle_thread_should_stop = 0;
+
+static void *idle_input_thread_main(void *arg)
+{
+    char dummy[256];
+    (void)arg;
+
+    while (!idle_thread_should_stop) {
+        ui_poll_result pr = ui_poll_line(dummy, sizeof(dummy), 200);
+        if (pr == UI_POLL_LINE) {
+            /* Something was typed and Enter pressed, but there's no
+             * active session to send it through - explain rather than
+             * silently dropping it, so this doesn't look like a bug to
+             * whoever's at the keyboard. */
+            ui_add_history(NULL, "(not connected - nothing sent)");
+        }
+        /* UI_POLL_TIMEOUT: normal, keep looping. UI_POLL_QUIT: never
+         * returned by the real ncurses ui_poll_line() - see ui.h. */
+    }
+    return NULL;
+}
+
+void ui_start_idle_input(void)
+{
+    if (!ui_active || idle_thread_running) {
+        return;
+    }
+    idle_thread_should_stop = 0;
+    if (pthread_create(&idle_thread, NULL, idle_input_thread_main, NULL)
+            == 0) {
+        idle_thread_running = 1;
+    }
+}
+
+void ui_stop_idle_input(void)
+{
+    if (!idle_thread_running) {
+        return;
+    }
+    idle_thread_should_stop = 1;
+    pthread_join(idle_thread, NULL);
+    idle_thread_running = 0;
 }
 
 #else /* !__linux__ */
@@ -726,6 +783,18 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
 void ui_shutdown(void)
 {
     /* no-op - stdio needs no cleanup */
+}
+
+/* No lock screen exists on this fallback path at all (see ui.h's top
+ * comment - it's a Linux/ncurses-only UI feature), so there's nothing
+ * for idle input polling to service here - no-ops, present only so
+ * client.c/server.c can call these unconditionally on either platform. */
+void ui_start_idle_input(void)
+{
+}
+
+void ui_stop_idle_input(void)
+{
 }
 
 #endif /* __linux__ */
