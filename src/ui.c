@@ -53,10 +53,38 @@
  * explicitly sleeps OUTSIDE the lock between them - see its comment.
  */
 static WINDOW *status_win = NULL;
-static WINDOW *history_win = NULL;
-static WINDOW *input_win = NULL;
+static WINDOW *history_border_win = NULL; /* outer window, box() only */
+static WINDOW *history_win = NULL;        /* derwin() inside the above -
+    all existing call sites keep using this name/window for actual
+    content; only ui_init() and the touch row-math needed to change to
+    account for the border. See this file's STYLING block comment. */
+static WINDOW *input_border_win = NULL;   /* outer window, box() only */
+static WINDOW *input_win = NULL;          /* derwin() inside the above */
 static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int ui_active = 0;
+
+/* --- Styling (Week 4 Days 2-3, "richer ncurses styling" - Phase 1 of
+ * a two-phase aesthetic direction the user gave directly: start here,
+ * eventually move toward a distinctive Flipper-Zero/Cyberpunk-2077-
+ * style look for the truly final iteration - that's a later, separate
+ * pass, not attempted here).
+ *
+ * Color palette confirmed against the REAL deployment target, not
+ * assumed: TERM=linux on the actual Pi console reports COLORS=8,
+ * COLOR_PAIRS=64 (the standard ANSI 8-color palette, not 256-color or
+ * truecolor) - every color pair below stays within that, using A_BOLD
+ * for "bright" variants (universally supported) rather than anything
+ * that would look wrong or fail silently on the real hardware this
+ * project targets.
+ */
+#define CP_STATUS   1 /* status "title bar": black text on cyan */
+#define CP_BORDER   2 /* panel borders: cyan on black */
+#define CP_PEER_MSG 3 /* incoming (peer) messages: green on black */
+#define CP_OWN_MSG  4 /* own sent messages: yellow on black */
+#define CP_SYSTEM   5 /* system/event notices: cyan on black, no bold -
+                          visually quieter than a real message */
+#define CP_LOCKED   6 /* lock screen: red on black */
+#define CP_INPUT    7 /* input line prompt: cyan on black */
 
 /* Deliberately smaller than SL_MAX_BODY_LEN (message.h's 64 KiB
  * protocol cap) - this bounds one INTERACTIVELY TYPED line through a
@@ -241,10 +269,12 @@ static int history_paused = 0;
 static void draw_locked_overlay_locked(void)
 {
     werase(history_win);
+    wattron(history_win, COLOR_PAIR(CP_LOCKED) | A_BOLD);
     mvwprintw(history_win, 0, 0,
               "Locked. Messages are still being received normally in the "
               "background.\nEnter your PIN below and press Enter to "
               "unlock.");
+    wattroff(history_win, COLOR_PAIR(CP_LOCKED) | A_BOLD);
     wrefresh(history_win);
 }
 
@@ -253,63 +283,55 @@ static void draw_locked_overlay_locked(void)
 static void redraw_input_locked(void)
 {
     size_t i;
+    int cp = CP_INPUT; /* overridden below for sensitive-entry modes */
+
+    werase(input_win);
 
     switch (ui_mode) {
     case UI_MODE_LOCKED:
-        werase(input_win);
+        cp = CP_LOCKED;
         mvwprintw(input_win, 0, 0, "Enter PIN to unlock: ");
         for (i = 0; i < pin_entry_len; i++) {
             waddch(input_win, '*');
         }
-        wrefresh(input_win);
         break;
     case UI_MODE_SET_PIN_NEW:
-        werase(input_win);
+        cp = CP_LOCKED;
         mvwprintw(input_win, 0, 0, "Set a PIN (min %d chars): ",
                   LOCK_PIN_MIN_LEN);
         for (i = 0; i < pin_entry_len; i++) {
             waddch(input_win, '*');
         }
-        wrefresh(input_win);
         break;
     case UI_MODE_SET_PIN_CONFIRM:
-        werase(input_win);
+        cp = CP_LOCKED;
         mvwprintw(input_win, 0, 0, "Confirm PIN: ");
         for (i = 0; i < pin_entry_len; i++) {
             waddch(input_win, '*');
         }
-        wrefresh(input_win);
         break;
     case UI_MODE_WIFI_SCANNING:
-        werase(input_win);
         mvwprintw(input_win, 0, 0,
                   "Scanning for WiFi networks... (Ctrl+W to cancel)");
-        wrefresh(input_win);
         break;
     case UI_MODE_WIFI_SELECT:
-        werase(input_win);
         mvwprintw(input_win, 0, 0,
                   "Select network number (Ctrl+W to cancel): %s", input_buf);
-        wrefresh(input_win);
         break;
     case UI_MODE_WIFI_PASSWORD:
-        werase(input_win);
+        cp = CP_LOCKED;
         mvwprintw(input_win, 0, 0, "Password for %s (Ctrl+W to cancel): ",
                   wifi_selected_ssid);
         for (i = 0; i < pin_entry_len; i++) {
             waddch(input_win, '*');
         }
-        wrefresh(input_win);
         break;
     case UI_MODE_WIFI_CONNECTING:
-        werase(input_win);
         mvwprintw(input_win, 0, 0, "Connecting to %s...",
                   wifi_selected_ssid);
-        wrefresh(input_win);
         break;
     case UI_MODE_NORMAL:
     default:
-        werase(input_win);
         if (history_paused) {
             mvwprintw(input_win, 0, 0,
                       "[PAUSED - tap lower half of history to resume] > %s",
@@ -317,9 +339,15 @@ static void redraw_input_locked(void)
         } else {
             mvwprintw(input_win, 0, 0, "> %s", input_buf);
         }
-        wrefresh(input_win);
         break;
     }
+
+    /* Applied to the whole line after drawing (rather than wrapping
+     * every mvwprintw/waddch call individually above) - simpler, and
+     * every character on the input line should share the same color
+     * for a given mode anyway, masked PIN/password asterisks included. */
+    mvwchgat(input_win, 0, 0, -1, A_NORMAL, cp, NULL);
+    wrefresh(input_win);
 }
 
 void ui_init(const char *peer_label)
@@ -339,9 +367,54 @@ void ui_init(const char *peer_label)
      * atexit() registration is safe, not a double-free-style hazard. */
     atexit(ui_shutdown);
 
+    /* Color setup - see this file's STYLING block comment for the
+     * palette rationale. has_colors() is checked defensively - a
+     * terminal without color support (shouldn't happen with TERM=linux
+     * on the real target, but conceivable elsewhere) just runs
+     * monochrome rather than crashing or looking broken. */
+    if (has_colors()) {
+        start_color();
+        init_pair(CP_STATUS, COLOR_BLACK, COLOR_CYAN);
+        init_pair(CP_BORDER, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_PEER_MSG, COLOR_GREEN, COLOR_BLACK);
+        init_pair(CP_OWN_MSG, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(CP_SYSTEM, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_LOCKED, COLOR_RED, COLOR_BLACK);
+        init_pair(CP_INPUT, COLOR_CYAN, COLOR_BLACK);
+    }
+
+    /* Layout: a 1-row status bar with a filled background (a "title
+     * bar" look, via wbkgd() below) plus two bordered panels. Each
+     * bordered panel is an OUTER window (box() only) with an INNER
+     * derwin() for actual content - the standard ncurses pattern for a
+     * border that survives scrolling: an inner derwin() physically
+     * shares the same character grid as its parent's interior, so
+     * refreshing just the inner window updates content without ever
+     * touching, or needing to redraw, the border cells around it.
+     * Every existing call site (ui_add_history(), redraw_input_locked(),
+     * etc.) keeps using the SAME `history_win`/`input_win` names for
+     * content - only what they're created FROM changed here. */
     status_win = newwin(1, COLS, 0, 0);
-    history_win = newwin(LINES - 3, COLS, 1, 0);
-    input_win = newwin(1, COLS, LINES - 1, 0);
+
+    history_border_win = newwin(LINES - 4, COLS, 1, 0);
+    history_win = derwin(history_border_win, LINES - 6, COLS - 2, 1, 1);
+
+    input_border_win = newwin(3, COLS, LINES - 3, 0);
+    input_win = derwin(input_border_win, 1, COLS - 2, 1, 1);
+
+    if (has_colors()) {
+        wbkgd(status_win, COLOR_PAIR(CP_STATUS));
+        wattron(history_border_win, COLOR_PAIR(CP_BORDER));
+        wattron(input_border_win, COLOR_PAIR(CP_BORDER));
+    }
+    box(history_border_win, 0, 0);
+    box(input_border_win, 0, 0);
+    if (has_colors()) {
+        wattroff(history_border_win, COLOR_PAIR(CP_BORDER));
+        wattroff(input_border_win, COLOR_PAIR(CP_BORDER));
+    }
+    wrefresh(history_border_win);
+    wrefresh(input_border_win);
 
     scrollok(history_win, TRUE);
     keypad(input_win, TRUE);
@@ -392,8 +465,12 @@ void ui_set_status(const char *status_text)
         return;
     }
     pthread_mutex_lock(&ui_mutex);
+    /* werase() fills with status_win's background attribute, set once
+     * in ui_init() via wbkgd() - CP_STATUS, giving the whole row a
+     * filled "title bar" look rather than just colored text on a
+     * black background. */
     werase(status_win);
-    mvwprintw(status_win, 0, 0, "%s", status_text != NULL ? status_text : "");
+    mvwprintw(status_win, 0, 1, "%s", status_text != NULL ? status_text : "");
     wrefresh(status_win);
     /* Put the cursor back in the input line - otherwise it visibly jumps
      * to wherever the status bar last wrote, which looks broken since
@@ -422,10 +499,24 @@ void ui_add_history(const char *prefix, const char *text)
         return;
     }
     pthread_mutex_lock(&ui_mutex);
-    if (prefix != NULL) {
-        wprintw(history_win, "%s: %s\n", prefix, text != NULL ? text : "");
-    } else {
-        wprintw(history_win, "%s\n", text != NULL ? text : "");
+    {
+        /* Color by source: NULL prefix is a system/event notice (quiet
+         * cyan, no bold); "you" (session.c's own convention for the
+         * local user's sent messages) gets a distinct color from an
+         * incoming peer message (any other non-NULL prefix, i.e. the
+         * peer_label session.c passes) - makes it possible to tell at
+         * a glance who said what without reading every line. */
+        int cp = CP_SYSTEM;
+        if (prefix != NULL) {
+            cp = (strcmp(prefix, "you") == 0) ? CP_OWN_MSG : CP_PEER_MSG;
+        }
+        wattron(history_win, COLOR_PAIR(cp));
+        if (prefix != NULL) {
+            wprintw(history_win, "%s: %s\n", prefix, text != NULL ? text : "");
+        } else {
+            wprintw(history_win, "%s\n", text != NULL ? text : "");
+        }
+        wattroff(history_win, COLOR_PAIR(cp));
     }
     /* Always write into history_win's buffer (above), regardless of lock
      * or pause state - see this file's lock-screen block comment's
@@ -1025,8 +1116,12 @@ static void handle_tap_locked(int tap_row, int tap_col)
          * this is the honest analog to "wake/dismiss a screensaver". */
         redraw_input_locked();
     } else if (ui_mode == UI_MODE_WIFI_SELECT) {
-        int history_row = tap_row - 1; /* history_win starts at screen
-            row 1 */
+        /* history_win's CONTENT starts at absolute screen row 2 now
+         * (row 0 = status bar, row 1 = history_border_win's top border
+         * edge, row 2 = first content row) - see ui_init()'s STYLING
+         * comment for the bordered-panel layout this offset comes
+         * from. */
+        int history_row = tap_row - 2;
         int idx = history_row - (wifi_list_header_row + 1);
 
         if (wifi_list_header_row >= 0 && idx >= 0 &&
@@ -1052,8 +1147,9 @@ static void handle_tap_locked(int tap_row, int tap_col)
             redraw_input_locked();
         }
     } else if (ui_mode == UI_MODE_NORMAL) {
-        int history_height = LINES - 3;
-        int history_row = tap_row - 1;
+        /* Same border-offset reasoning as the WIFI_SELECT branch above. */
+        int history_height = LINES - 6;
+        int history_row = tap_row - 2;
 
         if (history_row >= 0 && history_row < history_height) {
             if (history_row < history_height / 2) {
