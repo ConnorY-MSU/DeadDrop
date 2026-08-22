@@ -13,6 +13,7 @@
 #include "hw_expansion.h"
 #include "hw_oled.h"
 #include "hw_tts.h"
+#include "ui.h"
 
 /* Platform bits this file needs beyond what session.h already brought in
  * (socket_t, winsock2.h on Windows). Kept local rather than folded into
@@ -20,25 +21,22 @@
  * semantics, only this implementation does, same "platform knowledge
  * lives only where it's used" precedent client.c/server.c already set. */
 #ifdef _WIN32
-    #include <windows.h> /* GetStdHandle/WaitForSingleObject - safe after
-                           * winsock2.h (already pulled in by session.h),
-                           * which is the include order that avoids the
-                           * classic windows.h-redefines-winsock-symbols
-                           * conflict. */
     #define SHUTDOWN_READ(s) shutdown((s), SD_RECEIVE)
 #else
     #include <sys/socket.h>
-    #include <sys/select.h>
     #include <unistd.h>
     #define SHUTDOWN_READ(s) shutdown((s), SHUT_RD)
 #endif
 
-/* How often the sender loop wakes up (if stdin has nothing ready) to
+/* How often the sender loop wakes up (if nothing's been typed) to
  * re-check whether the receiver thread has ended the session. Bounds the
  * worst-case delay between "peer disconnected" and this side noticing
- * and returning, when the local user hasn't typed anything - short
- * enough to feel responsive, long enough not to busy-loop. */
-#define STDIN_POLL_MS 500
+ * and returning, when the local user hasn't typed anything. Also bounds
+ * (on the real ncurses UI path) how long an incoming message's display
+ * can be delayed by a concurrent ui_poll_line() wait - see ui.c's
+ * ui_mutex comment. 200ms: responsive enough that neither delay is
+ * perceptible, without busy-looping. */
+#define STDIN_POLL_MS 200
 
 /*
  * clear_recv_timeout - undo client.c/server.c's pre-handshake SO_RCVTIMEO
@@ -64,53 +62,6 @@ static void clear_recv_timeout(socket_t s)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 }
-
-/* --- stdin_ready: platform-specific bounded poll ---------------------
- *
- * Needed because a plain blocking fgets() can't be interrupted by
- * another thread - if the receiver thread discovers the session is over
- * while the local user hasn't typed anything, there'd be no way to wake
- * a sender loop sitting in fgets(). Polling with a bounded timeout
- * instead means the sender loop always comes back to re-check, within
- * STDIN_POLL_MS, even with nothing typed.
- *
- * POSIX: select() works on any fd, including stdin (fd 0).
- * Windows: Winsock's select() only accepts socket handles, not the
- * console's stdin handle, so this uses WaitForSingleObject() on the
- * console input handle instead. Caveat, dev-machine-only (this branch
- * never runs on the real Pi deployment target): a signaled console
- * handle means "some input event is queued", which can include things
- * other than a full line being ready (a keystroke that's part of a
- * longer line, a resize/focus event) - fgets() may still block briefly
- * after this returns true. Not a correctness problem, just an imprecision
- * accepted for dev-machine testing.
- */
-#ifdef _WIN32
-static int stdin_ready(int timeout_ms)
-{
-    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD rc;
-
-    if (h == INVALID_HANDLE_VALUE || h == NULL) {
-        return 1; /* can't poll - fall back to letting fgets() try */
-    }
-    rc = WaitForSingleObject(h, (DWORD)timeout_ms);
-    return rc == WAIT_OBJECT_0;
-}
-#else
-static int stdin_ready(int timeout_ms)
-{
-    fd_set fds;
-    struct timeval tv;
-
-    FD_ZERO(&fds);
-    FD_SET(0, &fds);
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    return select(1, &fds, NULL, NULL, &tv) > 0;
-}
-#endif
 
 /* --- Shared state between the two threads ----------------------------
  *
@@ -167,8 +118,8 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
                                   out_buf, sizeof(out_buf));
     if (total < 0) {
         pthread_mutex_unlock(&ctx->send_mutex);
-        fprintf(stderr, "session_send: sl_serialize_message failed "
-                         "(body_len=%u)\n", body_len);
+        ui_add_historyf(NULL, "(send failed: message too large, "
+                               "body_len=%u)", body_len);
         return -1;
     }
 
@@ -179,8 +130,8 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
     if (rc != total) {
         int err = wolfSSL_get_error(ctx->ssl_write, rc);
         char errbuf[80];
-        fprintf(stderr, "wolfSSL_write: %s\n",
-                wolfSSL_ERR_error_string(err, errbuf));
+        ui_add_historyf(NULL, "(send failed: %s)",
+                         wolfSSL_ERR_error_string(err, errbuf));
         return -1;
     }
     return 0;
@@ -250,10 +201,18 @@ static void *receiver_thread_main(void *arg)
 {
     shared_session_ctx *ctx = (shared_session_ctx *)arg;
     uint8_t *recv_buf = malloc(SL_MAX_MSG_SIZE);
+    /* Full-length NUL-terminated copy of a TEXT_MESSAGE body, for
+     * ui_add_history()/ui_add_historyf() (which need a real C string) -
+     * deliberately separate from the short OLED/TTS preview[] below:
+     * the on-screen history should show the whole message, not a
+     * 21-character-wide truncation. */
+    char *text_buf = malloc(SL_MAX_BODY_LEN + 1);
     size_t have = 0;
 
-    if (recv_buf == NULL) {
-        fprintf(stderr, "receiver_thread_main: out of memory\n");
+    if (recv_buf == NULL || text_buf == NULL) {
+        free(recv_buf);
+        free(text_buf);
+        ui_add_history(NULL, "(internal error: out of memory)");
         ctx->peer_ended = 1;
         return NULL;
     }
@@ -268,8 +227,8 @@ static void *receiver_thread_main(void *arg)
             break;
         }
         if (rs == RTHREAD_RECV_REJECTED) {
-            fprintf(stderr, "\nReceived an invalid message from %s - "
-                             "ending session.\n", ctx->peer_label);
+            ui_add_historyf(NULL, "Received an invalid message from %s "
+                                   "- ending session.", ctx->peer_label);
             ctx->peer_ended = 1;
             break;
         }
@@ -277,47 +236,56 @@ static void *receiver_thread_main(void *arg)
         /* rs == RTHREAD_RECV_OK */
         if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
             /* msg.body is length-prefixed per PROTOCOL.md, NOT a
-             * NUL-terminated C string - hw_oled_draw_text()/
-             * hw_tts_speak() both expect a real C string, so a bounded,
-             * NUL-terminated copy is made first. Bounded short - the
-             * OLED line is 21 characters wide, and speaking a full 64KB
-             * message aloud would be its own bad idea regardless of
+             * NUL-terminated C string - every consumer below needs a
+             * real C string, so a NUL-terminated copy is made first.
+             * text_buf is the full message (sized SL_MAX_BODY_LEN+1,
+             * see its declaration above), for the on-screen history;
+             * preview[] below is a SEPARATE, much shorter copy for the
+             * 21-character-wide OLED and for speech, where a full 64KB
+             * message would be its own bad idea regardless of
              * hw_tts_speak()'s own internal cap. */
-            char preview[64];
-            size_t preview_len = msg.body_len;
-            if (preview_len > sizeof(preview) - 1) {
-                preview_len = sizeof(preview) - 1;
+            {
+                size_t n = msg.body_len;
+                if (n > SL_MAX_BODY_LEN) {
+                    n = SL_MAX_BODY_LEN; /* defensive; the protocol layer
+                                           * already enforces this cap */
+                }
+                memcpy(text_buf, msg.body, n);
+                text_buf[n] = '\0';
             }
-            memcpy(preview, msg.body, preview_len);
-            preview[preview_len] = '\0';
-
-            printf("\n%s: %.*s\n> ", ctx->peer_label,
-                   (int)msg.body_len, msg.body);
-            fflush(stdout);
+            ui_add_history(ctx->peer_label, text_buf);
 
             {
-                char oled_line0[32];
-                snprintf(oled_line0, sizeof(oled_line0), "From %s:",
-                          ctx->peer_label);
-                hw_oled_draw_text(ctx->oled_fd, 0, oled_line0);
-                hw_oled_draw_text(ctx->oled_fd, 1, preview);
-                hw_oled_display(ctx->oled_fd);
+                char preview[64];
+                size_t preview_len = msg.body_len;
+                if (preview_len > sizeof(preview) - 1) {
+                    preview_len = sizeof(preview) - 1;
+                }
+                memcpy(preview, msg.body, preview_len);
+                preview[preview_len] = '\0';
+
+                {
+                    char oled_line0[32];
+                    snprintf(oled_line0, sizeof(oled_line0), "From %s:",
+                              ctx->peer_label);
+                    hw_oled_draw_text(ctx->oled_fd, 0, oled_line0);
+                    hw_oled_draw_text(ctx->oled_fd, 1, preview);
+                    hw_oled_display(ctx->oled_fd);
+                }
+                hw_tts_speak(preview);
             }
-            hw_tts_speak(preview);
         } else if (msg.msg_type == SL_MSG_PING) {
-            printf("\n(ping received from %s - replying)\n> ",
-                   ctx->peer_label);
-            fflush(stdout);
+            ui_add_historyf(NULL, "(ping received from %s - replying)",
+                             ctx->peer_label);
             if (session_send(ctx, SL_MSG_PONG, NULL, 0) != 0) {
                 ctx->peer_ended = 1;
                 break;
             }
         } else if (msg.msg_type == SL_MSG_PONG) {
-            printf("\n(pong received from %s)\n> ", ctx->peer_label);
-            fflush(stdout);
+            ui_add_historyf(NULL, "(pong received from %s)",
+                             ctx->peer_label);
         } else if (msg.msg_type == SL_MSG_DISCONNECT) {
-            printf("\n%s sent DISCONNECT.\n", ctx->peer_label);
-            fflush(stdout);
+            ui_add_historyf(NULL, "%s sent DISCONNECT.", ctx->peer_label);
             ctx->peer_ended = 1;
             break;
         }
@@ -327,6 +295,7 @@ static void *receiver_thread_main(void *arg)
     }
 
     free(recv_buf);
+    free(text_buf);
     return NULL;
 }
 
@@ -342,10 +311,10 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     session_result result;
 
     if (sl_session_init(ssl, &state) != 0) {
-        fprintf(stderr,
+        ui_add_history(NULL,
             "sl_session_init failed - wolfSSL_export_keying_material "
             "unavailable? (needs HAVE_KEYING_MATERIAL / "
-            "--enable-keying-material - see docs/BUILD.md)\n");
+            "--enable-keying-material)");
         return SESSION_DISCONNECTED;
     }
 
@@ -365,9 +334,9 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
      * all. Needs HAVE_WRITE_DUP / --enable-writedup - see docs/BUILD.md. */
     ctx.ssl_write = wolfSSL_write_dup(ssl);
     if (ctx.ssl_write == NULL) {
-        fprintf(stderr,
+        ui_add_history(NULL,
             "wolfSSL_write_dup failed - this wolfSSL build may lack "
-            "HAVE_WRITE_DUP / --enable-writedup (see docs/BUILD.md)\n");
+            "HAVE_WRITE_DUP / --enable-writedup");
         return SESSION_DISCONNECTED;
     }
 
@@ -379,7 +348,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     ctx.peer_label = peer_label;
 
     if (pthread_create(&rtid, NULL, receiver_thread_main, &ctx) != 0) {
-        fprintf(stderr, "run_symmetric_session: pthread_create failed\n");
+        ui_add_history(NULL, "run_symmetric_session: pthread_create failed");
         pthread_mutex_destroy(&ctx.send_mutex);
         wolfSSL_free(ctx.ssl_write);
         return SESSION_DISCONNECTED;
@@ -392,7 +361,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
      * buffer on top of those is unnecessary pressure for no benefit. */
     line = malloc(SL_MAX_BODY_LEN);
     if (line == NULL) {
-        fprintf(stderr, "run_symmetric_session: out of memory\n");
+        ui_add_history(NULL, "run_symmetric_session: out of memory");
         ctx.should_stop = 1;
         SHUTDOWN_READ(sock);
         pthread_join(rtid, NULL);
@@ -401,39 +370,42 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         return SESSION_DISCONNECTED;
     }
 
-    printf("Connected to %s. Type a message and press Enter (or 'quit' "
-           "to exit).\nIncoming messages from %s display automatically "
-           "at any time.\n> ", peer_label, peer_label);
-    fflush(stdout);
+    ui_set_statusf("Connected to %s", peer_label);
+    ui_add_history(NULL, "Type a message and press Enter to send "
+                          "('quit' to exit). Incoming messages display "
+                          "automatically at any time.");
 
     for (;;) {
         size_t len;
+        ui_poll_result pr;
 
         if (ctx.peer_ended) {
-            fprintf(stderr, "\nConnection to %s lost.\n", peer_label);
+            ui_add_historyf(NULL, "Connection to %s lost.", peer_label);
             result = SESSION_DISCONNECTED;
             break;
         }
 
-        if (!stdin_ready(STDIN_POLL_MS)) {
+        pr = ui_poll_line(line, SL_MAX_BODY_LEN, STDIN_POLL_MS);
+
+        if (pr == UI_POLL_TIMEOUT) {
             continue;
         }
-
-        if (fgets(line, SL_MAX_BODY_LEN, stdin) == NULL) {
-            /* EOF on stdin (e.g. Ctrl-D / Ctrl-Z) - treat the same as an
-             * explicit quit. */
-            printf("\n");
+        if (pr == UI_POLL_QUIT) {
+            /* stdin closed (EOF) - only the plain-console fallback ever
+             * returns this; see ui.h. Treat the same as an explicit
+             * quit. */
+            ui_add_history(NULL, "(you quit)");
             session_send(&ctx, SL_MSG_DISCONNECT, NULL, 0);
             result = SESSION_USER_QUIT;
             break;
         }
 
+        /* pr == UI_POLL_LINE: line[] holds the composed, NUL-terminated
+         * line (any trailing newline already stripped by ui_poll_line()). */
         len = strlen(line);
-        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
-            line[--len] = '\0';
-        }
 
         if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
+            ui_add_history(NULL, "(you quit)");
             session_send(&ctx, SL_MSG_DISCONNECT, NULL, 0);
             result = SESSION_USER_QUIT;
             break;
@@ -442,7 +414,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         if (ctx.peer_ended) {
             /* Peer ended the session while this line was being typed -
              * don't bother sending into an already-dead connection. */
-            fprintf(stderr, "\nConnection to %s lost.\n", peer_label);
+            ui_add_historyf(NULL, "Connection to %s lost.", peer_label);
             result = SESSION_DISCONNECTED;
             break;
         }
@@ -453,8 +425,12 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             break;
         }
 
-        printf("> ");
-        fflush(stdout);
+        /* Echo the user's own sent message into the history. ncurses
+         * runs in noecho() mode and clears the input line once
+         * submitted (ui.c), so without this the user would have no
+         * on-screen record of what they just sent - unlike a plain
+         * terminal, which echoes typed input on its own. */
+        ui_add_history("you", line);
     }
 
     free(line);

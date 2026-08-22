@@ -38,6 +38,7 @@
 #include "hw_expansion.h"
 #include "hw_oled.h"
 #include "session.h"
+#include "ui.h"
 
 /* Host/port are generic, sensible defaults (loopback, this project's
  * standard port) - not tied to any one machine, so they're fine to keep
@@ -151,10 +152,11 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
      * even opens so it's lit for the whole connect+handshake attempt,
      * not just the TLS portion of it. */
     hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTING);
+    ui_set_status("Connecting...");
 
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == SOCKET_INVALID) {
-        fprintf(stderr, "socket() failed: %d\n", SOCK_LAST_ERROR());
+        ui_add_historyf(NULL, "socket() failed: %d", SOCK_LAST_ERROR());
         return SESSION_DISCONNECTED;
     }
 
@@ -183,8 +185,8 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
         gai_rc = getaddrinfo(host, port_str, &hints, &res);
         if (gai_rc != 0) {
-            fprintf(stderr, "getaddrinfo failed for host '%s': %s\n",
-                    host, gai_strerror(gai_rc));
+            ui_add_historyf(NULL, "getaddrinfo failed for host '%s': %s",
+                             host, gai_strerror(gai_rc));
             CLOSE_SOCKET(sock);
             return SESSION_DISCONNECTED;
         }
@@ -199,8 +201,8 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
         freeaddrinfo(res);
 
         if (rp == NULL) {
-            fprintf(stderr,
-                "getaddrinfo: no IPv4 address found for host '%s'\n", host);
+            ui_add_historyf(NULL,
+                "getaddrinfo: no IPv4 address found for host '%s'", host);
             CLOSE_SOCKET(sock);
             return SESSION_DISCONNECTED;
         }
@@ -208,11 +210,11 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
     rc = connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (rc == SOCKET_ERR_RET) {
-        fprintf(stderr, "connect() failed: %d\n", SOCK_LAST_ERROR());
+        ui_add_historyf(NULL, "connect() failed: %d", SOCK_LAST_ERROR());
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
-    printf("Connected to server.\n");
+    ui_set_status("TCP connected - starting TLS handshake...");
 
     /* See CONN_TIMEOUT_SECONDS above - this is what turns "network died
      * silently mid-session" into an eventual, detectable read failure
@@ -221,7 +223,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
     ssl = wolfSSL_new(ctx);
     if (ssl == NULL) {
-        fprintf(stderr, "wolfSSL_new failed\n");
+        ui_add_history(NULL, "wolfSSL_new failed");
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
@@ -240,13 +242,13 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
         char errbuf[80];
-        fprintf(stderr, "Handshake failed: %s\n",
-                wolfSSL_ERR_error_string(err, errbuf));
+        ui_add_historyf(NULL, "Handshake failed: %s",
+                         wolfSSL_ERR_error_string(err, errbuf));
         wolfSSL_free(ssl);
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
-    printf("mTLS handshake succeeded.\n");
+    ui_set_status("mTLS handshake succeeded");
     *connected_ok = 1;
     hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
     hw_oled_draw_text(oled_fd, 0, "SecureLink client");
@@ -378,6 +380,17 @@ int main(int argc, char *argv[])
 
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
+    /* Everything from here on runs after the UI takes over the terminal
+     * (real ncurses on Linux; unchanged plain console on the dev
+     * machine - see ui.h). Every printf/fprintf below this point in
+     * main(), connect_and_run(), and session.c has been converted to
+     * ui_set_status()/ui_add_history() calls specifically because a
+     * stray direct print once ncurses is active would corrupt the
+     * screen it manages - see ui.h's top comment. Everything ABOVE this
+     * point (argument/cert/CTX setup) deliberately stays plain output,
+     * since it can fail before there's any UI to report through. */
+    ui_init("server");
+
     /* Case RGB status light (no-op on non-Linux / hardware-absent - see
      * hw_expansion.h). Opened once here, kept open for the whole
      * reconnect loop below (not re-opened per attempt), since it's a
@@ -431,8 +444,8 @@ int main(int argc, char *argv[])
 
         hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
 
-        fprintf(stderr, "Disconnected - retrying in %d second(s)...\n",
-                reconnect_delay);
+        ui_set_statusf("Disconnected - retrying in %d second(s)...",
+                       reconnect_delay);
         SLEEP_SECONDS(reconnect_delay);
 
         reconnect_delay *= 2;
@@ -444,6 +457,7 @@ int main(int argc, char *argv[])
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
+    ui_shutdown();
 
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();

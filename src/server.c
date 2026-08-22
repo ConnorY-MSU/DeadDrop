@@ -40,6 +40,7 @@
 #include "hw_oled.h"
 #include "hw_tts.h"
 #include "session.h"
+#include "ui.h"
 
 #define SERVER_PORT 4433
 #define LISTEN_BACKLOG 1
@@ -96,26 +97,27 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
     int rc;
 
     if (!preverify_ok) {
-        fprintf(stderr,
-            "Verify callback: standard cert-chain verification failed.\n");
+        ui_add_history(NULL,
+            "Verify callback: standard cert-chain verification failed.");
         return 0;
     }
 
     cert = wolfSSL_X509_STORE_CTX_get_current_cert(store);
     if (cert == NULL) {
-        fprintf(stderr, "Verify callback: no current cert available.\n");
+        ui_add_history(NULL, "Verify callback: no current cert available.");
         return 0;
     }
 
     rc = wolfSSL_X509_get_serial_number(cert, serial_bytes, &serial_len);
     if (rc != WOLFSSL_SUCCESS) {
-        fprintf(stderr, "Verify callback: could not read serial number.\n");
+        ui_add_history(NULL,
+            "Verify callback: could not read serial number.");
         return 0;
     }
 
     if (serial_len <= 0 || (size_t)(serial_len * 2) >= sizeof(serial_hex)) {
-        fprintf(stderr, "Verify callback: unexpected serial length (%d).\n",
-                serial_len);
+        ui_add_historyf(NULL,
+            "Verify callback: unexpected serial length (%d).", serial_len);
         return 0;
     }
 
@@ -124,18 +126,18 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
     }
     serial_hex[serial_len * 2] = '\0';
 
-    printf("Verify callback: checking serial %s against revocation list.\n",
-           serial_hex);
-    fflush(stdout);
+    ui_add_historyf(NULL,
+        "Verify callback: checking serial %s against revocation list.",
+        serial_hex);
 
     if (revocation_is_revoked(serial_hex)) {
-        fprintf(stderr, "Verify callback: serial %s is REVOKED - rejecting.\n",
-                serial_hex);
+        ui_add_historyf(NULL,
+            "Verify callback: serial %s is REVOKED - rejecting.", serial_hex);
         return 0;
     }
 
-    printf("Verify callback: serial %s not revoked, proceeding.\n", serial_hex);
-    fflush(stdout);
+    ui_add_historyf(NULL,
+        "Verify callback: serial %s not revoked, proceeding.", serial_hex);
     return 1;
 }
 
@@ -286,9 +288,20 @@ int main(int argc, char *argv[])
         WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
         my_verify_callback);
 
+    /* Everything from here on runs after the UI takes over the terminal
+     * (real ncurses on Linux; unchanged plain console on the dev
+     * machine - see ui.h). Every printf/fprintf below this point in
+     * main(), my_verify_callback(), and session.c has been converted to
+     * ui_set_status()/ui_add_history() calls specifically because a
+     * stray direct print once ncurses is active would corrupt the
+     * screen it manages - see ui.h's top comment. Everything ABOVE this
+     * point (argument/cert/CTX setup) deliberately stays plain output,
+     * since it can fail before there's any UI to report through. */
+    ui_init("client");
+
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == SOCKET_INVALID) {
-        fprintf(stderr, "socket() failed: %d\n", SOCK_LAST_ERROR());
+        ui_add_historyf(NULL, "socket() failed: %d", SOCK_LAST_ERROR());
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -310,7 +323,7 @@ int main(int argc, char *argv[])
 
     rc = bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (rc == SOCKET_ERR_RET) {
-        fprintf(stderr, "bind() failed: %d\n", SOCK_LAST_ERROR());
+        ui_add_historyf(NULL, "bind() failed: %d", SOCK_LAST_ERROR());
         CLOSE_SOCKET(listen_sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
@@ -322,7 +335,7 @@ int main(int argc, char *argv[])
 
     rc = listen(listen_sock, LISTEN_BACKLOG);
     if (rc == SOCKET_ERR_RET) {
-        fprintf(stderr, "listen() failed: %d\n", SOCK_LAST_ERROR());
+        ui_add_historyf(NULL, "listen() failed: %d", SOCK_LAST_ERROR());
         CLOSE_SOCKET(listen_sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
@@ -332,8 +345,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("Listening on port %d...\n", SERVER_PORT);
-    fflush(stdout);
+    ui_set_statusf("Listening on port %d...", SERVER_PORT);
 
     /* Case RGB status light (no-op on non-Linux / hardware-absent - see
      * hw_expansion.h). See client.c's matching comment for why this is
@@ -356,11 +368,10 @@ int main(int argc, char *argv[])
     for (;;) {
         socket_t client_sock = accept(listen_sock, NULL, NULL);
         if (client_sock == SOCKET_INVALID) {
-            fprintf(stderr, "accept() failed: %d\n", SOCK_LAST_ERROR());
+            ui_add_historyf(NULL, "accept() failed: %d", SOCK_LAST_ERROR());
             continue;
         }
-        printf("Raw TCP client connected.\n");
-        fflush(stdout);
+        ui_set_status("Client connected - starting TLS handshake...");
 
         /* See CONN_TIMEOUT_SECONDS above: bounds how long a single stalled
          * or malicious connection can block every other connection,
@@ -369,7 +380,7 @@ int main(int argc, char *argv[])
 
         WOLFSSL *ssl = wolfSSL_new(ctx);
         if (ssl == NULL) {
-            fprintf(stderr, "wolfSSL_new failed\n");
+            ui_add_history(NULL, "wolfSSL_new failed");
             CLOSE_SOCKET(client_sock);
             continue;
         }
@@ -387,11 +398,10 @@ int main(int argc, char *argv[])
         if (rc != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(ssl, rc);
             char errbuf[80];
-            fprintf(stderr, "Handshake failed: %s\n",
-                    wolfSSL_ERR_error_string(err, errbuf));
+            ui_add_historyf(NULL, "Handshake failed: %s",
+                             wolfSSL_ERR_error_string(err, errbuf));
         } else {
-            printf("mTLS handshake succeeded.\n");
-            fflush(stdout);
+            ui_set_status("mTLS handshake succeeded");
             hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
             hw_oled_draw_text(oled_fd, 0, "SecureLink server");
             hw_oled_draw_text(oled_fd, 1, "Connected");
@@ -410,6 +420,7 @@ int main(int argc, char *argv[])
              * ack) before the client ever sees it. Best-effort, doesn't
              * block waiting for the client's own close_notify in return. */
             wolfSSL_shutdown(ssl);
+            ui_set_statusf("Listening on port %d...", SERVER_PORT);
         }
 
         wolfSSL_free(ssl);
@@ -431,6 +442,7 @@ int main(int argc, char *argv[])
     CLOSE_SOCKET(listen_sock);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
+    ui_shutdown();
     wolfSSL_CTX_free(ctx);
     wolfSSL_Cleanup();
     revocation_free();

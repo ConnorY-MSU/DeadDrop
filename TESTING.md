@@ -1203,3 +1203,31 @@ Testing the two-way redesign with the physical OLEDs in mind (holding a session 
 [t=55] (still the same session - killed only by the test's own 55s external timeout)
 ```
 Rebuilt and redeployed to both Pis, confirmed clean compiles (`-Wall -Wextra`) on both before retesting.
+
+## Week 4, Days 2-3 (Parts A-D) — ncurses UI layer — 2026-08-21
+
+Real design decisions made and documented in `include/ui.h`'s top comment, per `ncurses UI Concepts.md`:
+- **Concurrency**: reuses `session.c`'s existing threaded design (receiver thread + polling sender loop) rather than a second, competing concurrency model - the walkthrough's "Option 1, single non-blocking loop" was considered and deliberately not chosen, since it would mean re-deriving the same thread-safety work already done for wolfSSL for no benefit.
+- **Windows**: three separate `WINDOW*`s (status/history/input), matching the walkthrough's own given layout.
+- **Scope**: the UI is active for the whole process lifetime (`ui_init()` called once in `main()`), not just per-connection, so the status bar can show connecting/disconnected states between sessions too - a device meant to sit in a case should always show something coherent, not flip between a plain console and a full-screen UI depending on connection state.
+- **Touch**: keyboard-driven; the touchscreen displays the same UI, no on-screen-keyboard text entry - the honest, limited scope `ncurses UI Concepts.md` explicitly sanctions ("touch is used only to..." framing).
+
+New `include/ui.h`/`src/ui.c` module, `__linux__`-gated real ncurses implementation with a non-Linux plain-stdio fallback that replicates exactly what `client.c`/`server.c`/`session.c` did before this module existed (same precedent as `hw_expansion.h`/`hw_oled.h`: dev-machine behavior unchanged). `session.c`'s every `printf`/`fprintf` call was converted to `ui_set_status()`/`ui_add_history()` (and their printf-style `...f()` variants, added specifically so the many existing call sites in `client.c`/`server.c` could convert with a near-mechanical swap) - necessary, not cosmetic: once ncurses is active it assumes exclusive control of the terminal, and any stray direct `printf`/`fprintf` would visually corrupt the screen it manages. Verified this conversion was actually complete (not just "the obvious spots") by grepping both files for every remaining `printf(`/`fprintf(` call before testing.
+
+### Two real bugs found via live two-Pi testing, not caught by compiling alone
+
+**1. Message not rendering - root cause was a test-timing assumption, not a code bug.** First pass looked exactly like a rendering failure: a message would arrive (confirmed via `/proc/<tid>/stack` showing the receiver thread genuinely blocked in `recvfrom()` beforehand, then via temporary debug logging showing `ui_add_history()` being called with the correct data and completing successfully) but not show up in `tmux capture-pane`'s output for several seconds. Resolved by simply waiting longer before checking - not a real defect, a lesson about this specific test methodology's latency, kept here so it isn't rediscovered as a false alarm later.
+
+**2. A real bug: `ui_mutex` starvation.** The *initial* `ui_poll_line()` held `ui_mutex` for the entire `wgetch()` timeout wait (up to `STDIN_POLL_MS`), called back-to-back in a tight loop by `session.c` with almost no gap between one call's unlock and the next call's lock. This starved the receiver thread's `ui_add_history()` calls - confirmed, not guessed, via `/proc/<tid>/stack` showing the receiver thread sitting in `futex_do_wait` on this exact mutex while the main thread's own wait showed as legitimate short `poll()` calls with the lock free for only a sliver of each cycle. Linux's default pthread mutex provides no fairness/FIFO guarantee, and a thread that immediately tries to re-lock right after unlocking has a real, observed tendency to keep winning the race - this wasn't a deadlock (it did eventually resolve, confirmed by waiting), but was observed to persist for 30+ seconds in one run, unacceptable for a chat UI.
+
+**Fix**: `ui_poll_line()` now polls in short `UI_POLL_SLICE_MS` (20ms) slices and, critically, `usleep()`s *outside* the lock between slices when nothing was typed - not just a shorter hold, an actual guaranteed window where this thread isn't even attempting the mutex, giving the receiver thread a genuine uncontended chance every ~20ms instead of every ~200ms with almost no gap at all.
+
+**Verified after the fix**: real two-Pi test, message sent from either side rendered on the peer's screen within ~1 second consistently (checked promptly, not by waiting-and-hoping), across multiple rapid back-and-forth exchanges. `quit` on one side produced a real `DISCONNECT` the other side handled correctly, the quitting side's process exited cleanly (confirmed via `ps`), and the surviving side's status bar correctly reset to "Listening on port 4433...".
+
+### Build notes
+`ui.c` needs `pkg-config --cflags ncurses` (`-D_DEFAULT_SOURCE -D_XOPEN_SOURCE=600`) specifically for its compile step, and links against `-lncurses -ltinfo` in addition to this project's existing libs. Confirmed via `pkg-config --cflags --libs ncurses` on both Pis rather than assumed. `tmux` was installed on both Pis specifically to drive/inspect the ncurses UI programmatically for this testing (`tmux send-keys` / `tmux capture-pane`) - a testing-only tool, not a project runtime dependency.
+
+### Not yet done (Days 2-3, remaining)
+- The lock screen (Part E): hidden/visible state design, salted-hash PIN storage via the Week 1 SHA-256 implementation, lock timing, rate-limiting decision, and the decoupling proof test (lock → send from peer → unlock → confirm received).
+- The WiFi setup screen (Part H): scan/select/connect via `nmcli`, the "no network found" prompt, tested against a genuinely new network.
+- Whether/how the RGB status light and OLED hook into this new ncurses UI, rather than remaining a separate layer - still an open question carried forward from Day 1.
