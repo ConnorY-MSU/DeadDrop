@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind console 1 to the DSI touchscreen framebuffer
+After=local-fs.target
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fix-console-fb.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -173,4 +173,29 @@ void ui_shutdown(void);
 void ui_start_idle_input(void);
 void ui_stop_idle_input(void);
 
+/*
+ * TOUCH - "Selection + wake" scope, added once physical keyboards
+ * turned out not to be attached to either Pi yet (keyboards remain
+ * the only way to TYPE - no on-screen keyboard exists or is planned).
+ * ui_start_touch() spawns a dedicated thread reading raw touchscreen
+ * taps and translating them into three gestures - see ui.c's touch
+ * block comment for exactly what each does: a tap on the lock screen,
+ * a tap to select a WiFi network from the scanned list, and a tap to
+ * pause/resume the message history display.
+ *
+ * Unlike ui_start_idle_input()/ui_stop_idle_input(), this does NOT
+ * need bracketing around an active session - the touch thread never
+ * touches input_win's own read state (wgetch()), only ui_mutex to
+ * update shared UI state, the same way the receiver thread's
+ * ui_add_history() calls already do safely. Call ui_start_touch()
+ * once, early (ui_init() already does this) - it runs for the whole
+ * process lifetime until ui_stop_touch()/ui_shutdown().
+ *
+ * No-ops on non-Linux (no touchscreen exists there - see touch.h) and
+ * silently does nothing if no touchscreen is attached even on Linux
+ * (touch_open() returning -1) - safe to call unconditionally.
+ */
+void ui_start_touch(void);
+void ui_stop_touch(void);
+
 #endif /* UI_H */

@@ -25,6 +25,7 @@
 
 #include "lock.h"
 #include "wifi.h"
+#include "touch.h"
 
 /* --- Module state -------------------------------------------------------
  *
@@ -172,12 +173,62 @@ static char wifi_pending_password[LOCK_PIN_MAX_LEN + 1]; /* copied out of
     pin_entry_buf (reused here as the general masked-entry buffer - see
     its own declaration comment) right before ui_mutex is released, so
     the deferred connect call in ui_poll_line() has it after unlocking */
+static int wifi_list_header_row = -1; /* history_win row (its own
+    coordinate space) where the "WiFi networks found" header was last
+    drawn - entry i is at wifi_list_header_row + 1 + i. Used by the
+    touch thread to map a tap back to a specific network - see this
+    file's touch block comment for the known staleness edge case. */
 
 typedef enum {
     UI_PENDING_NONE,
     UI_PENDING_WIFI_SCAN,
     UI_PENDING_WIFI_CONNECT
 } ui_pending_action;
+
+/* --- Touch (Week 4 Days 2-3, "Selection + wake" scope) -------------------
+ *
+ * Real decisions, per the user's explicit scope choice once physical
+ * keyboards turned out not to be attached yet: keyboards remain the
+ * only way to TYPE (compose a message, a PIN, a WiFi password - no
+ * on-screen keyboard exists or is planned, same honest scope limit as
+ * ui.h's touch/keyboard note already stated); touch adds three
+ * SELECTION/gesture actions on top of that, confirmed against real
+ * hardware (an ft5x06 controller, /dev/input/event1 on the units
+ * tested - see touch.h for why that exact path is never hardcoded):
+ * - LOCKED: a tap clears any lingering "Wrong PIN" message and
+ *   redraws a clean PIN prompt - the closest honest analog this
+ *   project has to "wake/dismiss a screensaver-equivalent"
+ *   (ncurses UI Concepts.md's own suggested minimal touch scope),
+ *   since there is no actual screen-dimming feature to wake from.
+ * - UI_MODE_WIFI_SELECT: tapping a rendered network entry selects it,
+ *   equivalent to typing its number and pressing Enter - see
+ *   wifi_list_header_row's declaration for how a tap row maps back to
+ *   an entry, and its documented staleness edge case.
+ * - UI_MODE_NORMAL: tapping the UPPER half of history_win's rows
+ *   "pauses" it (stops wrefresh()-ing on new content, reusing the
+ *   exact suppress-refresh technique the lock screen already uses -
+ *   see ui_add_history()); tapping the LOWER half "resumes" (reveals
+ *   everything that accumulated while paused via touchwin()+
+ *   wrefresh()). Deliberately NOT true arbitrary scrollback (which
+ *   would need converting history_win from a plain window to a pad,
+ *   a real architecture change) - "pause so new messages don't push
+ *   away what you're reading, then catch up" covers the actual
+ *   motivation for touch-scrolling on a small display without that
+ *   rewrite, and is documented here as the honest, deliberate scope
+ *   chosen instead of literal scrollback.
+ *
+ * THREADING: unlike the idle-input thread, this thread does NOT need
+ * ui_start_idle_input()/ui_stop_idle_input()-style bracketing around
+ * an active session - it never calls wgetch()/touches input_win's own
+ * read state, only ui_mutex to update shared UI state, exactly like
+ * the receiver thread's ui_add_history() calls already do safely. It
+ * runs for the whole process lifetime once started in ui_init().
+ */
+static int touch_fd = -1;
+static pthread_t touch_thread;
+static volatile int touch_thread_running = 0;
+static volatile int touch_thread_should_stop = 0;
+static int history_paused = 0;
 
 /* Must be called with ui_mutex held. Replaces history_win's PHYSICAL
  * content with a locked banner, then STOPS refreshing history_win (see
@@ -259,7 +310,13 @@ static void redraw_input_locked(void)
     case UI_MODE_NORMAL:
     default:
         werase(input_win);
-        mvwprintw(input_win, 0, 0, "> %s", input_buf);
+        if (history_paused) {
+            mvwprintw(input_win, 0, 0,
+                      "[PAUSED - tap lower half of history to resume] > %s",
+                      input_buf);
+        } else {
+            mvwprintw(input_win, 0, 0, "> %s", input_buf);
+        }
         wrefresh(input_win);
         break;
     }
@@ -321,6 +378,12 @@ void ui_init(const char *peer_label)
         ui_add_history(NULL, "No PIN set - press Ctrl+L to set one and "
                               "enable the lock screen.");
     }
+
+    /* Started once here, for the whole process lifetime - unlike the
+     * idle-input thread, no bracketing around sessions is needed (see
+     * this file's touch block comment). Silently does nothing if no
+     * touchscreen is attached (touch_open() returning -1). */
+    ui_start_touch();
 }
 
 void ui_set_status(const char *status_text)
@@ -365,13 +428,16 @@ void ui_add_history(const char *prefix, const char *text)
         wprintw(history_win, "%s\n", text != NULL ? text : "");
     }
     /* Always write into history_win's buffer (above), regardless of lock
-     * state - see this file's lock-screen block comment's DECOUPLING
-     * note: the receiver thread calling this must never behave
-     * differently based on UI lock state. Only the PHYSICAL screen
+     * or pause state - see this file's lock-screen block comment's
+     * DECOUPLING note: the receiver thread calling this must never
+     * behave differently based on UI state. Only the PHYSICAL screen
      * update is gated: while locked, skip wrefresh() so the
      * accumulating real content stays invisible behind the lock overlay
-     * (drawn once, at lock time) until unlock explicitly reveals it. */
-    if (ui_mode != UI_MODE_LOCKED) {
+     * (drawn once, at lock time) until unlock explicitly reveals it -
+     * and likewise while history_paused (see this file's touch block
+     * comment), so a deliberate "hold still, I'm reading this" tap
+     * isn't immediately undone by the next incoming message. */
+    if (ui_mode != UI_MODE_LOCKED && !history_paused) {
         wrefresh(history_win);
     }
     redraw_input_locked();
@@ -769,6 +835,14 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                 pthread_mutex_lock(&ui_mutex);
                 if (wifi_scan_count > 0) {
                     int i;
+                    /* Remember exactly where (within history_win's own
+                     * row coordinates) the list gets drawn, so a
+                     * touch tap can be mapped back to a specific
+                     * entry - see this file's touch block comment for
+                     * the known edge case (an incoming chat message
+                     * scrolling history_win further while this list
+                     * is showing would make this stale). */
+                    wifi_list_header_row = getcury(history_win);
                     wprintw(history_win,
                             "WiFi networks found (Ctrl+W to cancel):\n");
                     for (i = 0; i < wifi_scan_count; i++) {
@@ -845,8 +919,11 @@ void ui_shutdown(void)
      * (a caller forgot to bracket a session with
      * ui_stop_idle_input()/ui_start_idle_input(), or is exiting
      * abnormally), stop it before endwin() rather than leaving it
-     * reading from a window that's about to be torn down. */
+     * reading from a window that's about to be torn down. Same
+     * reasoning for the touch thread, which normally only ever gets
+     * stopped here anyway (see ui_start_touch()'s comment). */
     ui_stop_idle_input();
+    ui_stop_touch();
     if (ui_active) {
         ui_active = 0;
         endwin();
@@ -926,6 +1003,146 @@ void ui_stop_idle_input(void)
     idle_thread_should_stop = 1;
     pthread_join(idle_thread, NULL);
     idle_thread_running = 0;
+}
+
+/* --- Touch thread - see this file's touch block comment above for the
+ * three gestures implemented and why this thread needs no
+ * start/stop bracketing around sessions the way the idle-input
+ * thread does. --- */
+
+/* Must be called with ui_mutex held. tap_row/tap_col are already
+ * screen-relative (0..LINES-1 / 0..COLS-1). */
+static void handle_tap_locked(int tap_row, int tap_col)
+{
+    (void)tap_col; /* every gesture here is row-based (which window,
+        which half) - kept as a parameter rather than discarding the
+        information at the call site, for a future column-sensitive
+        gesture. */
+
+    if (ui_mode == UI_MODE_LOCKED) {
+        /* Clears any lingering "Wrong PIN" message and redraws a
+         * clean prompt - see this file's touch block comment for why
+         * this is the honest analog to "wake/dismiss a screensaver". */
+        redraw_input_locked();
+    } else if (ui_mode == UI_MODE_WIFI_SELECT) {
+        int history_row = tap_row - 1; /* history_win starts at screen
+            row 1 */
+        int idx = history_row - (wifi_list_header_row + 1);
+
+        if (wifi_list_header_row >= 0 && idx >= 0 &&
+            idx < wifi_scan_count) {
+            snprintf(wifi_selected_ssid, sizeof(wifi_selected_ssid), "%s",
+                      wifi_scan_results[idx].ssid);
+            wifi_selected_secured = wifi_scan_results[idx].secured;
+            input_len = 0;
+            input_buf[0] = '\0';
+            pin_entry_len = 0;
+            pin_entry_buf[0] = '\0';
+            /* Lands on the password prompt even for an open network,
+             * rather than kicking off the connect immediately - this
+             * thread has no access to ui_poll_line()'s "pending
+             * action, run after releasing ui_mutex" mechanism (that
+             * machinery is scoped to a single call's local
+             * variables), and wifi_connect() already treats an empty
+             * password the same as "no password" - one extra Enter
+             * press for the open-network case is a small, honest
+             * price for not duplicating that deferred-call machinery
+             * here for a rare case. */
+            ui_mode = UI_MODE_WIFI_PASSWORD;
+            redraw_input_locked();
+        }
+    } else if (ui_mode == UI_MODE_NORMAL) {
+        int history_height = LINES - 3;
+        int history_row = tap_row - 1;
+
+        if (history_row >= 0 && history_row < history_height) {
+            if (history_row < history_height / 2) {
+                if (!history_paused) {
+                    history_paused = 1;
+                    redraw_input_locked();
+                }
+            } else if (history_paused) {
+                history_paused = 0;
+                /* Reveal everything that accumulated while paused -
+                 * touchwin() forces a full redraw, same reasoning as
+                 * the lock screen's unlock path: ncurses' normal
+                 * diff-based refresh can miss content that changed
+                 * while this window wasn't the one being refreshed. */
+                touchwin(history_win);
+                wrefresh(history_win);
+                redraw_input_locked();
+            }
+        }
+    }
+    /* Other modes (WIFI_SCANNING, WIFI_PASSWORD, WIFI_CONNECTING,
+     * SET_PIN_NEW, SET_PIN_CONFIRM): no touch gesture defined - a tap
+     * during one of these transient/sensitive-entry states is simply
+     * ignored rather than guessed at. */
+}
+
+static void *touch_thread_main(void *arg)
+{
+    (void)arg;
+
+    while (!touch_thread_should_stop) {
+        touch_point pt;
+        int rc = touch_read_tap(touch_fd, &pt, 200);
+
+        if (rc == 1) {
+            int tap_row = (int)(pt.y * LINES);
+            int tap_col = (int)(pt.x * COLS);
+
+            if (tap_row < 0) {
+                tap_row = 0;
+            } else if (tap_row >= LINES) {
+                tap_row = LINES - 1;
+            }
+            if (tap_col < 0) {
+                tap_col = 0;
+            } else if (tap_col >= COLS) {
+                tap_col = COLS - 1;
+            }
+
+            pthread_mutex_lock(&ui_mutex);
+            handle_tap_locked(tap_row, tap_col);
+            pthread_mutex_unlock(&ui_mutex);
+        } else if (rc < 0) {
+            /* Device error (e.g. unplugged) - stop trying rather than
+             * spin on a broken fd. */
+            break;
+        }
+    }
+    return NULL;
+}
+
+void ui_start_touch(void)
+{
+    if (!ui_active || touch_thread_running) {
+        return;
+    }
+    touch_fd = touch_open();
+    if (touch_fd < 0) {
+        return; /* no touchscreen attached - non-fatal, see touch.h */
+    }
+    touch_thread_should_stop = 0;
+    if (pthread_create(&touch_thread, NULL, touch_thread_main, NULL) == 0) {
+        touch_thread_running = 1;
+    } else {
+        touch_close(touch_fd);
+        touch_fd = -1;
+    }
+}
+
+void ui_stop_touch(void)
+{
+    if (!touch_thread_running) {
+        return;
+    }
+    touch_thread_should_stop = 1;
+    pthread_join(touch_thread, NULL);
+    touch_thread_running = 0;
+    touch_close(touch_fd);
+    touch_fd = -1;
 }
 
 #else /* !__linux__ */
@@ -1074,6 +1291,17 @@ void ui_start_idle_input(void)
 }
 
 void ui_stop_idle_input(void)
+{
+}
+
+/* No touchscreen exists on this project's Windows dev machine - see
+ * touch.h. No-ops, present only so client.c/server.c can call these
+ * unconditionally on either platform. */
+void ui_start_touch(void)
+{
+}
+
+void ui_stop_touch(void)
 {
 }
 
