@@ -1,0 +1,22 @@
+# Least-privilege sudoers rule for the SecureLink app's own runtime needs.
+#
+# The deployed server/client binaries run as the unprivileged `connor`
+# user (see securelink-alpha.service/securelink-bravo.service's
+# User=/Group=), and the ONLY reason they ever need root at all is
+# NetworkManager's polkit rules requiring elevated privileges to add
+# a new WiFi connection profile or force a fresh scan (see wifi.c's
+# own comments - activating an ALREADY-KNOWN profile doesn't need
+# this, only these two specific operations do).
+#
+# This file exists to make that real: even if the much broader
+# 010-connor-nopasswd rule (unscoped, ALL=(ALL) NOPASSWD:ALL - see its
+# own file, and TESTING.md's 2026-08-23 security audit entry for the
+# tradeoff reasoning) were ever narrowed or removed, the app's actual
+# runtime functionality (the Ctrl+W WiFi setup screen) keeps working
+# unattended with exactly this and nothing more.
+#
+# Install as /etc/sudoers.d/020-securelink-wifi (mode 440, root:root -
+# same as every other file in this directory; sudo refuses to read a
+# sudoers.d file with unsafe permissions).
+Cmnd_Alias SECURELINK_WIFI = /usr/bin/nmcli device wifi rescan, /usr/bin/nmcli device wifi connect *
+connor ALL=(root) NOPASSWD: SECURELINK_WIFI
