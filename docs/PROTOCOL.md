@@ -78,9 +78,11 @@ Total message size = 17 + 32 = 49 bytes.
 | Value  | Name           | Purpose                                             |
 |--------|----------------|------------------------------------------------------|
 | `0x01` | `TEXT_MESSAGE` | User-originated chat text — the core message type.   |
-| `0x02` | `PING`         | Keepalive probe sent by either endpoint.             |
-| `0x03` | `PONG`         | Response to a received `PING`.                       |
+| `0x02` | `PING`         | Keepalive probe / RTT measurement, sent periodically by either endpoint while a session is active. |
+| `0x03` | `PONG`         | Response to a received `PING` — the RTT sample is `now - (local send time of the PING this responds to)`, measured entirely locally; no timestamp is carried on the wire. |
 | `0x04` | `DISCONNECT`   | Explicit, clean notice that the session is closing.  |
+| `0x05` | `ACK`          | Delivery acknowledgment for one `TEXT_MESSAGE`. Body is exactly 4 bytes, big-endian: the `seq_num` of the message being acknowledged. Sent automatically by the receiver immediately after a `TEXT_MESSAGE` is accepted (parsed, HMAC-verified, in-order) — this is a receipt of "I got and displayed it," not a read receipt in the human sense (no notion of "the person actually looked at the screen" exists at this layer). |
+| `0x06` | `FILE`         | A small file transfer. Body: `[2-byte filename_len, big-endian][filename bytes, UTF-8][file data, the rest of the body]`. `filename_len` must be ≤ 255. Because the whole body (filename + file data together) is still bound by the header's 65536-byte `body_length` cap, this is only ever suitable for genuinely small files (a thumbnail, a short text/config file, a brief audio clip) — there is no chunking/reassembly across multiple messages; a file that doesn't fit in one message is rejected outright by the sender before anything is transmitted. The receiver treats the filename as untrusted (it came from the wire) and saves using only its basename, with any path-separator characters stripped, into a fixed local directory — never using the received filename as a literal filesystem path. |
 
 Any other `msg_type` value is unrecognized. See Failure handling.
 

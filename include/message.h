@@ -29,8 +29,22 @@ typedef enum {
     SL_MSG_TEXT_MESSAGE = 0x01,
     SL_MSG_PING         = 0x02,
     SL_MSG_PONG         = 0x03,
-    SL_MSG_DISCONNECT   = 0x04
+    SL_MSG_DISCONNECT   = 0x04,
+    SL_MSG_ACK          = 0x05, /* body: 4 bytes BE, the seq_num of the
+                                    TEXT_MESSAGE being acknowledged - see
+                                    docs/PROTOCOL.md */
+    SL_MSG_FILE         = 0x06  /* body: [2-byte filename_len BE]
+                                    [filename bytes][file data] - see
+                                    docs/PROTOCOL.md for the size cap */
 } sl_msg_type;
+
+#define SL_FILE_NAME_LEN_SIZE 2 /* the 2-byte length prefix within a
+    SL_MSG_FILE body - kept as its own constant since both the sender
+    (building the body) and receiver (parsing it back apart) need to
+    agree on this exact offset */
+#define SL_FILE_NAME_MAX 255   /* generous for a real filename, small
+    enough that even a maximally-long name still leaves the overwhelming
+    majority of SL_MAX_BODY_LEN for actual file content */
 
 /*
  * Per-TLS-session framing/replay state. Create one fresh instance per

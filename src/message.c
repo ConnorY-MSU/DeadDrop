@@ -162,6 +162,8 @@ sl_parse_result sl_try_parse_message(sl_session_state *state,
         case SL_MSG_PING:
         case SL_MSG_PONG:
         case SL_MSG_DISCONNECT:
+        case SL_MSG_ACK:
+        case SL_MSG_FILE:
             break;
         default:
             return SL_PARSE_REJECTED;
