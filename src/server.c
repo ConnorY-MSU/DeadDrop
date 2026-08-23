@@ -303,6 +303,27 @@ static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
  * staying duplicated between client.c and server.c the way the small
  * portability shim above does. */
 
+#ifndef _WIN32
+/* Identical to client.c's own copy of this helper, including the
+ * timing/bound reasoning - see there for the full "boot sequence
+ * overlapped onto the banner" story. Duplicated rather than shared,
+ * matching this file's existing convention for small per-file helpers
+ * (parse_args, print_usage, load_private_key) rather than adding a
+ * third module just for this. */
+#define CLOUD_INIT_WAIT_MAX_MS 15000
+#define CLOUD_INIT_WAIT_POLL_MS 250
+
+static void wait_for_cloud_init_boot_finished(void)
+{
+    int waited_ms = 0;
+    while (access("/var/lib/cloud/instance/boot-finished", F_OK) != 0 &&
+           waited_ms < CLOUD_INIT_WAIT_MAX_MS) {
+        usleep(CLOUD_INIT_WAIT_POLL_MS * 1000);
+        waited_ms += CLOUD_INIT_WAIT_POLL_MS;
+    }
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     socket_t listen_sock = SOCKET_INVALID;
@@ -399,6 +420,9 @@ int main(int argc, char *argv[])
      * Everything from here on goes through ui_add_error()/ui_add_history()
      * instead of fprintf/printf for the same reason already documented
      * below - it just starts earlier now. */
+#ifndef _WIN32
+    wait_for_cloud_init_boot_finished();
+#endif
     ui_init("bravo");
     ui_start_idle_input();
     ui_set_status("Loading credentials...");

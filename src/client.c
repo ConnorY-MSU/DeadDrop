@@ -498,6 +498,61 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     return result;
 }
 
+#ifndef _WIN32
+/* How long to wait for cloud-init's "boot-finished" marker before giving
+ * up and drawing the splash anyway - bounded for the same reason every
+ * other boot-time wait in this project is (SPLASH_MAX_WAIT_MS,
+ * CONNECT_TIMEOUT_SECONDS, ...): "boots and works with zero manual
+ * steps" has to hold even if cloud-init itself is unusually slow or
+ * genuinely stuck this boot - a device that refuses to ever show its
+ * UI because of someone ELSE's subsystem is exactly the kind of silent,
+ * unrecoverable wait this project has repeatedly found and fixed. In
+ * the ordinary case this returns almost immediately - by the time this
+ * service's own After= chain (network-online.target, tailscaled,
+ * fix-console-fb) has been satisfied, cloud-init has virtually always
+ * already finished. */
+#define CLOUD_INIT_WAIT_MAX_MS 15000
+#define CLOUD_INIT_WAIT_POLL_MS 250
+
+/* REAL BUG FOUND AND FIXED (2026-08-23), direct user report from a hard
+ * unplug/replug power cycle: the boot sequence visibly "overlapped onto
+ * the banner" - cloud-init's final stage (cloud-final.service) writes
+ * plain text status directly to this same physical console (tty1) as
+ * part of its own boot-time completion sequence, and if that happens
+ * AFTER show_splash() (inside ui_init() below) has already put ncurses
+ * in charge of the screen, those stray writes land on top of ncurses'
+ * own screen buffer and visibly corrupt the splash - this project found
+ * and documented the exact same underlying cause once already (see
+ * securelink-alpha.service's own header comment, "REAL BUG FOUND VIA
+ * LIVE TESTING" / cloud-init.target), but the fix attempted there
+ * (After=cloud-init.target on the systemd unit) created a genuine
+ * ordering cycle and had to be reverted - confirmed again here:
+ * cloud-init.target AND cloud-final.service both carry
+ * After=multi-user.target, while this unit's own WantedBy=multi-user.
+ * target implicitly orders it BEFORE multi-user.target, so depending on
+ * either one at the systemd level is a cycle no matter which is picked.
+ *
+ * Solved differently this time - entirely inside the application, no
+ * systemd ordering involved at all, so there's no cycle to hit: wait,
+ * bounded, for cloud-init's own standard "I am completely done"
+ * sentinel file (the same one `cloud-init status --wait` itself polls
+ * for) before ever calling ui_init() below. This runs once, this early,
+ * specifically because everything before this point (arg parsing, TCP/
+ * TLS setup, wolfSSL_CTX_new()) either exits immediately on failure or
+ * doesn't touch the console at all - the only thing actually at risk of
+ * corruption is the ncurses screen ui_init() is about to create, so
+ * that's the one place this wait needs to guard. */
+static void wait_for_cloud_init_boot_finished(void)
+{
+    int waited_ms = 0;
+    while (access("/var/lib/cloud/instance/boot-finished", F_OK) != 0 &&
+           waited_ms < CLOUD_INIT_WAIT_MAX_MS) {
+        usleep(CLOUD_INIT_WAIT_POLL_MS * 1000);
+        waited_ms += CLOUD_INIT_WAIT_POLL_MS;
+    }
+}
+#endif
+
 int main(int argc, char *argv[])
 {
     WOLFSSL_CTX *ctx = NULL;
@@ -590,6 +645,9 @@ int main(int argc, char *argv[])
      * "nothing printed here includes a filesystem path" security property
      * is unaffected either way: none of these messages ever included a
      * raw path value, before or after this move. */
+#ifndef _WIN32
+    wait_for_cloud_init_boot_finished();
+#endif
     ui_init("alpha");
     ui_start_idle_input();
     ui_set_status("Loading credentials...");
