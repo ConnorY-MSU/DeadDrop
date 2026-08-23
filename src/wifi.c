@@ -10,11 +10,14 @@
 #include <sys/wait.h>
 
 /*
- * run_nmcli - fork()+execvp() nmcli with the given NULL-terminated
- * argv, capturing combined stdout+stderr into out_buf (NUL-terminated,
- * truncated if it doesn't fit - pass NULL/0 to discard output
- * entirely, e.g. for wifi_has_connectivity() piggy-backing on this
- * same helper isn't needed there, but scan/connect both want it).
+ * run_nmcli - fork()+execvp() argv[0] (almost always "nmcli" - see
+ * wifi_connect()'s own comment for the one exception, "sudo", which
+ * then execs nmcli itself as ITS argv[1]) with the given NULL-
+ * terminated argv, capturing combined stdout+stderr into out_buf
+ * (NUL-terminated, truncated if it doesn't fit - pass NULL/0 to
+ * discard output entirely, e.g. for wifi_has_connectivity()
+ * piggy-backing on this same helper isn't needed there, but
+ * scan/connect both want it).
  * Deliberately no shell involved at all - see wifi.h's SECURITY NOTE.
  *
  * Returns nmcli's exit status (0 = success) on a normal exit, or -1 if
@@ -48,7 +51,15 @@ static int run_nmcli(char *const argv[], char *out_buf, size_t out_buf_size)
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
-        execvp("nmcli", argv);
+        execvp(argv[0], argv); /* argv[0] IS the executable to run -
+            almost always "nmcli", but wifi_connect() also passes
+            "sudo" (nmcli as ITS argv[1]) for the one operation that
+            genuinely needs elevated NetworkManager permissions - see
+            its own comment. Previously hardcoded to "nmcli" here
+            regardless of argv[0]'s actual value, which would have
+            silently made a "sudo" prefix a no-op (execvp'd "nmcli"
+            directly anyway, ignoring argv[0] entirely, still running
+            unprivileged) rather than genuinely elevating anything. */
         _exit(127); /* execvp only returns on failure */
     }
 
@@ -161,14 +172,37 @@ int wifi_connect(const char *ssid, const char *password,
         return -1;
     }
 
+    /* REAL BUG FOUND AND FIXED (2026-08-23): this service runs as an
+     * unprivileged user (see securelink-alpha.service/-bravo.service's
+     * User=connor), and plain `nmcli device wifi connect` for an SSID
+     * with no existing saved connection profile requires NetworkManager
+     * to ADD a brand new system-wide profile, not just activate one
+     * that's already there - a genuinely different, more privileged
+     * polkit action than scanning or activating an already-known
+     * connection (which is why wifi_scan()/wifi_has_connectivity()
+     * above and the already-known BDH-public profile's own automatic
+     * boot-time activation both work fine unprivileged, while this one
+     * call never did). Confirmed directly via journalctl -u
+     * NetworkManager: every real Ctrl+W connect attempt failed with
+     * `op="connection-add-activate" ... uid=1000 result="fail"
+     * reason="Not authorized to control networking."` - meaning this
+     * whole feature silently failed on every genuinely new network,
+     * every time, in the real deployed service - not a timeout, not
+     * specific to any one SSID. `sudo` (already relies on this
+     * project's own established NOPASSWD sudoers entry, same as every
+     * other elevated call this project makes - never an interactive
+     * password prompt) resolves it: confirmed live, the identical
+     * command succeeded immediately (well under 10 seconds, full
+     * association + DHCP) the moment it ran as uid=0 instead of 1000. */
     if (password != NULL && password[0] != '\0') {
-        char *argv[] = { (char *)"nmcli", (char *)"device", (char *)"wifi",
-                          (char *)"connect", (char *)ssid,
+        char *argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
+                          (char *)"wifi", (char *)"connect", (char *)ssid,
                           (char *)"password", (char *)password, NULL };
         rc = run_nmcli(argv, output, sizeof(output));
     } else {
-        char *argv[] = { (char *)"nmcli", (char *)"device", (char *)"wifi",
-                          (char *)"connect", (char *)ssid, NULL };
+        char *argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
+                          (char *)"wifi", (char *)"connect", (char *)ssid,
+                          NULL };
         rc = run_nmcli(argv, output, sizeof(output));
     }
 
