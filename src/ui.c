@@ -459,10 +459,19 @@ static void draw_locked_overlay_locked(void)
     wattroff(history_win, COLOR_PAIR(CP_LOCKED));
 
     wattron(history_win, COLOR_PAIR(CP_SYSTEM));
+    /* REAL BUG FOUND (2026-08-22, via live touch-gesture re-testing):
+     * no trailing '\n' here left history_win's internal cursor sitting
+     * mid-line, right after "unlock." - anything appended later via a
+     * bare wprintw() (the WiFi-scan-results code, the only other
+     * consumer of this window besides ui_add_history(), which always
+     * includes its own trailing newline) silently concatenated onto
+     * that same physical line instead of starting a fresh one. Fixed
+     * by always ending on a clean line here too, regardless of what
+     * runs next. */
     mvwprintw(history_win, 5, 1,
               "Messages are still being received normally in the "
               "background.\nEnter your PIN below and press Enter to "
-              "unlock.");
+              "unlock.\n");
     wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
 
     wrefresh(history_win);
