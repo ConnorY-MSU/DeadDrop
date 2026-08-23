@@ -750,6 +750,25 @@ static void *receiver_thread_main(void *arg)
                             if (f != NULL) {
                                 size_t written = fwrite(data, 1, data_len, f);
                                 fclose(f);
+#ifndef _WIN32
+                                /* Security audit, 2026-08-23: this file's
+                                 * content is attacker-influenceable (it
+                                 * arrived over the wire from the peer) and
+                                 * was falling back to fopen()'s default
+                                 * mode + whatever umask the process
+                                 * happens to run under - inconsistent
+                                 * with lock.c's pin_hash and msglog.c's
+                                 * message_log.txt, which both explicitly
+                                 * chmod(path, 0600) right after creation
+                                 * rather than trust ambient umask. Matched
+                                 * that precedent here instead of relying
+                                 * on umask (the systemd unit sets none,
+                                 * so it would otherwise inherit whatever
+                                 * PID1's default is - not something this
+                                 * file's confidentiality should depend
+                                 * on). */
+                                chmod(path, 0600);
+#endif
                                 if (written == data_len) {
                                     ui_add_historyf(ctx->peer_label,
                                         "sent a file: %s (%u bytes) -> "
