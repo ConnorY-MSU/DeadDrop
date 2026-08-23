@@ -82,6 +82,25 @@ static WINDOW *input_win = NULL;          /* derwin() inside the above */
 static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int ui_active = 0;
 
+/* This device's own identity - Alpha or Bravo - inferred once in
+ * ui_init() from the peer_label it's given (see that function's own
+ * comment: this project's architecture is a fixed two-device pair, so
+ * "not the peer" always uniquely determines self). Drives CP_STATUS's
+ * background color. session.c independently infers the exact same
+ * thing into its own ctx.self_label (see that struct field's comment)
+ * and passes the real capitalized name directly as of 2026-08-23,
+ * rather than the literal sentinel "you" it used to pass - that change
+ * was needed so a message replayed from msglog.txt on a FUTURE boot
+ * (replay_msglog_into_pad_locked(), which writes msglog's already-
+ * formatted text straight into the pad, bypassing ui_add_history_ex()
+ * entirely) shows the real name too, not just a live "you" being
+ * translated on the way to the screen. ui_add_history_ex()'s own
+ * "you"-checking branch below is kept only as a defensive fallback for
+ * any future caller that reintroduces the sentinel - not the primary
+ * mechanism anymore. 1 = this device is Alpha, 0 = this device is
+ * Bravo. */
+static int g_self_is_alpha = 1;
+
 /* --- Styling (Week 4 Days 2-3). Structural aesthetic pass on top of
  * Phase 1's foundation (color, bordered panels, message-source
  * color-coding): a boot splash, a persistent status-bar brand prefix, a
@@ -111,12 +130,21 @@ static int ui_active = 0;
  * uses ncurses' own single-line ACS box() drawing, proven working on
  * this exact device since Phase 1.
  */
-#define CP_STATUS   1 /* status "title bar": white text on blue - a
-                          conventional terminal-app title-bar look */
+#define CP_STATUS   1 /* status "title bar" - RED on alpha, BLUE on
+                          bravo (white text either way), decided once
+                          in ui_init() from g_self_is_alpha (see its own
+                          comment) - 2026-08-23, direct request to make
+                          this device's own color identity visible at
+                          a glance on the one UI element that's always
+                          on screen regardless of mode. */
 #define CP_BORDER   2 /* panel borders: cyan on black */
-#define CP_PEER_MSG 3 /* incoming (peer) messages: plain white on black */
-#define CP_OWN_MSG  4 /* own sent messages: cyan on black - a quiet
-                          distinction from peer messages, not a loud one */
+/* Pair IDs 3 and 4 (formerly CP_PEER_MSG/CP_OWN_MSG) retired
+ * 2026-08-23: message-history coloring now goes entirely through
+ * CP_NODE_ALPHA/CP_NODE_BRAVO below instead, chosen by the actual
+ * SENDER'S NAME rather than an own/peer distinction - see
+ * ui_add_history_ex()'s own comment. Left as a gap rather than
+ * renumbering every constant below, which would touch far more of
+ * this file for no real benefit. */
 #define CP_SYSTEM   5 /* system/event notices: white on black -
                           visually quieter than a real message */
 #define CP_LOCKED   6 /* lock screen / danger state: red on black */
@@ -143,22 +171,24 @@ static int ui_active = 0;
                           window, this is a history line color), and
                           "red = something's wrong" is the same
                           intuitive meaning in both places. */
-#define CP_NODE_ALPHA 12 /* splash screen's "Twin Nodes" banner
-                          (2026-08-23, direct request) - the ALPHA
-                          box: green on black. Deliberately its own
-                          pair, not a reuse of CP_OWN_MSG (which also
-                          happens to be green) - that pair's color is
-                          about chat-message authorship and could
-                          reasonably change for that reason alone
-                          someday; coupling the splash screen's node
-                          coloring to it would be a surprising side
-                          effect of an unrelated future edit. */
-#define CP_NODE_BRAVO 13 /* same banner, the BRAVO box: yellow on
-                          black - deliberately different from ALPHA's
-                          green so the two named devices read as
-                          visually distinct at a glance, same
-                          reasoning as CP_NODE_ALPHA's own comment for
-                          why this isn't just a reuse of CP_PEER_MSG. */
+#define CP_NODE_ALPHA 12 /* Alpha's identity color: RED on black.
+                          Originally just the splash's "Twin Nodes"
+                          ALPHA box (2026-08-23); expanded the same day
+                          to be THE single color for "this is Alpha" -
+                          also every message Alpha sent/sends
+                          (ui_add_history_ex(), by sender NAME rather
+                          than an own/peer distinction - see its own
+                          comment) and CP_STATUS's background on
+                          alpha's own device. One name, one color,
+                          everywhere it's shown - not three independent
+                          choices that happen to agree today and could
+                          silently drift apart later. */
+#define CP_NODE_BRAVO 13 /* Bravo's identity color: BLUE on black -
+                          same expanded role as CP_NODE_ALPHA's own
+                          comment, just for the other name. Red vs
+                          blue deliberately reads as two clearly
+                          opposed identities at a glance, more than
+                          the original green/yellow pairing did. */
 
 /* Deliberately smaller than SL_MAX_BODY_LEN (message.h's 64 KiB
  * protocol cap) - this bounds one INTERACTIVELY TYPED line through a
@@ -1104,6 +1134,21 @@ void ui_show_help(void)
 
 void ui_init(const char *peer_label)
 {
+    /* This device IS whichever of the two names peer_label is NOT -
+     * see g_self_is_alpha's own declaration comment. Computed before
+     * anything else in here since the very first thing that needs it
+     * (CP_STATUS's background color, below) happens early too. Checks
+     * specifically for "Bravo" (self is Alpha unless the peer really
+     * is Bravo) rather than the reverse, so a NULL or unexpected
+     * peer_label defaults to the more common single-device dev/test
+     * invocation (client.c, peer "Alpha") rather than silently
+     * guessing wrong for an unrecognized string either way - there's
+     * no way to be genuinely correct for an input outside this
+     * project's fixed two-name set, so this just picks the
+     * least-surprising default instead of failing loudly over a
+     * cosmetic color choice. */
+    g_self_is_alpha = (peer_label == NULL || strcmp(peer_label, "Bravo") != 0);
+
     initscr();
     cbreak();
     noecho();
@@ -1125,22 +1170,19 @@ void ui_init(const char *peer_label)
      * on the real target, but conceivable elsewhere) just runs
      * monochrome rather than crashing or looking broken.
      *
-     * CP_OWN_MSG/CP_PEER_MSG (2026-08-22): changed from cyan/white (too
-     * close to each other, and to CP_BORDER/CP_INPUT's own cyan, at a
-     * glance) to green/yellow specifically so "who said this" is
-     * readable from the color alone, not just the "you:"/"<peer>: "
-     * text prefix - a real, direct request after the softer "standard
-     * terminal" pass made every message line read as roughly the same
-     * color. Green for "you" (a common, low-effort-to-parse convention
-     * for one's own messages), yellow for the peer - both stay
-     * comfortably distinct from CP_LOCKED's red and CP_SYSTEM's neutral
-     * white on the same black background. */
+     * 2026-08-23: message-source coloring (formerly CP_OWN_MSG/
+     * CP_PEER_MSG, green/yellow, chosen by own-vs-peer) replaced with
+     * CP_NODE_ALPHA/CP_NODE_BRAVO (red/blue, chosen by the actual
+     * sender NAME) - direct request for one consistent identity color
+     * per named device, used everywhere that name appears: the splash
+     * banner, message history, AND CP_STATUS's own background below
+     * (red on alpha's device, blue on bravo's) - not three independent
+     * choices that happened to agree before. */
     if (has_colors()) {
         start_color();
-        init_pair(CP_STATUS, COLOR_WHITE, COLOR_BLUE);
+        init_pair(CP_STATUS, COLOR_WHITE,
+                  g_self_is_alpha ? COLOR_RED : COLOR_BLUE);
         init_pair(CP_BORDER, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_PEER_MSG, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(CP_OWN_MSG, COLOR_GREEN, COLOR_BLACK);
         init_pair(CP_SYSTEM, COLOR_WHITE, COLOR_BLACK);
         init_pair(CP_LOCKED, COLOR_RED, COLOR_BLACK);
         init_pair(CP_INPUT, COLOR_CYAN, COLOR_BLACK);
@@ -1148,8 +1190,8 @@ void ui_init(const char *peer_label)
         init_pair(CP_ACCENT, COLOR_CYAN, COLOR_BLACK);
         init_pair(CP_TIMESTAMP, COLOR_BLUE, COLOR_BLACK);
         init_pair(CP_ERROR, COLOR_RED, COLOR_BLACK);
-        init_pair(CP_NODE_ALPHA, COLOR_GREEN, COLOR_BLACK);
-        init_pair(CP_NODE_BRAVO, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(CP_NODE_ALPHA, COLOR_RED, COLOR_BLACK);
+        init_pair(CP_NODE_BRAVO, COLOR_BLUE, COLOR_BLACK);
     }
 
     /* Boot splash - see its own comment above for why this is safe to
@@ -1294,6 +1336,28 @@ void ui_set_statusf(const char *fmt, ...)
  * (CP_SYSTEM vs CP_ERROR); everything else (timestamp handling, pad
  * bookkeeping, lock/scroll gating) is identical, so this is the one
  * place that logic lives rather than two near-duplicate copies. */
+/* Maps a display NAME (already capitalized - "Alpha" or "Bravo") to its
+ * fixed identity color pair (see CP_NODE_ALPHA/CP_NODE_BRAVO's own
+ * comments - red/blue, consistent everywhere the name appears: this
+ * history pane, the splash banner, the status bar). Defensive fallback
+ * to CP_SYSTEM for anything else (should never happen given this
+ * project's fixed two-device architecture, but a defensive default
+ * beats a crash if a future message type ever passes something else
+ * through here). */
+static int color_pair_for_name(const char *name)
+{
+    if (name == NULL) {
+        return CP_SYSTEM;
+    }
+    if (strcmp(name, "Alpha") == 0) {
+        return CP_NODE_ALPHA;
+    }
+    if (strcmp(name, "Bravo") == 0) {
+        return CP_NODE_BRAVO;
+    }
+    return CP_SYSTEM;
+}
+
 static void ui_add_history_ex(const char *prefix, const char *text,
                                 int is_error)
 {
@@ -1303,12 +1367,19 @@ static void ui_add_history_ex(const char *prefix, const char *text,
     pthread_mutex_lock(&ui_mutex);
     {
         /* Color by source: NULL prefix is a system/event notice (or an
-         * error, if is_error - see this function's own comment); "you"
-         * (session.c's own convention for the local user's sent
-         * messages) gets a distinct color from an incoming peer message
-         * (any other non-NULL prefix, i.e. the peer_label session.c
-         * passes) - makes it possible to tell at a glance who said what
-         * without reading every line. */
+         * error, if is_error - see this function's own comment);
+         * otherwise the line is colored by the SENDER'S identity
+         * (Alpha=red, Bravo=blue - color_pair_for_name()), not by
+         * own-vs-peer as before. session.c's own internal sentinel for
+         * "this device's own sent message" is the literal string "you"
+         * (see msglog.h/session.c) - substituted here, at display time
+         * only, for this device's own capitalized name
+         * (g_self_is_alpha), so the on-screen prefix and its color both
+         * always show the real device name rather than the generic
+         * "you" - matches the direct request that names/colors be
+         * consistent everywhere (banner, messages, status bar), not
+         * just "mine vs. theirs". */
+        const char *display_prefix = prefix;
         int cp = is_error ? CP_ERROR : CP_SYSTEM;
         char ts_buf[12]; /* "[HH:MM:SS] " + NUL */
         time_t now = time(NULL);
@@ -1321,7 +1392,10 @@ static void ui_add_history_ex(const char *prefix, const char *text,
         strftime(ts_buf, sizeof(ts_buf), "[%H:%M:%S] ", &tm_now);
 
         if (prefix != NULL) {
-            cp = (strcmp(prefix, "you") == 0) ? CP_OWN_MSG : CP_PEER_MSG;
+            if (strcmp(prefix, "you") == 0) {
+                display_prefix = g_self_is_alpha ? "Alpha" : "Bravo";
+            }
+            cp = color_pair_for_name(display_prefix);
         }
         /* Timestamp itself always in its own quiet CP_TIMESTAMP color
          * (2026-08-22 - previously shared CP_SYSTEM, split out per direct
@@ -1340,8 +1414,8 @@ static void ui_add_history_ex(const char *prefix, const char *text,
         wattroff(history_win, COLOR_PAIR(CP_TIMESTAMP));
 
         wattron(history_win, COLOR_PAIR(cp));
-        if (prefix != NULL) {
-            wprintw(history_win, "%s: %s\n", prefix, text != NULL ? text : "");
+        if (display_prefix != NULL) {
+            wprintw(history_win, "%s: %s\n", display_prefix, text != NULL ? text : "");
         } else {
             wprintw(history_win, "%s\n", text != NULL ? text : "");
         }
@@ -1350,10 +1424,13 @@ static void ui_add_history_ex(const char *prefix, const char *text,
         /* See wrapped_row_count()'s comment - this line's TOTAL display
          * width (timestamp + optional "prefix: " + text) is what
          * actually determines how many physical pad rows it consumed,
-         * not a flat 1. */
+         * not a flat 1. Uses display_prefix, not the raw prefix
+         * argument: "you" (3 chars) vs. "Alpha"/"Bravo" (5 chars) are
+         * different lengths, and it's the actual rendered width that
+         * determines real wrap behavior. */
         {
             size_t total_width = strlen(ts_buf) +
-                (prefix != NULL ? strlen(prefix) + 2 : 0) +
+                (display_prefix != NULL ? strlen(display_prefix) + 2 : 0) +
                 strlen(text != NULL ? text : "");
             history_total_lines += wrapped_row_count(
                 (int)total_width, getmaxx(history_win));

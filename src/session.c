@@ -220,6 +220,30 @@ typedef struct {
                   * ui_notify_message_pending()), below. */
     int oled_fd;
     const char *peer_label;
+    const char *self_label; /* 2026-08-23 (direct request): the OTHER
+        device's capitalized name is already carried above as
+        peer_label (client.c passes "Bravo", server.c passes "Alpha" -
+        see run_symmetric_session()'s own comment); this is THIS
+        device's own capitalized name, inferred the same way ui.c's
+        g_self_is_alpha is (peer_label != "Bravo" implies self is
+        "Alpha", given this project's fixed two-device architecture -
+        see g_self_is_alpha's declaration comment in ui.c for the full
+        reasoning). Set once in run_symmetric_session() below and used
+        everywhere this file used to hardcode the literal sentinel
+        "you" for a locally-sent message's prefix - both for
+        msglog_append()/msglog_append_saved() (so a PERSISTED message,
+        replayed on a future boot via replay_msglog_into_pad_locked(),
+        shows the real device name directly rather than "you" - that
+        replay path writes msglog's raw stored text straight into the
+        history pane and does NOT go through ui_add_history_ex()'s own
+        "you"-substitution logic, so relying on that substitution alone
+        would leave replayed history permanently inconsistent with live
+        messages) and for ui_add_history()/ui_add_historyf() (where it's
+        redundant with ui_add_history_ex()'s own substitution today, but
+        keeping both paths passing the same real name rather than one
+        passing "you" and relying on a second layer to translate it is
+        simpler to reason about and keeps this file's own persisted and
+        on-screen text identical, not just the on-screen text alone). */
 } shared_session_ctx;
 
 static void seq_num_to_be(uint32_t seq, uint8_t out[4])
@@ -854,6 +878,11 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     ctx.hw_fd = hw_fd;
     ctx.oled_fd = oled_fd;
     ctx.peer_label = peer_label;
+    /* See self_label's own declaration comment above: inferred from
+     * peer_label the same way ui.c's g_self_is_alpha is, since this
+     * project has exactly two fixed roles. */
+    ctx.self_label = (peer_label != NULL && strcmp(peer_label, "Bravo") == 0)
+                          ? "Alpha" : "Bravo";
 
     if (pthread_create(&rtid, NULL, receiver_thread_main, &ctx) != 0) {
         ui_add_error("run_symmetric_session: pthread_create failed");
@@ -926,8 +955,8 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                                   (const uint8_t *)queued, (uint32_t)qlen,
                                   &sent_seq) == 0) {
                     track_pending_ack(&ctx, sent_seq, queued);
-                    msglog_append("you", queued);
-                    ui_add_history("you", queued);
+                    msglog_append(ctx.self_label, queued);
+                    ui_add_history(ctx.self_label, queued);
                 } else {
                     /* Send failed mid-drain (connection died again) -
                      * put it back at the front of the queue rather than
@@ -1142,8 +1171,8 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                 break;
             }
             track_pending_ack(&ctx, sent_seq, text);
-            msglog_append_saved("you", text);
-            ui_add_historyf("you", "[SAVED] %s", text);
+            msglog_append_saved(ctx.self_label, text);
+            ui_add_historyf(ctx.self_label, "[SAVED] %s", text);
             continue;
         }
 
@@ -1216,7 +1245,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                 }
                 ui_add_historyf(NULL, "(sent file: %s, %ld bytes)", name,
                                  file_size);
-                msglog_append("you",
+                msglog_append(ctx.self_label,
                     "(sent a file - see docs/PROTOCOL.md FILE type)");
             }
             continue;
@@ -1235,7 +1264,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                 break;
             }
             track_pending_ack(&ctx, sent_seq, line);
-            msglog_append("you", line);
+            msglog_append(ctx.self_label, line);
         }
 
         /* Echo the user's own sent message into the history. ncurses
@@ -1243,7 +1272,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
          * submitted (ui.c), so without this the user would have no
          * on-screen record of what they just sent - unlike a plain
          * terminal, which echoes typed input on its own. */
-        ui_add_history("you", line);
+        ui_add_history(ctx.self_label, line);
     }
 
     free(line);

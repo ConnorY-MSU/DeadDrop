@@ -473,7 +473,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
      * after - see ui.h's "IDLE INPUT" comment. These two calls must
      * bracket every run_symmetric_session() call exactly like this. */
     ui_stop_idle_input();
-    result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "alpha");
+    result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "Alpha");
     ui_start_idle_input();
 
     hw_oled_draw_text(oled_fd, 0, "SecureLink bravo");
@@ -648,7 +648,19 @@ int main(int argc, char *argv[])
 #ifndef _WIN32
     wait_for_cloud_init_boot_finished();
 #endif
-    ui_init("alpha");
+    /* 2026-08-23 (direct request): capitalized "Alpha"/"Bravo"
+     * consistently everywhere either name is displayed - the banner,
+     * message history ("Alpha: ..."/"Bravo: ..."), and the status bar
+     * ("Connected to Bravo") all derive from this one literal, so
+     * capitalizing it here (and the matching literal in
+     * run_symmetric_session()'s call above) is the single source of
+     * truth for every other display site. ui_init() also infers this
+     * device's OWN identity from this same string (see its own
+     * comment) - deliberately still just one argument, not two,
+     * since self and peer are always exactly the other one of these
+     * two literal names in this project's fixed two-device
+     * architecture. */
+    ui_init("Alpha");
     ui_start_idle_input();
     ui_set_status("Loading credentials...");
 

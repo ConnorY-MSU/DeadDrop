@@ -423,7 +423,12 @@ int main(int argc, char *argv[])
 #ifndef _WIN32
     wait_for_cloud_init_boot_finished();
 #endif
-    ui_init("bravo");
+    /* 2026-08-23 (direct request): see client.c's matching comment -
+     * this capitalized literal is the single source of truth for every
+     * other "Alpha"/"Bravo" display site (banner, message history,
+     * status bar), and ui_init() infers THIS device's own identity
+     * from it too. */
+    ui_init("Bravo");
     ui_start_idle_input();
     ui_set_status("Loading credentials...");
 
@@ -607,7 +612,7 @@ int main(int argc, char *argv[])
              * These two calls must bracket every run_symmetric_session()
              * call exactly like this. */
             ui_stop_idle_input();
-            run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "bravo");
+            run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "Bravo");
             ui_start_idle_input();
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
             ui_set_link_state(0);
