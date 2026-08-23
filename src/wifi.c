@@ -189,10 +189,24 @@ int wifi_scan(wifi_network *out_networks, int max_results)
         }
         ssid[si] = '\0';
 
-        /* nmcli prints "--" in the SECURITY column for an open
-         * network with no security at all - anything else (WPA1,
-         * WPA2, WPA3, WEP, combinations) means a password is needed. */
-        secured = (strstr(p, "--") == NULL);
+        /* REAL BUG FOUND AND FIXED (2026-08-23): nmcli's *human-
+         * readable* SECURITY column prints "--" for an open network,
+         * but this is TERSE (-t) output, which uses a genuinely
+         * different convention - an open network's SECURITY field is
+         * simply EMPTY (confirmed byte-for-byte on real hardware:
+         * "The Arrow:" with literally nothing after the colon, not
+         * "The Arrow:--"). The old `strstr(p, "--") == NULL` check
+         * treated an empty string as "no '--' found" -> secured=1,
+         * meaning every genuinely open network was silently
+         * misreported as needing a password - the Ctrl+W flow would
+         * prompt for one it should never have asked for, and
+         * wifi_connect() would then pass that unnecessary password to
+         * an open network's connect call. Fixed to check for a
+         * genuinely non-empty security string instead - open (empty)
+         * -> unsecured, anything else (WPA1/2/3, WEP, 802.1X, ...) ->
+         * secured, matching terse mode's actual convention rather
+         * than the human-readable one this was written against. */
+        secured = (p[0] != '\0');
 
         if (si > 0) {
             int dup = 0;
