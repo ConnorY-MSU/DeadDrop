@@ -2,6 +2,7 @@
 #define LOCK_H
 
 #include <stddef.h>
+#include <time.h>
 
 /*
  * lock - salted-hash PIN storage/verification for the ncurses UI's
@@ -76,5 +77,51 @@ int lock_set_pin(const char *pin, size_t pin_len);
  * no PIN file exists at all.
  */
 int lock_check_pin(const char *pin, size_t pin_len);
+
+/*
+ * Wrong-PIN rate-limit persistence (added 2026-08-23, security audit
+ * Finding #6). ui.c's own wrong-attempt delay (a short, ramping,
+ * 5s-capped "speed bump" - see its own design comment for the honest
+ * threat-model context, physical possession is already assumed) used
+ * to live ENTIRELY in an in-process variable, which meant a process
+ * restart - `systemctl restart`, or simply the crash/respawn cycle
+ * `Restart=always` performs automatically - reset it to zero, verified
+ * empirically on real hardware (TESTING.md's Finding #6). Persisting
+ * just the "next allowed attempt" timestamp (not the full ramping
+ * counter - see lock.c's own comment on why that's a deliberate,
+ * proportionate scope choice) closes the actual gap: a restart can no
+ * longer be used to make PIN attempts arrive faster than the delay
+ * already in effect allows, regardless of how many times the process
+ * is restarted in between.
+ *
+ * Stored in a separate small file from the PIN hash itself (same
+ * directory, same 0600 permissions) - deliberately not appended to the
+ * fixed 48-byte pin_hash format above, so this stays trivially easy to
+ * reason about (and to migrate/drop later) independent of that file's
+ * own format.
+ */
+
+/*
+ * lock_get_next_allowed_time - fills *out_time with the persisted
+ * "don't accept another PIN attempt before this time" timestamp (0 if
+ * none is stored, i.e. no restriction currently in effect). Returns 0
+ * on success (including "no file - out_time set to 0"), -1 on a real
+ * I/O error reading an existing file (caller should treat this the
+ * same as "no restriction" rather than fail closed here - this is a
+ * rate-limit speed bump, not the actual PIN check).
+ */
+int lock_get_next_allowed_time(time_t *out_time);
+
+/*
+ * lock_set_next_allowed_time - persist `t` as the next-allowed-attempt
+ * timestamp. Returns 0 on success, -1 on failure.
+ */
+int lock_set_next_allowed_time(time_t t);
+
+/*
+ * lock_clear_next_allowed_time - remove the persisted timestamp
+ * (called on a successful unlock). Missing file is not an error.
+ */
+void lock_clear_next_allowed_time(void);
 
 #endif /* LOCK_H */

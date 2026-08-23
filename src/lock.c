@@ -38,6 +38,27 @@ int lock_pin_file_path(char *buf, size_t buf_size)
     return 0;
 }
 
+/* Same directory/fallback logic as lock_pin_file_path(), a separate
+ * file - see lock.h's own comment on the rate-limit persistence
+ * functions for why this isn't just appended to pin_hash's format. */
+static int lock_ratelimit_file_path(char *buf, size_t buf_size)
+{
+    const char *home = getenv("HOME");
+#ifdef _WIN32
+    if (home == NULL) {
+        home = getenv("USERPROFILE");
+    }
+#endif
+    if (home == NULL) {
+        return -1;
+    }
+    if ((size_t)snprintf(buf, buf_size, "%s/.securelink/lock_ratelimit",
+                          home) >= buf_size) {
+        return -1;
+    }
+    return 0;
+}
+
 /* Directory portion of lock_pin_file_path()'s result, so the file can
  * actually be created - MKDIR on an already-existing directory is
  * treated as success (not every platform/libc agrees on the errno for
@@ -198,4 +219,90 @@ int lock_check_pin(const char *pin, size_t pin_len)
         diff |= (uint8_t)(computed[i] ^ file_data[LOCK_SALT_LEN + i]);
     }
     return diff == 0;
+}
+
+/* Stored as a plain decimal ASCII string (not a raw binary time_t) -
+ * deliberately: this file's contents are never treated as a secret
+ * (unlike the salted hash above, its content reveals nothing except a
+ * timestamp, so 0600 here is just tidy hygiene, not a security
+ * boundary) and a portable text format avoids any endianness/type-
+ * width assumption about time_t across the two real platforms this
+ * code actually runs on (32-bit vs 64-bit time_t, Linux vs the
+ * Windows dev-machine build). */
+#define RATELIMIT_FILE_MAX_LEN 32
+
+int lock_get_next_allowed_time(time_t *out_time)
+{
+    char path[512];
+    char buf[RATELIMIT_FILE_MAX_LEN];
+    FILE *f;
+    size_t got;
+
+    if (out_time == NULL) {
+        return -1;
+    }
+    *out_time = 0;
+
+    if (lock_ratelimit_file_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0; /* no file yet - not a restriction, not an error */
+    }
+    got = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    *out_time = (time_t)strtoll(buf, NULL, 10);
+    return 0;
+}
+
+int lock_set_next_allowed_time(time_t t)
+{
+    char path[512];
+    char buf[RATELIMIT_FILE_MAX_LEN];
+    FILE *f;
+    int len;
+
+    if (lock_pin_file_path(path, sizeof(path)) != 0) {
+        return -1; /* just to get ensure_pin_dir() a valid path to derive
+                       the directory from below */
+    }
+    ensure_pin_dir(path);
+
+    if (lock_ratelimit_file_path(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    len = snprintf(buf, sizeof(buf), "%lld", (long long)t);
+    if (len < 0 || (size_t)len >= sizeof(buf)) {
+        return -1;
+    }
+    f = fopen(path, "wb");
+    if (f == NULL) {
+        return -1;
+    }
+    {
+        size_t written = fwrite(buf, 1, (size_t)len, f);
+        fclose(f);
+        if (written != (size_t)len) {
+            return -1;
+        }
+    }
+#ifndef _WIN32
+    chmod(path, 0600); /* tidy hygiene, see this function's own comment
+                           above lock_get_next_allowed_time() - not a
+                           secrecy boundary for this particular file */
+#endif
+    return 0;
+}
+
+void lock_clear_next_allowed_time(void)
+{
+    char path[512];
+
+    if (lock_ratelimit_file_path(path, sizeof(path)) != 0) {
+        return;
+    }
+    remove(path); /* missing file is not an error - nothing to clear */
 }

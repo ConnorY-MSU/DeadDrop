@@ -1282,7 +1282,19 @@ void ui_init(const char *peer_label)
     pin_entry_buf[0] = '\0';
     pin_first_entry_len = 0;
     wrong_attempt_count = 0;
-    next_allowed_check_time = 0;
+    /* Security audit Finding #6 fix (2026-08-23): load whatever
+     * wrong-PIN rate-limit deadline was persisted from before this
+     * process started (0 if none/expired-and-not-yet-cleared/never
+     * set), instead of always starting at 0 - see lock.h's own comment
+     * on lock_get_next_allowed_time() for why an in-memory-only
+     * version of this let a restart reset the delay entirely. A
+     * timestamp from the past is harmless either way - the check
+     * below this is used for is `now < next_allowed_check_time`, so an
+     * already-elapsed deadline just naturally imposes no wait, exactly
+     * like a fresh 0 would. */
+    if (lock_get_next_allowed_time(&next_allowed_check_time) != 0) {
+        next_allowed_check_time = 0;
+    }
     last_activity_time = time(NULL);
 
     /* Locked by default on boot whenever a PIN has ever been set on this
@@ -1857,6 +1869,10 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                         ui_mode = UI_MODE_NORMAL;
                         wrong_attempt_count = 0;
                         next_allowed_check_time = 0;
+                        lock_clear_next_allowed_time(); /* security audit
+                            Finding #6 fix - clear the persisted deadline
+                            too, not just the in-memory one, on a
+                            successful unlock */
                         last_activity_time = time(NULL);
                         /* Reveal history_win's pad: its screen region was
                          * showing lock_overlay_win the whole time locked
@@ -1880,6 +1896,14 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                             delay = 5;
                         }
                         next_allowed_check_time = time(NULL) + delay;
+                        /* Security audit Finding #6 fix: persist the
+                         * deadline too. Best-effort - if this write
+                         * fails (disk full, permission problem), the
+                         * in-memory delay above still applies for the
+                         * REST of this process's life; it just wouldn't
+                         * survive a restart, which is exactly today's
+                         * pre-fix behavior, not a regression. */
+                        lock_set_next_allowed_time(next_allowed_check_time);
 
                         {
                             char msg[64];
