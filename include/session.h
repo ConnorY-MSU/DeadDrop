@@ -100,6 +100,40 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                                       int oled_fd, const char *peer_label);
 
 /*
+ * session_perform_local_destroy - the actual effect of "/destroy CONFIRM"
+ * (see session.c's own block comment on the full emergency-wipe design,
+ * and docs/PROTOCOL.md's DESTROY entry). Wipes, on THIS device only: the
+ * persisted message log in full (msglog.h's msglog_destroy_all() - unlike
+ * "/clear", ignores the SAVED marker entirely), the live on-screen
+ * scrollback, and any locally-saved received files. Exported (rather
+ * than staying private to session.c, where every other call site lives)
+ * specifically so ui.c's idle-input thread can also trigger it while no
+ * session is active - "/destroy" needs to work offline exactly like
+ * "/clear" already does, for the same reason: a security-motivated wipe
+ * command shouldn't have to wait for a connection to exist. Does NOT
+ * show its own confirmation notice or notify the peer - callers handle
+ * both (the exact notice wording and whether/how to reach the peer
+ * differ per call site).
+ */
+void session_perform_local_destroy(void);
+
+/*
+ * OUTBOX_DESTROY_SENTINEL - enqueued into the offline outbox (see
+ * outbox.h) in place of real message text when "/destroy CONFIRM" is
+ * issued while the peer is unreachable, from EITHER call site (this
+ * file's own outbox-drain loop in run_symmetric_session(), or ui.c's
+ * idle-input thread for the fully-offline case) - whichever one
+ * eventually finds a live session first sends SL_MSG_DESTROY instead of
+ * a normal SL_MSG_TEXT_MESSAGE when it dequeues this exact string. Uses
+ * ASCII SOH (0x01), which no real keyboard can type and ui_poll_line()
+ * never produces from normal input, specifically so a legitimate user's
+ * own message could never be mistaken for this sentinel by coincidence.
+ * Declared here (not privately in session.c) because both files need to
+ * agree on the exact same value.
+ */
+#define OUTBOX_DESTROY_SENTINEL "\x01SL_DESTROY_PENDING\x01"
+
+/*
  * IMPORTANT for callers: client.c/server.c both apply a receive timeout
  * (SO_RCVTIMEO, CONN_TIMEOUT_SECONDS) to the raw socket before the TLS
  * handshake, to bound a stalled connect/handshake. That made sense for

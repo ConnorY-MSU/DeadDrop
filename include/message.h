@@ -33,9 +33,20 @@ typedef enum {
     SL_MSG_ACK          = 0x05, /* body: 4 bytes BE, the seq_num of the
                                     TEXT_MESSAGE being acknowledged - see
                                     docs/PROTOCOL.md */
-    SL_MSG_FILE         = 0x06  /* body: [2-byte filename_len BE]
+    SL_MSG_FILE         = 0x06, /* body: [2-byte filename_len BE]
                                     [filename bytes][file data] - see
                                     docs/PROTOCOL.md for the size cap */
+    SL_MSG_DESTROY      = 0x07  /* body: none. The "/destroy CONFIRM"
+                                    emergency-wipe command - see
+                                    docs/PROTOCOL.md and session.c's
+                                    perform_local_destroy(). No body/nonce
+                                    needed: this arrives over an already
+                                    mutually-authenticated, replay-protected
+                                    session (see seq_num handling below),
+                                    so its mere authenticated arrival is
+                                    the only confirmation that matters -
+                                    the peer's own identity already proved
+                                    itself during the mTLS handshake. */
 } sl_msg_type;
 
 #define SL_FILE_NAME_LEN_SIZE 2 /* the 2-byte length prefix within a

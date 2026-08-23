@@ -144,6 +144,20 @@ void ui_show_help(void);
  */
 void ui_clear_history(void);
 
+/*
+ * ui_destroy_history - the on-screen half of the "/destroy CONFIRM"
+ * emergency-wipe command (see session.c's perform_local_destroy(),
+ * which pairs this with msglog.h's msglog_destroy_all()). Unlike
+ * ui_clear_history(), does NOT replay anything back afterward - there
+ * is nothing left to replay, and a destroy is meant to leave a
+ * genuinely blank slate. The caller is responsible for showing its own
+ * confirmation notice afterward (wording differs between a local vs.
+ * remote-triggered destroy). Thread-safe, same locking as
+ * ui_add_history(). On the non-Linux plain-console fallback, this is a
+ * no-op notice only - see ui.c.
+ */
+void ui_destroy_history(void);
+
 typedef enum {
     UI_POLL_TIMEOUT, /* timeout elapsed, no complete line yet - keep polling */
     UI_POLL_LINE,    /* a full line was composed and submitted (Enter) */

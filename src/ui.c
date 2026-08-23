@@ -30,6 +30,12 @@
 #include "hw_oled.h"
 #include "msglog.h"
 #include "outbox.h"
+/* Only for session_perform_local_destroy() - see its own declaration
+ * comment in session.h for why this file needs it too (the "/destroy"
+ * command's offline case, in idle_input_thread_main() below). A
+ * pragmatic, narrow exception to this file otherwise having no
+ * dependency on session.h/session.c - not a broader layering change. */
+#include "session.h"
 
 /* --- Module state -------------------------------------------------------
  *
@@ -853,6 +859,8 @@ void ui_show_help(void)
         "/send <path>: send a small local file",
         "/save <text>: send a message that survives /clear",
         "/clear: wipe chat history (keeps any /save'd messages)",
+        "/destroy CONFIRM: EMERGENCY - irreversibly wipe ALL chat data",
+        "                  on BOTH devices, no exceptions",
         "/help: show this guide again",
         "quit or exit: end the session",
     };
@@ -1212,6 +1220,36 @@ void ui_clear_history(void)
     history_view_line = 0;
     history_following = 1;
     replay_msglog_into_pad_locked();
+    if (ui_mode != UI_MODE_LOCKED) {
+        refresh_history_viewport_locked();
+    }
+    pthread_mutex_unlock(&ui_mutex);
+}
+
+/* The "/destroy CONFIRM" emergency-wipe command's UI-side half (see
+ * session.c's perform_local_destroy(), which pairs this with
+ * msglog_destroy_all() - same DECOUPLING as ui_clear_history() above:
+ * this only touches the live on-screen pad). Deliberately does NOT
+ * call replay_msglog_into_pad_locked() the way ui_clear_history() does
+ * - there is nothing left to replay (msglog_destroy_all() removes the
+ * log file entirely, no SAVED exception), and a /destroy is meant to
+ * leave a genuinely blank slate, not a "here's what survived" list.
+ * The caller is expected to show its own stark confirmation notice via
+ * ui_add_error() right after this returns - kept as a separate step
+ * rather than built into this function, since the exact wording
+ * differs between "you triggered this locally" and "the peer
+ * triggered this remotely" (see session.c's two call sites). */
+void ui_destroy_history(void)
+{
+    if (!ui_active) {
+        return;
+    }
+    pthread_mutex_lock(&ui_mutex);
+    werase(history_win);
+    wmove(history_win, 0, 0);
+    history_total_lines = 0;
+    history_view_line = 0;
+    history_following = 1;
     if (ui_mode != UI_MODE_LOCKED) {
         refresh_history_viewport_locked();
     }
@@ -1775,6 +1813,40 @@ static void *idle_input_thread_main(void *arg)
                 /* Same reasoning as "/clear" just above - purely local,
                  * no connection needed. */
                 ui_show_help();
+            } else if (strcmp(dummy, "/destroy") == 0) {
+                ui_add_error(
+                    "EMERGENCY DESTROY: type '/destroy CONFIRM' (exact, "
+                    "case-sensitive) to IRREVERSIBLY wipe ALL chat "
+                    "history, saved messages, and received files on "
+                    "BOTH this device and the paired device. This "
+                    "cannot be undone.");
+            } else if (strcmp(dummy, "/destroy CONFIRM") == 0) {
+                /* Same emergency-wipe protocol as session.c's connected-
+                 * path handler - see session.h's session_perform_local_
+                 * destroy() comment. No live session exists here by
+                 * definition (this is the IDLE thread), so the peer
+                 * notification always queues rather than ever attempting
+                 * a direct send. */
+                session_perform_local_destroy();
+                if (outbox_enqueue(OUTBOX_DESTROY_SENTINEL) == 0) {
+                    ui_add_error(
+                        "EMERGENCY DESTROY: all local chat data wiped. "
+                        "Peer notification queued - will be delivered "
+                        "automatically once connected.");
+                } else {
+                    /* Queue is full of unrelated pending messages - this
+                     * should be exceedingly rare (OUTBOX_MAX_MESSAGES is
+                     * generous), but the wipe command itself must never
+                     * silently fail to queue, so this is loud and
+                     * explicit about needing a manual retry rather than
+                     * pretending success. */
+                    ui_add_error(
+                        "EMERGENCY DESTROY: all local chat data wiped, "
+                        "but the outbound queue is full - peer "
+                        "notification could NOT be queued. Run "
+                        "'/destroy CONFIRM' again once connected to "
+                        "notify the peer.");
+                }
             } else if (strncmp(dummy, "/save ", 6) == 0) {
                 /* "/save" sends AND tags in one step (see session.c) -
                  * there's no session to send through here, so rather
@@ -2178,6 +2250,8 @@ void ui_show_help(void)
            "/send <path>: send a small local file\n"
            "/save <text>: send a message that survives /clear\n"
            "/clear: wipe chat history (keeps any /save'd messages)\n"
+           "/destroy CONFIRM: EMERGENCY - irreversibly wipe ALL chat "
+           "data on BOTH devices, no exceptions\n"
            "/help: show this guide again\n"
            "quit or exit: end the session\n"
            "(lock screen / WiFi setup are Linux+ncurses-only features,\n"
@@ -2259,6 +2333,15 @@ void ui_clear_history(void)
      * session.c's msglog_clear_except_saved() call still runs and does
      * the real (on-disk) work regardless of this being a no-op. */
     printf("(chat log cleared - any /save'd messages were kept)\n");
+    fflush(stdout);
+}
+
+void ui_destroy_history(void)
+{
+    /* Same reasoning as ui_clear_history() above - nothing to wipe
+     * on-screen on this fallback. msglog_destroy_all() still does the
+     * real (on-disk) work. */
+    printf("(EMERGENCY DESTROY: all local chat data wiped)\n");
     fflush(stdout);
 }
 

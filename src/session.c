@@ -35,6 +35,13 @@
     #define SHUTDOWN_READ(s) shutdown((s), SHUT_RD)
     #define MKDIR(path) mkdir((path), 0700)
 #endif
+/* dirent.h - needed by wipe_directory_contents() (see the "/destroy
+ * CONFIRM" emergency-wipe block below) to enumerate ~/.securelink/received/
+ * for deletion. Available on both real targets: POSIX natively, and
+ * MinGW-w64 (this project's Windows dev-machine toolchain, per
+ * docs/BUILD.md's UCRT64 setup) ships a compatible shim - no #ifdef
+ * split needed, unlike the raw socket/directory-creation APIs above. */
+#include <dirent.h>
 
 /* How often the sender loop wakes up (if nothing's been typed) to
  * re-check whether the receiver thread has ended the session. Bounds the
@@ -425,6 +432,85 @@ static void sanitize_basename(const char *raw, char *out, size_t out_size)
     snprintf(out, out_size, "%s", raw);
 }
 
+/* --- "/destroy CONFIRM" emergency-wipe protocol -------------------------
+ *
+ * A deliberately more drastic sibling to "/clear" (see msglog.h's
+ * msglog_destroy_all() for exactly how it differs): triggerable from
+ * EITHER paired device, wipes ALL local chat state on BOTH devices, no
+ * exceptions (not even /save'd messages). Intended for a genuine
+ * device-compromise/seizure scenario, not routine tidying.
+ *
+ * Flow: typing "/destroy CONFIRM" (exact, case-sensitive - see the
+ * command handler below for why a plain "/destroy" alone only shows a
+ * warning) immediately wipes THIS device's own state, then either sends
+ * SL_MSG_DESTROY to the peer right now (if connected) or queues it for
+ * automatic delivery the next time a session connects (if not) - see
+ * OUTBOX_DESTROY_SENTINEL below. Receiving SL_MSG_DESTROY performs the
+ * exact same local wipe - see receiver_thread_main()'s SL_MSG_DESTROY
+ * case. Either direction ends up wiping both devices, which is the
+ * actual point: a compromised or seized device shouldn't leave the
+ * OTHER device's copy sitting there un-warned either, and the device
+ * that's still safely in the legitimate owner's hands should be able to
+ * trigger both sides from wherever it is.
+ */
+
+/* Deletes every regular file directly inside `dir` (no recursion into
+ * subdirectories - ~/.securelink/received/ is expected flat, this
+ * project's own code never creates subdirectories inside it). Silently
+ * does nothing if `dir` doesn't exist - matches every other "best-
+ * effort, missing state is fine" helper in this file. */
+static void wipe_directory_contents(const char *dir)
+{
+    DIR *d = opendir(dir);
+    struct dirent *entry;
+
+    if (d == NULL) {
+        return;
+    }
+    while ((entry = readdir(d)) != NULL) {
+        char path[600];
+        if (strcmp(entry->d_name, ".") == 0 ||
+                strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if ((size_t)snprintf(path, sizeof(path), "%s/%s", dir,
+                              entry->d_name) < sizeof(path)) {
+            remove(path);
+        }
+    }
+    closedir(d);
+}
+
+/* The actual "/destroy CONFIRM" effect - declared in session.h (see its
+ * own comment there for why this is exported rather than staying static
+ * like every other helper in this block: ui.c's idle-input thread needs
+ * to call this too, for the offline case). Shared by three call sites
+ * total: the local command handler in run_symmetric_session() below, the
+ * SL_MSG_DESTROY case in receiver_thread_main(), and ui.c's offline
+ * "/destroy" handling. Wipes the persisted message log (in full - see
+ * msglog_destroy_all()), the live on-screen scrollback, and any locally-
+ * saved received files, in that order. Deliberately does NOT show its
+ * own confirmation notice - each call site's wording needs to differ
+ * ("you triggered this" vs. "the peer did"), so that stays with the
+ * caller. */
+void session_perform_local_destroy(void)
+{
+    msglog_destroy_all();
+    ui_destroy_history();
+
+    {
+        char dir[512];
+        if (received_files_dir(dir, sizeof(dir)) == 0) {
+            wipe_directory_contents(dir);
+        }
+    }
+}
+
+/* OUTBOX_DESTROY_SENTINEL itself now lives in session.h - both this
+ * file's outbox-drain loop AND ui.c's offline "/destroy" handling need
+ * to agree on the EXACT same string, so it can't be a private #define
+ * in just one of them. See session.h's copy for the full comment. */
+
 /* --- Receiver thread ---------------------------------------------------
  *
  * Runs for the whole session: always reads, parses, displays, and (for
@@ -685,6 +771,18 @@ static void *receiver_thread_main(void *arg)
             ui_add_historyf(NULL, "%s sent DISCONNECT.", ctx->peer_label);
             ctx->peer_ended = 1;
             break;
+        } else if (msg.msg_type == SL_MSG_DESTROY) {
+            /* The peer triggered "/destroy CONFIRM" remotely - see this
+             * file's "/destroy CONFIRM" block comment above. No
+             * additional authentication/confirmation needed here beyond
+             * this message having arrived at all: it rode in over an
+             * already mutually-authenticated (mTLS), replay-protected
+             * (HMAC + strictly-increasing seq_num) session, so its mere
+             * valid arrival already proves it came from the legitimate
+             * paired device, not an attacker. */
+            session_perform_local_destroy();
+            ui_add_error("EMERGENCY DESTROY: the peer remotely wiped all "
+                          "chat data on this device.");
         }
         /* Any other well-formed-but-unrecognized msg_type: treated as
          * forward-compat noise, not fatal - sl_try_parse_message() has
@@ -802,22 +900,42 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
      * as soon as I reconnected"). */
     {
         char queued[OUTBOX_MSG_MAX_LEN];
+        uint32_t sent_seq;
         while (outbox_try_dequeue(queued, sizeof(queued))) {
-            uint32_t sent_seq;
-            size_t qlen = strlen(queued);
-            if (session_send(&ctx, SL_MSG_TEXT_MESSAGE,
-                              (const uint8_t *)queued, (uint32_t)qlen,
-                              &sent_seq) == 0) {
-                track_pending_ack(&ctx, sent_seq, queued);
-                msglog_append("you", queued);
-                ui_add_history("you", queued);
-            } else {
-                /* Send failed mid-drain (connection died again) - put
-                 * it back at the front of the queue rather than lose
-                 * it, and stop draining; the next successful session
-                 * start will pick up where this left off. */
-                outbox_enqueue(queued);
-                break;
+            /* A queued "/destroy CONFIRM" from earlier, issued while the
+             * peer was unreachable (see OUTBOX_DESTROY_SENTINEL's
+             * comment) - THIS device's own wipe already happened
+             * immediately back when the command was originally typed;
+             * all that's left now is telling the peer, so this doesn't
+             * go through the normal TEXT_MESSAGE send path below at
+             * all. */
+            if (strcmp(queued, OUTBOX_DESTROY_SENTINEL) == 0) {
+                if (session_send(&ctx, SL_MSG_DESTROY, NULL, 0, NULL) == 0) {
+                    ui_add_error("EMERGENCY DESTROY: queued wipe command "
+                                  "delivered to peer.");
+                } else {
+                    outbox_enqueue(queued);
+                    break;
+                }
+                continue;
+            }
+
+            {
+                size_t qlen = strlen(queued);
+                if (session_send(&ctx, SL_MSG_TEXT_MESSAGE,
+                                  (const uint8_t *)queued, (uint32_t)qlen,
+                                  &sent_seq) == 0) {
+                    track_pending_ack(&ctx, sent_seq, queued);
+                    msglog_append("you", queued);
+                    ui_add_history("you", queued);
+                } else {
+                    /* Send failed mid-drain (connection died again) -
+                     * put it back at the front of the queue rather than
+                     * lose it, and stop draining; the next successful
+                     * session start will pick up where this left off. */
+                    outbox_enqueue(queued);
+                    break;
+                }
             }
         }
     }
@@ -929,6 +1047,58 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
          * top comment). */
         if (strcmp(line, "/help") == 0) {
             ui_show_help();
+            continue;
+        }
+
+        /* "/destroy" and "/destroy CONFIRM" - the emergency-wipe
+         * protocol, see this file's block comment above
+         * session_perform_local_destroy() for the full design. "/destroy"
+         * ALONE is deliberately inert (just a stark warning) so an
+         * accidental Enter-press mid-command can never trigger this -
+         * only the exact, deliberate "/destroy CONFIRM" (case-
+         * sensitive) actually wipes anything. Checked before the
+         * ctx.peer_ended check below, same as "/clear": the LOCAL half
+         * of a destroy must always succeed regardless of connection
+         * state. */
+        if (strcmp(line, "/destroy") == 0) {
+            ui_add_error(
+                "EMERGENCY DESTROY: type '/destroy CONFIRM' (exact, "
+                "case-sensitive) to IRREVERSIBLY wipe ALL chat history, "
+                "saved messages, and received files on BOTH this device "
+                "and the paired device. This cannot be undone.");
+            continue;
+        }
+
+        if (strcmp(line, "/destroy CONFIRM") == 0) {
+            session_perform_local_destroy();
+            ui_add_error("EMERGENCY DESTROY: all local chat data wiped.");
+
+            /* Notify the peer so both devices end up wiped, not just
+             * this one - queue it (see OUTBOX_DESTROY_SENTINEL) rather
+             * than lose the intent if the peer isn't reachable right
+             * now, exactly like a queued TEXT_MESSAGE already does. */
+            if (ctx.peer_ended ||
+                    session_send(&ctx, SL_MSG_DESTROY, NULL, 0, NULL) != 0) {
+                if (outbox_enqueue(OUTBOX_DESTROY_SENTINEL) == 0) {
+                    ui_add_error(
+                        "EMERGENCY DESTROY: peer unreachable right now - "
+                        "the wipe command is queued and will be "
+                        "delivered automatically once reconnected.");
+                } else {
+                    /* See ui.c's matching idle-thread comment - the
+                     * outbound queue being full is exceedingly rare, but
+                     * this must never silently fail to queue. */
+                    ui_add_error(
+                        "EMERGENCY DESTROY: peer unreachable AND the "
+                        "outbound queue is full - peer notification "
+                        "could NOT be queued. Run '/destroy CONFIRM' "
+                        "again once reconnected to notify the peer.");
+                }
+                result = SESSION_DISCONNECTED;
+                break;
+            }
+
+            ui_add_error("EMERGENCY DESTROY: peer notified and wiped.");
             continue;
         }
 

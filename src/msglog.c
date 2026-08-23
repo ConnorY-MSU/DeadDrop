@@ -178,6 +178,48 @@ void msglog_clear_except_saved(void)
     rename(tmp_path, path);
 }
 
+void msglog_destroy_all(void)
+{
+    char path[512];
+    FILE *f;
+
+    if (msglog_file_path(path, sizeof(path)) != 0) {
+        return;
+    }
+
+    /* Best-effort overwrite before delete - see msglog.h's own comment
+     * on this function for the honest limitation (not a guaranteed
+     * secure erase on flash storage). "r+b" so this is a no-op (fopen
+     * fails, nothing to overwrite) if the log doesn't exist yet -
+     * matches every other function in this file treating "no log yet"
+     * as a normal, non-error state. */
+    f = fopen(path, "r+b");
+    if (f != NULL) {
+        long size;
+        if (fseek(f, 0, SEEK_END) == 0 && (size = ftell(f)) > 0) {
+            char zeros[4096];
+            long remaining = size;
+            memset(zeros, 0, sizeof(zeros));
+            fseek(f, 0, SEEK_SET);
+            while (remaining > 0) {
+                size_t chunk = (size_t)(remaining < (long)sizeof(zeros)
+                                             ? remaining
+                                             : (long)sizeof(zeros));
+                if (fwrite(zeros, 1, chunk, f) != chunk) {
+                    break; /* best-effort - a partial overwrite is still
+                        strictly better than none, keep going to the
+                        remove() below regardless */
+                }
+                remaining -= (long)chunk;
+            }
+            fflush(f);
+        }
+        fclose(f);
+    }
+
+    remove(path);
+}
+
 /* Read at most this many trailing bytes of the log file when looking
  * for recent lines - bounds memory use even if the log has grown very
  * large over a long deployment, at the cost of possibly missing lines

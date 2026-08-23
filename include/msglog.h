@@ -74,6 +74,29 @@ void msglog_append_saved(const char *who, const char *text);
 void msglog_clear_except_saved(void);
 
 /*
+ * msglog_destroy_all - the "/destroy CONFIRM" emergency-wipe command's
+ * log-side effect (see session.c's perform_local_destroy()). Genuinely
+ * different from msglog_clear_except_saved(): this ignores the SAVED
+ * marker entirely and removes EVERYTHING, no exceptions - /clear is a
+ * routine tidy-up that respects what was explicitly marked worth
+ * keeping, /destroy is a "get rid of all of it, now" panic action for
+ * a device-compromise/seizure scenario, and conflating the two would
+ * defeat the point of either. Best-effort overwrites the file's
+ * content with zeros before removing it - meaningfully better than a
+ * bare delete against a filesystem that might not otherwise scrub
+ * reused blocks, but HONEST, STATED LIMITATION: this is NOT a
+ * guaranteed secure erase on flash storage (the SD card this project
+ * targets) - flash wear-leveling can retain the original physical
+ * cells even after an application-level "overwrite," since the flash
+ * translation layer doesn't guarantee reusing the exact same cells.
+ * A true secure erase would need device-level support (e.g. an SD
+ * card's own ATA/SD secure-erase command) this project doesn't
+ * attempt to invoke. Documented here rather than glossed over, same
+ * discipline as this header's own plaintext-at-rest note above.
+ */
+void msglog_destroy_all(void);
+
+/*
  * msglog_load_recent - fill out_lines with up to max_lines of the most
  * RECENT entries from the log (oldest of the returned lines first,
  * matching natural reading order), each already formatted exactly as

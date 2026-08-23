@@ -1646,3 +1646,32 @@ Bravo replugged one final time; both devices reconnected; user confirmed both LE
 
 ### Summary
 Four real, physically-executed tests, two real bugs found and fixed as a direct result (the watchdog fix from earlier this session, and the `connect()` timeout fix found mid-series), every LED state in the redesigned scheme (solid green, solid red, flashing blue/green, flashing red/orange) confirmed by direct visual observation on real hardware, not just inferred from logs or code review. Detection latency observed: 8-27 seconds across three independent real disconnects, consistently within the intended design envelope (well under a minute, most of the time well under the 25s watchdog ceiling thanks to real-world network-layer failures being faster than the synthetic worst case).
+
+## Emergency destroy protocol - "/destroy CONFIRM" — 2026-08-23
+
+The user asked for one more security feature: a command, triggerable from EITHER paired device, that irreversibly wipes ALL chat history on BOTH devices - a genuine panic/duress feature for a device-compromise-or-seizure scenario, deliberately more drastic than the existing `/clear` (which respects `/save`'d messages; `/destroy` does not, on purpose - see `msglog.h`'s comment on why conflating the two would defeat the point of either).
+
+### Design
+- **New wire message type**: `SL_MSG_DESTROY = 0x07` (`message.h`, and - critically, learned from the ACK/FILE addition earlier this project - added to `message.c`'s parse-time whitelist switch, or it would be silently rejected). No body needed: it rides an already mutually-authenticated (mTLS), replay-protected (per-message HMAC + strictly-increasing `seq_num`) session, so its mere valid arrival already proves it came from the legitimate paired device. Documented in `docs/PROTOCOL.md`.
+- **Confirmation gate**: `/destroy` alone shows a stark warning and does nothing destructive; only the EXACT, case-sensitive `/destroy CONFIRM` actually wipes anything - specifically so an accidental Enter-press on a half-typed command can never trigger this.
+- **What gets wiped**, in order (`session_perform_local_destroy()`, exported via `session.h` so both `session.c`'s connected-path handler AND `ui.c`'s offline idle-thread handler can call the identical logic): the persisted message log in full (`msglog_destroy_all()` - a real overwrite-with-zeros before delete, with an honestly-documented limitation that this is not a guaranteed secure erase on flash/SD storage due to wear-leveling), the live on-screen scrollback (`ui_destroy_history()` - no replay afterward, a genuinely blank slate), and any locally-saved received files (`wipe_directory_contents()` on `~/.securelink/received/`).
+- **Reaches the peer even if offline right now**: if the peer isn't reachable at the moment `/destroy CONFIRM` is issued, this device still wipes its own state immediately and queues `SL_MSG_DESTROY` via a sentinel string (`OUTBOX_DESTROY_SENTINEL`, an ASCII-SOH-wrapped marker no real keystroke could ever produce, so a legitimate message could never be mistaken for it) - reusing the exact same offline-outbox mechanism `TEXT_MESSAGE` already has, drained automatically the next time either side connects. Works both from an active session and fully offline (`ui.c`'s idle-input thread), matching `/clear`'s existing precedent that a security-motivated command shouldn't require a live connection.
+- **Receiving `SL_MSG_DESTROY`** performs the identical local wipe and shows "the peer remotely wiped all chat data on this device" - no additional confirmation needed on the receiving end, for the authentication reason above.
+
+### Verified end-to-end on real hardware, with a rigorous forensic check afterward
+Rather than a manual keyboard test, this was automated for repeatability: a corrected synthetic-keyboard tool (`build/synth_type.c`, throwaway, deleted after use) - built using the CORRECT letter-keycode table found and fixed earlier this project (real `KEY_*` symbolic constants, not `KEY_A + (letter-'A')` arithmetic, which is wrong because Linux's keycode layout follows physical keyboard rows, not the alphabet) - sent 12 distinct, uniquely-identifiable test messages (`TESTMSG-number-N-secret`) plus one control message from `bravo` to `alpha`. First confirmed the fixed tool types cleanly with zero garbling (a real, previously-recurring problem throughout this project, now confirmed genuinely fixed). All 13 messages confirmed correctly received on `alpha`'s console and persisted to `msglog.txt` on **both** devices (13/13 each) before proceeding - a real, verified "before" baseline, not assumed.
+
+`/destroy CONFIRM` then sent from `bravo` via the same tool. Both consoles immediately showed the correct, distinct confirmation text (`bravo`: "all local chat data wiped" + "peer notified and wiped"; `alpha`: "the peer remotely wiped all chat data on this device") with **zero visible message content** on either screen.
+
+**Full forensic sweep on both devices afterward, not just a screen glance**:
+- `~/.securelink/message_log.txt` - does not exist on either device (confirmed via `ls`, not just "the app said so").
+- `~/.securelink/` - completely empty on both (just `.`/`..`).
+- `grep -r "TESTMSG" ~/.securelink/` - zero hits on both.
+- No `.tmp` files left behind by the destroy process on either device.
+- `~/.bash_history` on both devices - zero `TESTMSG` hits, confirming the test's OWN methodology (all commands run non-interactively over SSH) left no trace of its own either - a real consideration for a "no trace" claim, not just checking the app's behavior in isolation.
+- `journalctl` on both services - zero `TESTMSG` hits (expected: `StandardError=tty` means this app's output never reaches the journal at all, checked directly rather than assumed).
+
+Both services confirmed `active` and still fully functional (`Connected to <peer>`) after the test - the destroy correctly ends with a clean, working, empty session, not a broken one. Test tooling deleted from both devices afterward.
+
+### Full regression check
+`test_message` rebuilt (message.c changed) and the full 5-binary suite re-run - **5/5 pass**, zero regressions from adding the new message type.
