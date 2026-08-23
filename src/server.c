@@ -506,8 +506,60 @@ int main(int argc, char *argv[])
 
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(SERVER_PORT);
+
+    /* REAL SECURITY FINDING, FIXED (2026-08-23 security audit): this
+     * used to be a flat INADDR_ANY bind - the mTLS listener was
+     * reachable from ANY network this device happened to be
+     * connected to (the local WiFi AP, a shared/managed property-wide
+     * network with dozens of other tenants, etc.), not just the
+     * tailnet docs/tailscale-acl.json's own ACL was written to scope
+     * traffic to. mTLS still rejected an unauthenticated peer, but the
+     * ACL's actual job - restricting which network paths can even
+     * ATTEMPT a handshake - was silently bypassed for anyone who could
+     * reach the device's LAN IP directly, which on a shared/managed
+     * network can be a lot of people. Fixed by binding to the
+     * Tailscale IP specifically (keyshare.c's own listener already
+     * does exactly this, for the same reason - see
+     * keyshare_get_own_tailscale_ip()'s comment). Deliberately
+     * fail-closed, not fail-open: if the Tailscale IP can't be
+     * determined, refuse to start rather than silently falling back
+     * to an unscoped INADDR_ANY bind - by this point
+     * keyshare_reconstruct() has already succeeded, which itself
+     * required a working Tailscale connection moments earlier in this
+     * same startup, so this realistically never fails; on the rare
+     * chance it does, a loud refusal-to-start is the correct response
+     * for a security-relevant network binding, not a silent, less-
+     * secure fallback. Windows dev-machine builds keep INADDR_ANY
+     * unconditionally - keyshare_get_own_tailscale_ip() always
+     * returns -1 there (no Tailscale plumbing - see keyshare.c's own
+     * non-Linux stub comment), and dev-machine testing already uses
+     * a plain -k PEM file over loopback instead of this whole scheme,
+     * so there's nothing to scope to. */
+#ifdef __linux__
+    {
+        char ts_ip[64];
+        if (keyshare_get_own_tailscale_ip(ts_ip, sizeof(ts_ip)) != 0) {
+            ui_add_error("Could not determine this device's Tailscale IP - "
+                "refusing to start rather than bind an unscoped listener "
+                "(see server.c's bind() comment).");
+            CLOSE_SOCKET(listen_sock);
+            wolfSSL_CTX_free(ctx);
+            wolfSSL_Cleanup();
+            return 1;
+        }
+        if (inet_pton(AF_INET, ts_ip, &server_addr.sin_addr) != 1) {
+            ui_add_errorf("Tailscale IP '%s' failed to parse - refusing to "
+                "start.", ts_ip);
+            CLOSE_SOCKET(listen_sock);
+            wolfSSL_CTX_free(ctx);
+            wolfSSL_Cleanup();
+            return 1;
+        }
+    }
+#else
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+#endif
 
     rc = bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (rc == SOCKET_ERR_RET) {

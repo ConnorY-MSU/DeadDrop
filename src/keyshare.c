@@ -362,6 +362,11 @@ void keyshare_stop_listener(void)
     g_listener_running = 0;
 }
 
+int keyshare_get_own_tailscale_ip(char *out_ip, size_t out_ip_size)
+{
+    return get_own_tailscale_ip(out_ip, out_ip_size);
+}
+
 /* --- Fetching this device's own remote_share from the peer --- */
 
 static int fetch_remote_share(const char *peer_ip, int peer_port,
@@ -470,6 +475,13 @@ int keyshare_reconstruct(const char *local_share_path,
 
 void keyshare_stop_listener(void)
 {
+}
+
+int keyshare_get_own_tailscale_ip(char *out_ip, size_t out_ip_size)
+{
+    (void)out_ip;
+    (void)out_ip_size;
+    return -1;
 }
 
 #endif /* __linux__ */

@@ -134,4 +134,35 @@ long keyshare_decrypt_private_key(const char *encrypted_key_path,
                                    const uint8_t key[KEYSHARE_LEN],
                                    uint8_t *out_buf, size_t out_buf_size);
 
+/*
+ * keyshare_get_own_tailscale_ip - `tailscale ip -4`, trimmed. Exposes
+ * the same lookup this file's own share-listener already uses to bind
+ * itself to the Tailscale interface specifically, never INADDR_ANY
+ * (see that call site's own comment for the full "why" - a socket
+ * bound only to the Tailscale IP is unreachable from anywhere except
+ * the tailnet, structurally, regardless of what firewall rules do or
+ * don't exist).
+ *
+ * REAL SECURITY FINDING (2026-08-23, security audit): server.c's main
+ * mTLS listener never got this same treatment - it bound INADDR_ANY,
+ * meaning it was reachable from ANY network the device happened to be
+ * connected to (the local WiFi AP, a property-wide managed network
+ * with dozens of other tenants, etc.), not just the tailnet the
+ * project's own ACL (docs/tailscale-acl.json) was written to scope
+ * traffic to. mTLS still rejected an unauthenticated connection, but
+ * the ACL's entire point - restricting which network paths can even
+ * ATTEMPT a handshake in the first place - was silently bypassed by
+ * anyone able to reach the device's LAN IP directly. This function
+ * lets server.c bind to the Tailscale IP the same way keyshare.c
+ * already does, so the ACL's protection is real rather than
+ * decorative. Safe to call at server.c's own bind() point: by then,
+ * keyshare_reconstruct() has already succeeded, which itself required
+ * a working Tailscale connection to fetch the remote share - so
+ * Tailscale is confirmed up well before this is ever called.
+ *
+ * Returns 0 and fills out_ip on success, -1 on any failure (tailscale
+ * not running, not authenticated, etc. - out_ip is left untouched).
+ */
+int keyshare_get_own_tailscale_ip(char *out_ip, size_t out_ip_size);
+
 #endif /* KEYSHARE_H */
