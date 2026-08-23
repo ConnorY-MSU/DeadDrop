@@ -92,12 +92,27 @@ static int run_nmcli(char *const argv[], char *out_buf, size_t out_buf_size)
     return WEXITSTATUS(status);
 }
 
+/* A real 802.11 scan has to dwell on every channel it probes - both
+ * bands, ~11+ channels on 2.4GHz alone plus a much longer 5GHz channel
+ * list (see this project's own real scan results: 11 distinct
+ * frequencies just for two SSIDs at one property) - which genuinely
+ * takes multiple seconds to cover, not a single instant read. `nmcli
+ * device wifi rescan` itself only REQUESTS a scan and returns
+ * immediately, asynchronously, well before it's actually finished -
+ * see wifi_scan()'s own comment for the real-world consequence found
+ * this same night (a network genuinely in range not showing up in the
+ * results) and why this wait exists at all instead of being
+ * "obviously" pointless. */
+#define WIFI_SCAN_SETTLE_SECONDS 4
+
 int wifi_scan(wifi_network *out_networks, int max_results)
 {
     char buf[8192];
     char *line;
     char *saveptr = NULL;
     int count = 0;
+    char *rescan_argv[] = { (char *)"nmcli", (char *)"device", (char *)"wifi",
+                              (char *)"rescan", NULL };
     char *argv[] = { (char *)"nmcli", (char *)"-t", (char *)"-f",
                       (char *)"SSID,SECURITY", (char *)"device",
                       (char *)"wifi", (char *)"list", NULL };
@@ -105,6 +120,26 @@ int wifi_scan(wifi_network *out_networks, int max_results)
     if (out_networks == NULL || max_results <= 0) {
         return -1;
     }
+
+    /* REAL BUG FOUND AND FIXED (2026-08-23): this used to go straight
+     * to `nmcli device wifi list` with no rescan of its own - just
+     * reading whatever NetworkManager already had cached, which can be
+     * stale or incomplete (a scan that happened a while ago, was
+     * throttled, or never covered every channel yet) rather than a
+     * genuine, current picture of every network actually in range.
+     * Confirmed directly on real hardware: a network confirmed
+     * physically in range didn't always show up in a single
+     * uncoerced `list` call. Forcing a real rescan and giving it a
+     * few real seconds to actually finish (see
+     * WIFI_SCAN_SETTLE_SECONDS's own comment) before reading results
+     * makes every Ctrl+W scan genuinely current instead of trusting
+     * however fresh nmcli's last cache happened to be. Best-effort -
+     * if the rescan request itself fails (e.g. NetworkManager
+     * throttling an immediately-repeated one), fall straight through
+     * to reading whatever's cached anyway, exactly as this always
+     * did, rather than aborting the whole scan over it. */
+    run_nmcli(rescan_argv, NULL, 0);
+    sleep(WIFI_SCAN_SETTLE_SECONDS);
 
     if (run_nmcli(argv, buf, sizeof(buf)) < 0) {
         return -1;
@@ -193,7 +228,36 @@ int wifi_connect(const char *ssid, const char *password,
      * other elevated call this project makes - never an interactive
      * password prompt) resolves it: confirmed live, the identical
      * command succeeded immediately (well under 10 seconds, full
-     * association + DHCP) the moment it ran as uid=0 instead of 1000. */
+     * association + DHCP) the moment it ran as uid=0 instead of 1000.
+     *
+     * SECOND REAL BUG FOUND THE SAME NIGHT, once the first one stopped
+     * masking it: a quick retry (Ctrl+W again shortly after a failed
+     * attempt - a real, expected user reaction, not an edge case) can
+     * fail with `reason="Failed to determine AP security information"`
+     * even for an SSID that scanned fine moments earlier - confirmed
+     * live via journalctl -u NetworkManager. NetworkManager throttles
+     * how often `nmcli device wifi list` actually re-scans the radio
+     * (an implicit scan on every call would be wasteful/slow), so a
+     * retry soon enough after a failed association can hit a stale or
+     * momentarily-invalidated cache entry for that specific SSID -
+     * nmcli then can't determine what security type to build the new
+     * connection profile with at all, and fails outright rather than
+     * guessing. An explicit, forced rescan immediately before
+     * connecting (best-effort - if it fails or nmcli throttles it
+     * anyway, fall straight through to the connect attempt exactly as
+     * before rather than aborting early) makes the immediately-prior
+     * scan genuinely fresh right when it matters most, rather than
+     * trusting whatever nmcli happened to have cached from the
+     * original Ctrl+W scan a failed attempt (and possibly a real
+     * pause while the user typed a password) ago. */
+    {
+        char *rescan_argv[] = { (char *)"nmcli", (char *)"device", (char *)"wifi",
+                                  (char *)"rescan", NULL };
+        run_nmcli(rescan_argv, NULL, 0); /* best-effort - ignore rc */
+        sleep(2); /* give the radio a moment to actually complete the
+                     scan before the connect attempt below reads it */
+    }
+
     if (password != NULL && password[0] != '\0') {
         char *argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
                           (char *)"wifi", (char *)"connect", (char *)ssid,
