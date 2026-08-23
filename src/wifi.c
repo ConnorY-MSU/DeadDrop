@@ -111,8 +111,8 @@ int wifi_scan(wifi_network *out_networks, int max_results)
     char *line;
     char *saveptr = NULL;
     int count = 0;
-    char *rescan_argv[] = { (char *)"nmcli", (char *)"device", (char *)"wifi",
-                              (char *)"rescan", NULL };
+    char *rescan_argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
+                              (char *)"wifi", (char *)"rescan", NULL };
     char *argv[] = { (char *)"nmcli", (char *)"-t", (char *)"-f",
                       (char *)"SSID,SECURITY", (char *)"device",
                       (char *)"wifi", (char *)"list", NULL };
@@ -137,7 +137,27 @@ int wifi_scan(wifi_network *out_networks, int max_results)
      * if the rescan request itself fails (e.g. NetworkManager
      * throttling an immediately-repeated one), fall straight through
      * to reading whatever's cached anyway, exactly as this always
-     * did, rather than aborting the whole scan over it. */
+     * did, rather than aborting the whole scan over it.
+     *
+     * SECOND REAL BUG, found immediately after deploying the above:
+     * `nmcli device wifi rescan` ALSO requires the same elevated
+     * NetworkManager privilege `wifi_connect()` needed fixed earlier
+     * tonight - confirmed directly, unprivileged, on real hardware:
+     * `Error: org.freedesktop.NetworkManager.wifi.scan request failed:
+     * not authorized.` Without `sudo` here too, this call was silently
+     * failing on every single invocation (best-effort design silently
+     * swallowed the error, exactly as intended for THROTTLING, but
+     * this wasn't throttling - it never worked at all as this
+     * unprivileged user) - meaning every Ctrl+W scan was actually
+     * still just reading whatever NetworkManager happened to have
+     * cached already, the exact bug this rescan was supposed to fix,
+     * completely undetected until live testing showed only the
+     * currently-associated SSID appearing in the results (real
+     * networks confirmed in range never showed up until something
+     * ELSE - a successful sudo'd connect() call, which happens to
+     * refresh NetworkManager's scan state as a side effect - forced a
+     * cache refresh). `wifi_connect()`'s own equivalent rescan call
+     * below has the identical fix for the identical reason. */
     run_nmcli(rescan_argv, NULL, 0);
     sleep(WIFI_SCAN_SETTLE_SECONDS);
 
@@ -249,10 +269,17 @@ int wifi_connect(const char *ssid, const char *password,
      * scan genuinely fresh right when it matters most, rather than
      * trusting whatever nmcli happened to have cached from the
      * original Ctrl+W scan a failed attempt (and possibly a real
-     * pause while the user typed a password) ago. */
+     * pause while the user typed a password) ago.
+     *
+     * Needs `sudo` too - `nmcli device wifi rescan` requires the same
+     * elevated NetworkManager privilege as the connect call below;
+     * confirmed live (`... not authorized.` unprivileged) the same
+     * night this was first written without it - see wifi_scan()'s own
+     * matching rescan call for the full story of how that got missed
+     * here originally. */
     {
-        char *rescan_argv[] = { (char *)"nmcli", (char *)"device", (char *)"wifi",
-                                  (char *)"rescan", NULL };
+        char *rescan_argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
+                                  (char *)"wifi", (char *)"rescan", NULL };
         run_nmcli(rescan_argv, NULL, 0); /* best-effort - ignore rc */
         sleep(2); /* give the radio a moment to actually complete the
                      scan before the connect attempt below reads it */
