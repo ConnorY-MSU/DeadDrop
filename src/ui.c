@@ -540,6 +540,39 @@ static void draw_locked_overlay_locked(void)
 #define HISTORY_VIEWPORT_TOP_ROW 2
 #define HISTORY_VIEWPORT_LEFT_COL 1
 
+/* How many physical pad rows a line of `display_width` characters
+ * consumes once written to a `window_width`-column-wide window,
+ * starting at column 0 - ncurses wraps a wprintw() write at the
+ * window's right edge by default, so a single LOGICAL line (one
+ * history_total_lines increment - see this file's touch block comment)
+ * can occupy MORE than one physical pad row once its length exceeds the
+ * window width. Every site that increments history_total_lines must go
+ * through this rather than a flat +1, or the count silently drifts out
+ * of sync with the pad's real rows.
+ *
+ * REAL BUG FOUND (2026-08-22): every increment site originally used a
+ * flat +1 regardless of length - harmless for short lines, but this
+ * project's own session-start hint ("Type a message...") alone is
+ * ~240 characters, well over one 98-column row. Found via an
+ * out-of-box reset test: bravo's screen had scrolled the quick-help
+ * guide off-screen despite having nowhere near a viewport's worth of
+ * genuinely separate lines - the undercount made history_total_lines
+ * think less content had been written than the pad had actually
+ * consumed, throwing off where "live" (the bottom of the viewport)
+ * actually was. */
+static int wrapped_row_count(int display_width, int window_width)
+{
+    int rows;
+    if (window_width < 1) {
+        window_width = 1;
+    }
+    if (display_width < 1) {
+        return 1;
+    }
+    rows = (display_width + window_width - 1) / window_width;
+    return rows < 1 ? 1 : rows;
+}
+
 /* Must be called with ui_mutex held, and only while NOT locked (the
  * lock overlay owns the screen instead - see draw_locked_overlay_locked()).
  * This is the pad equivalent of every old direct wrefresh(history_win)
@@ -758,15 +791,19 @@ static void replay_msglog_into_pad_locked(void)
                                  (int)(sizeof(recent) / sizeof(recent[0])));
     if (n > 0) {
         int i;
+        int width = getmaxx(history_win);
         wattron(history_win, COLOR_PAIR(CP_SYSTEM));
         wprintw(history_win, "--- previous session history ---\n");
-        history_total_lines++;
+        history_total_lines += wrapped_row_count(
+            (int)strlen("--- previous session history ---"), width);
         for (i = 0; i < n; i++) {
             wprintw(history_win, "%s\n", recent[i]);
-            history_total_lines++;
+            history_total_lines += wrapped_row_count(
+                (int)strlen(recent[i]), width);
         }
         wprintw(history_win, "--- end of previous history ---\n");
-        history_total_lines++;
+        history_total_lines += wrapped_row_count(
+            (int)strlen("--- end of previous history ---"), width);
         wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
     }
 }
@@ -1017,7 +1054,18 @@ void ui_add_history(const char *prefix, const char *text)
             wprintw(history_win, "%s\n", text != NULL ? text : "");
         }
         wattroff(history_win, COLOR_PAIR(cp));
-        history_total_lines++;
+
+        /* See wrapped_row_count()'s comment - this line's TOTAL display
+         * width (timestamp + optional "prefix: " + text) is what
+         * actually determines how many physical pad rows it consumed,
+         * not a flat 1. */
+        {
+            size_t total_width = strlen(ts_buf) +
+                (prefix != NULL ? strlen(prefix) + 2 : 0) +
+                strlen(text != NULL ? text : "");
+            history_total_lines += wrapped_row_count(
+                (int)total_width, getmaxx(history_win));
+        }
     }
     /* Always write into history_win's pad (above), regardless of lock
      * or scroll state - see this file's lock-screen block comment's
@@ -1500,16 +1548,24 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                      * since handle_tap_locked()'s WIFI_SELECT branch
                      * reads history_view_line at TAP time, not a cached
                      * value from when the list was drawn. */
-                    wifi_list_header_row = history_total_lines;
-                    wprintw(history_win,
-                            "WiFi networks found (Ctrl+W to cancel):\n");
-                    history_total_lines++;
-                    for (i = 0; i < wifi_scan_count; i++) {
-                        wprintw(history_win, "  %d) %s%s\n", i + 1,
-                                wifi_scan_results[i].ssid,
-                                wifi_scan_results[i].secured
-                                    ? " (secured)" : " (open)");
-                        history_total_lines++;
+                    {
+                        int wifi_width = getmaxx(history_win);
+                        const char *header_text =
+                            "WiFi networks found (Ctrl+W to cancel):";
+                        wifi_list_header_row = history_total_lines;
+                        wprintw(history_win, "%s\n", header_text);
+                        history_total_lines += wrapped_row_count(
+                            (int)strlen(header_text), wifi_width);
+                        for (i = 0; i < wifi_scan_count; i++) {
+                            char entry[128];
+                            snprintf(entry, sizeof(entry), "  %d) %s%s",
+                                     i + 1, wifi_scan_results[i].ssid,
+                                     wifi_scan_results[i].secured
+                                         ? " (secured)" : " (open)");
+                            wprintw(history_win, "%s\n", entry);
+                            history_total_lines += wrapped_row_count(
+                                (int)strlen(entry), wifi_width);
+                        }
                     }
                     history_following = 1;
                     refresh_history_viewport_locked();
