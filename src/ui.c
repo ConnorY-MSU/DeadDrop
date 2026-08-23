@@ -143,6 +143,22 @@ static int ui_active = 0;
                           window, this is a history line color), and
                           "red = something's wrong" is the same
                           intuitive meaning in both places. */
+#define CP_NODE_ALPHA 12 /* splash screen's "Twin Nodes" banner
+                          (2026-08-23, direct request) - the ALPHA
+                          box: green on black. Deliberately its own
+                          pair, not a reuse of CP_OWN_MSG (which also
+                          happens to be green) - that pair's color is
+                          about chat-message authorship and could
+                          reasonably change for that reason alone
+                          someday; coupling the splash screen's node
+                          coloring to it would be a surprising side
+                          effect of an unrelated future edit. */
+#define CP_NODE_BRAVO 13 /* same banner, the BRAVO box: yellow on
+                          black - deliberately different from ALPHA's
+                          green so the two named devices read as
+                          visually distinct at a glance, same
+                          reasoning as CP_NODE_ALPHA's own comment for
+                          why this isn't just a reuse of CP_PEER_MSG. */
 
 /* Deliberately smaller than SL_MAX_BODY_LEN (message.h's 64 KiB
  * protocol cap) - this bounds one INTERACTIVELY TYPED line through a
@@ -486,7 +502,47 @@ static void ui_draw_centered(WINDOW *win, int row, int col, int width,
  * touchscreen is attached at all (touch_open() failing) - same
  * "hardware absence is never fatal" discipline as every other touch-
  * dependent code path in this project. */
-static void show_splash(void)
+/* Shared tail for every show_splash() layout below: wait for a
+ * dismissal tap (bounded - see SPLASH_MAX_WAIT_MS's own comment) or
+ * fall back to a fixed delay with no touchscreen at all, then clear
+ * the screen. Factored out so the "Twin Nodes" layout and the
+ * narrow-terminal fallback below don't have to duplicate it. */
+static void splash_wait_for_dismiss_and_clear(void)
+{
+    int splash_touch_fd = touch_open();
+    if (splash_touch_fd >= 0) {
+        int waited_ms = 0;
+        for (;;) {
+            touch_point pt;
+            int rc = touch_read_tap(splash_touch_fd, &pt, 200);
+            if (rc == 1) {
+                break; /* tapped - dismiss now */
+            }
+            if (rc < 0) {
+                break; /* device error/gone mid-wait - don't hang on it */
+            }
+            waited_ms += 200;
+            if (waited_ms >= SPLASH_MAX_WAIT_MS) {
+                break; /* nobody tapped - proceed unattended */
+            }
+        }
+        touch_close(splash_touch_fd);
+    } else {
+        napms(1200); /* no touchscreen at all - original fixed delay */
+    }
+
+    clear();
+    refresh();
+}
+
+/* Original single-box splash, kept as the fallback for any console
+ * narrower than TWIN_BLOCK_WIDTH needs (see show_splash()'s own
+ * comment) - both real devices are confirmed wide enough for the Twin
+ * Nodes design as of 2026-08-23, but this project's "hardware absence
+ * is never fatal" discipline means a hypothetical future narrower
+ * device still gets a working, legible splash rather than a silently
+ * garbled one. */
+static void show_splash_simple(void)
 {
     int box_width = 56;
     int col, row;
@@ -550,33 +606,149 @@ static void show_splash(void)
     }
 
     refresh();
+    splash_wait_for_dismiss_and_clear();
+}
 
-    {
-        int splash_touch_fd = touch_open();
-        if (splash_touch_fd >= 0) {
-            int waited_ms = 0;
-            for (;;) {
-                touch_point pt;
-                int rc = touch_read_tap(splash_touch_fd, &pt, 200);
-                if (rc == 1) {
-                    break; /* tapped - dismiss now */
-                }
-                if (rc < 0) {
-                    break; /* device error/gone mid-wait - don't hang on it */
-                }
-                waited_ms += 200;
-                if (waited_ms >= SPLASH_MAX_WAIT_MS) {
-                    break; /* nobody tapped - proceed unattended */
-                }
-            }
-            touch_close(splash_touch_fd);
-        } else {
-            napms(1200); /* no touchscreen at all - original fixed delay */
-        }
+/* "Twin Nodes" banner width, fixed rather than reflowed - both named
+ * device boxes and the connector between them are pre-built strings
+ * (see show_splash() below), not something ui_draw_centered()'s
+ * generic single-box padding logic can stretch to fit an arbitrary
+ * width the way the old design could. TWIN_NODE_BOX_WIDTH matches
+ * "+------------+"/"|   ALPHA    |" exactly (14 chars);
+ * TWIN_CONNECTOR_WIDTH matches "========== L I N K E D ===========\"
+ * exactly (34 chars) - both verified programmatically (awk, exact
+ * per-line character counts), not by hand-counting, same discipline
+ * as docs/splash-banner-options-v2.md's own verification. */
+#define TWIN_NODE_BOX_WIDTH 14
+#define TWIN_CONNECTOR_WIDTH 34
+#define TWIN_BLOCK_WIDTH (TWIN_NODE_BOX_WIDTH * 2 + TWIN_CONNECTOR_WIDTH)
+
+static void show_splash(void)
+{
+    /* "Twin Nodes" design (2026-08-23, direct request): the two named,
+     * paired devices shown literally, linked, in distinct colors -
+     * picked from docs/splash-banner-options-v2.md's Option F. Along
+     * with the request came a real question worth answering with data,
+     * not assumption: is bravo's smaller 66x20 console (found earlier
+     * this session, see TESTING.md's DSI resolution investigation)
+     * still true, or was it the "DSI auto-detection flakiness" that
+     * investigation already flagged as the more likely explanation?
+     * Checked directly on both real devices before building this at
+     * all: `stty -F /dev/tty1 size` now reports 30 100 (30 rows, 100
+     * cols) and `fbset` reports a genuine 1280x720 framebuffer on
+     * BOTH alpha and bravo - confirming it really was boot-time
+     * flakiness, not a permanent hardware difference; it resolved
+     * itself across this session's several real reboots. This design
+     * makes real use of that width rather than staying conservative
+     * for a constraint that no longer applies to either real device -
+     * TWIN_BLOCK_WIDTH (62) comfortably clears COLS-2 (98) on both
+     * with real margin to spare, but still falls back to the original
+     * simple design below if a narrower console ever does show up
+     * (see show_splash_simple()'s own comment). */
+    int col, row;
+    const char *alpha_box_border = "+------------+";
+    const char *alpha_box_mid    = "|   ALPHA    |";
+    const char *connector        = "========== L I N K E D ===========";
+    const char *bravo_box_border = "+------------+";
+    const char *bravo_box_mid    = "|   BRAVO    |";
+    const char *title            = "S E C U R E L I N K";
+    const char *subtitle         = "[ ENCRYPTED FIELD TERMINAL ]";
+    const char *dismiss_hint     = "( tap screen to continue )";
+    int bravo_col;
+
+    if (COLS - 2 < TWIN_BLOCK_WIDTH) {
+        show_splash_simple();
+        return;
+    }
+
+    col = (COLS - TWIN_BLOCK_WIDTH) / 2;
+    bravo_col = col + TWIN_NODE_BOX_WIDTH + TWIN_CONNECTOR_WIDTH;
+    /* 12 rows tall (box x3 + 2 blank + title + 2 blank + subtitle + 2
+     * blank + hint) - centered the same way the old 7-row layout was
+     * (row = LINES/2 - roughly-half-the-block), just scaled for the
+     * new height. */
+    row = LINES / 2 - 6;
+    if (row < 0) {
+        row = 0;
     }
 
     clear();
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_NODE_ALPHA));
+    }
+    mvprintw(row, col, "%s", alpha_box_border);
+    mvprintw(row + 1, col, "%s", alpha_box_mid);
+    mvprintw(row + 2, col, "%s", alpha_box_border);
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_NODE_ALPHA));
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_ACCENT));
+    }
+    mvprintw(row + 1, col + TWIN_NODE_BOX_WIDTH, "%s", connector);
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_ACCENT));
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_NODE_BRAVO));
+    }
+    mvprintw(row, bravo_col, "%s", bravo_box_border);
+    mvprintw(row + 1, bravo_col, "%s", bravo_box_mid);
+    mvprintw(row + 2, bravo_col, "%s", bravo_box_border);
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_NODE_BRAVO));
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_BANNER));
+    }
+    {
+        int len = (int)strlen(title);
+        int c = col + (TWIN_BLOCK_WIDTH - len) / 2;
+        if (c < col) {
+            c = col;
+        }
+        mvprintw(row + 5, c, "%s", title);
+    }
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_BANNER));
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_ACCENT));
+    }
+    {
+        int len = (int)strlen(subtitle);
+        int c = col + (TWIN_BLOCK_WIDTH - len) / 2;
+        if (c < col) {
+            c = col;
+        }
+        mvprintw(row + 8, c, "%s", subtitle);
+    }
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_ACCENT));
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_SYSTEM));
+    }
+    {
+        int len = (int)strlen(dismiss_hint);
+        int c = col + (TWIN_BLOCK_WIDTH - len) / 2;
+        if (c < col) {
+            c = col;
+        }
+        mvprintw(row + 11, c, "%s", dismiss_hint);
+    }
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_SYSTEM));
+    }
+
     refresh();
+    splash_wait_for_dismiss_and_clear();
 }
 
 /* Must be called with ui_mutex held. Draws into lock_overlay_win - a
@@ -976,6 +1148,8 @@ void ui_init(const char *peer_label)
         init_pair(CP_ACCENT, COLOR_CYAN, COLOR_BLACK);
         init_pair(CP_TIMESTAMP, COLOR_BLUE, COLOR_BLACK);
         init_pair(CP_ERROR, COLOR_RED, COLOR_BLACK);
+        init_pair(CP_NODE_ALPHA, COLOR_GREEN, COLOR_BLACK);
+        init_pair(CP_NODE_BRAVO, COLOR_YELLOW, COLOR_BLACK);
     }
 
     /* Boot splash - see its own comment above for why this is safe to
