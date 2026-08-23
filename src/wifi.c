@@ -191,6 +191,68 @@ int wifi_has_connectivity(void)
     return strstr(output, "full") != NULL;
 }
 
+int wifi_get_link_info(wifi_link_info *out_info)
+{
+    char buf[4096];
+    char *line;
+    char *saveptr = NULL;
+    char *argv[] = { (char *)"nmcli", (char *)"-t", (char *)"-f",
+                      (char *)"active,ssid,signal,rate", (char *)"device",
+                      (char *)"wifi", (char *)"list", NULL };
+
+    if (out_info == NULL) {
+        return -1;
+    }
+    out_info->ssid[0] = '\0';
+    out_info->signal_percent = -1;
+    out_info->rate[0] = '\0';
+
+    if (run_nmcli(argv, buf, sizeof(buf)) < 0) {
+        return -1;
+    }
+
+    line = strtok_r(buf, "\n", &saveptr);
+    while (line != NULL) {
+        /* Only the "active:...(yes)" row (there's at most one) is the
+         * one we want - every other row is a different visible AP for
+         * the same or a different SSID, not this device's own link. */
+        if (strncmp(line, "yes:", 4) == 0) {
+            /* Same escaped-colon-aware SSID parsing as wifi_scan() -
+             * an SSID can legitimately contain a literal ':', escaped
+             * as '\:' in nmcli's terse output. */
+            char *p = line + 4;
+            size_t si = 0;
+
+            while (*p != '\0' && si < sizeof(out_info->ssid) - 1) {
+                if (p[0] == '\\' && p[1] == ':') {
+                    out_info->ssid[si++] = ':';
+                    p += 2;
+                } else if (*p == ':') {
+                    p++; /* now at the start of "signal:rate" */
+                    break;
+                } else {
+                    out_info->ssid[si++] = *p++;
+                }
+            }
+            out_info->ssid[si] = '\0';
+
+            out_info->signal_percent = atoi(p);
+            {
+                char *rate_start = strchr(p, ':');
+                if (rate_start != NULL) {
+                    rate_start++;
+                    snprintf(out_info->rate, sizeof(out_info->rate), "%s",
+                              rate_start);
+                }
+            }
+            return 0;
+        }
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    return -1; /* no active WiFi connection right now */
+}
+
 #else /* !__linux__ */
 
 /* This project's Windows dev machine has no NetworkManager/nmcli, and
@@ -221,6 +283,16 @@ int wifi_has_connectivity(void)
 {
     return 1; /* assume yes - this path is never actually exercised
                * (no WiFi setup screen exists on non-Linux, see ui.c) */
+}
+
+int wifi_get_link_info(wifi_link_info *out_info)
+{
+    if (out_info != NULL) {
+        out_info->ssid[0] = '\0';
+        out_info->signal_percent = -1;
+        out_info->rate[0] = '\0';
+    }
+    return -1; /* no OLED/WiFi metrics display exists on non-Linux */
 }
 
 #endif /* __linux__ */

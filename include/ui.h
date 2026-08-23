@@ -198,4 +198,63 @@ void ui_stop_idle_input(void);
 void ui_start_touch(void);
 void ui_stop_touch(void);
 
+/*
+ * MESSAGE-PENDING LED FLASH - user-requested, added on top of the
+ * "cyberpunk neon" styling pass. An unread incoming message flashes the
+ * FNK0100 case's RGB LEDs (a distinct magenta "alert" color, see
+ * hw_expansion.h's HW_STATUS_ALERT) until the touchscreen is tapped -
+ * ANY tap, in any mode, counts as acknowledgment, not just a tap
+ * specifically on the message. The flash toggle itself is driven by the
+ * existing touch thread's own ~200ms poll loop (see ui.c) rather than a
+ * dedicated thread - one more background timer piggy-backing on
+ * infrastructure that already exists and already runs for the whole
+ * process lifetime.
+ *
+ * ui_notify_message_pending() takes the hw_fd to flash directly (rather
+ * than ui.c needing a separate persistent setter for it) because a
+ * message can only ever arrive while genuinely connected -
+ * session.c's receiver thread, the only caller, only runs during an
+ * active session, and the hw_fd it already holds (ctx->hw_fd) is right
+ * there. See ui.c's touch-thread comment for the accepted edge case
+ * this implies for what color gets restored on acknowledgment.
+ *
+ * No-op on non-Linux (no case hardware exists there - see
+ * hw_expansion.h) and silently does nothing if hw_fd < 0 (no case
+ * hardware attached even on Linux) - safe to call unconditionally.
+ */
+void ui_notify_message_pending(int hw_fd);
+
+/*
+ * OLED BACKGROUND METRICS - also user-requested. Once given the OLED's
+ * fd, ui.c periodically (see ui.c for the exact interval) refreshes a
+ * small "network metrics" section on it - current WiFi SSID, signal
+ * strength, and link rate (see wifi.h's wifi_get_link_info()), plus a
+ * basic connectivity OK/DOWN indicator - BELOW whatever
+ * hw_oled_draw_text() calls session.c/client.c/server.c already make
+ * for the brief "new message" preview and role/status lines (see
+ * hw_oled.h's own line-numbering contract) - this never overwrites
+ * those, it only owns the lines below them.
+ *
+ * Call once, early in main(), right after hw_oled_open() - a one-time
+ * setter, not a per-call argument, since (unlike the message-flash fd
+ * above) the metrics refresh runs on its own timer, independent of any
+ * particular message or session event. fd may be -1 (no OLED present)
+ * - safe, matches hw_oled's own contract.
+ *
+ * No-op on non-Linux (no OLED exists there - see hw_oled.h).
+ */
+void ui_set_oled_fd(int fd);
+
+/*
+ * ui_report_rtt - report a fresh round-trip-time sample (milliseconds)
+ * to be shown on the OLED's background metrics section, alongside the
+ * WiFi SSID/signal/link-rate lines (see ui_set_oled_fd() above) - this
+ * is the actual peer-to-peer link quality (a PING/PONG round trip over
+ * the live mTLS session), distinct from WiFi signal strength (which is
+ * link quality to the access point, not to the paired device). Called
+ * by session.c roughly every 10s while a session is active - see
+ * SESSION_PING_INTERVAL_SECONDS in session.c. No-op on non-Linux.
+ */
+void ui_report_rtt(int rtt_ms);
+
 #endif /* UI_H */

@@ -59,4 +59,27 @@ int wifi_connect(const char *ssid, const char *password,
  */
 int wifi_has_connectivity(void);
 
+typedef struct {
+    char ssid[WIFI_SSID_MAX];
+    int signal_percent;  /* 0-100, or -1 if unknown */
+    char rate[32];        /* nmcli's own text, e.g. "195 Mbit/s" - kept
+                              as a string rather than parsed to a number,
+                              since it's link rate not a fixed unit
+                              (could be Mbit/s or Gbit/s) and this is
+                              only ever displayed, never computed on */
+} wifi_link_info;
+
+/*
+ * wifi_get_link_info - details of the CURRENTLY ACTIVE WiFi connection
+ * (the "active" marker on `nmcli device wifi list`'s own output - the
+ * same command wifi_scan() already uses, filtered differently), for the
+ * OLED's background metrics display (see ui.c). Fills out_info and
+ * returns 0 if there IS an active WiFi connection right now; returns -1
+ * (out_info's fields left blank) if there isn't one - e.g. this device
+ * is on Ethernet only, or genuinely offline. Real field format
+ * (`active:ssid:signal:rate`) confirmed against actual nmcli output on
+ * this project's own deployed hardware, not assumed from documentation.
+ */
+int wifi_get_link_info(wifi_link_info *out_info);
+
 #endif /* WIFI_H */

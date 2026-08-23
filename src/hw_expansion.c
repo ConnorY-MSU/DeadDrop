@@ -126,6 +126,9 @@ void hw_expansion_set_status_color(int fd, hw_connection_status status)
         case HW_STATUS_CONNECTED:
             rgb[0] = 0;   rgb[1] = 200; rgb[2] = 0;   /* green */
             break;
+        case HW_STATUS_ALERT:
+            rgb[0] = 255; rgb[1] = 0;   rgb[2] = 255; /* magenta */
+            break;
         default:
             return; /* unrecognized status - do nothing rather than
                       * write something arbitrary to a physical light */

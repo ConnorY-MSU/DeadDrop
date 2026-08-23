@@ -1477,4 +1477,56 @@ Sent a real message from `bravo` using an ad-hoc `uinput`-based synthetic-keyboa
 ### Not yet done
 - Overlay-filesystem persistence has not yet been tested through a Day 6 certificate-rotation drill (deploying a new cert while overlay is active, confirming it survives a reboot) - that's explicitly Day 6's own task.
 - The mobility drill (moving a device to a different network mid-session) hasn't been run since enabling overlay/persistence - worth re-confirming the WiFi-profile persistence path specifically, given how much churn today's NetworkManager incident involved.
+
+## Messaging system enhancements — 2026-08-22
+
+The user asked directly what would make this a better messaging system, and after a joint prioritization (explicitly excluding message editing/deletion and multi-device/group messaging as poor fits for this project's security posture and two-device architecture), asked for everything else: timestamps, offline message queueing, delivery acknowledgment, persisted message history, real scrollback, small file transfer, and a live link-quality (RTT) indicator. Built in that order (lowest-risk first), tested incrementally, with real scrollback deliberately saved for last as its own dedicated pass given how much working code it touches.
+
+### Protocol additions (docs/PROTOCOL.md)
+Two new `msg_type` values, both added to `message.h`'s enum AND `message.c`'s parse-time whitelist switch (confirmed by checking the actual code, not assumed - the switch would have silently rejected them otherwise):
+- `0x05 ACK` - 4-byte body, the big-endian `seq_num` of the `TEXT_MESSAGE` being acknowledged. Sent automatically by the receiver the moment a `TEXT_MESSAGE` is accepted.
+- `0x06 FILE` - `[2-byte filename_len BE][filename][file data]`, still bound by the existing 65536-byte `body_length` cap (no chunking/reassembly - a file that doesn't fit is rejected by the sender before anything is transmitted). Receiver treats the filename as untrusted wire input: basename-only, path separators stripped, `.`/`..` rejected outright (see `sanitize_basename()` in `session.c`).
+
+`tests/test_message.c` (unchanged) still passes 5/5 after these additions - confirmed by rebuilding and rerunning on real hardware, not assumed safe because "only new cases were added."
+
+### New modules
+- **`outbox.h`/`outbox.c`** - a small, bounded (20 messages), thread-safe FIFO queue. Cross-platform, no `__linux__` split needed (pure in-memory, pthread already proven working on both this project's real targets). Verified in isolation first (a throwaway dev-machine round-trip test: enqueue/dequeue/count/full/empty), same discipline as every other module this project has built.
+- **`msglog.h`/`msglog.c`** - append-only, timestamped, local chat log at `$HOME/.securelink/message_log.txt` - deliberately the SAME directory the PIN hash already uses, so it's automatically covered by the existing Day 5 overlay-persistence bind mount with zero changes needed to `docs/setup-persist-overlay.sh`. **Honest, stated limitation**: stored in plaintext, protected only by file permissions and the device's own physical/OS security - real encryption-at-rest would need its own key-management story (the mutual key-share mechanism's key is per-session/ephemeral, unsuitable for something meant to persist across many sessions) - not attempted, documented instead, matching this project's Documentation Standard. Verified in isolation (append + load-recent round-trip) before integration.
+
+### Feature-by-feature, what's real and verified
+- **Timestamps** (`ui_add_history()`) - local wall-clock time only, `[HH:MM:SS]`, deliberately NOT carried on the wire (Raspberry Pis have no hardware RTC and clocks aren't guaranteed synchronized - a wire timestamp could be actively misleading across devices; same reasoning already applied to RTT below). Confirmed rendering correctly on real hardware.
+- **Delivery ACK** - confirmed with a real, live round trip on real hardware: sent a message from `bravo`, `alpha` auto-ACK'd it, `bravo` displayed `(delivered: "...")` within the same second. Verbatim:
+  ```
+  [19:13:25] you: ngbn gbbajg z\g
+  [19:13:25] (delivered: "ngbn gbbajg z\g")
+  ```
+  (garbled text is the same known synthetic-keyboard test-tool timing artifact documented earlier this project - the ACK mechanism itself doesn't care what the text says.)
+- **Offline queueing** - the single most valuable addition, per the user's own stated goal ("a live chat pipe" vs. "an actual messaging system"). Tested for real: stopped `alpha`'s systemd service mid-session, typed a message on `bravo` while genuinely disconnected, confirmed the idle-input thread queued it (`outbox_enqueue()`) rather than dropping it, restarted `alpha`, confirmed `bravo`'s reconnect automatically drained and sent the queued message, confirmed `alpha` received it, confirmed the delivery ACK fired for it too. Full verbatim sequence on `bravo`:
+  ```
+  [19:16:06] Connection to server lost.
+  [19:16:07] connect() failed: 111
+  [19:16:10] (not connected - message queued, will send once connected)
+  [19:16:37] you: queued message while offline
+  [19:16:37] (delivered: "queued message while offline")
+  ```
+  A send that fails *mid-session* (not just while fully disconnected) is also queued rather than lost, per the same logic in `run_symmetric_session()`'s main loop - not separately live-tested this session (harder to trigger deliberately without corrupting the connection in a controlled way), but it reuses the exact same `outbox_enqueue()` call already proven above.
+- **Persisted message history** - confirmed two ways: (1) `msglog.txt`'s content matched exactly what was sent/received during testing; (2) a real service restart replayed it correctly on boot:
+  ```
+  --- previous session history ---
+  [2026-08-22 19:17:58] client: (sent a file - see ~/.securelink/received/)
+  --- end of previous history ---
+  ```
+- **File transfer** - confirmed end to end, including a real bug found and fixed along the way (see below): `bravo` sent `/tmp/testfile.txt` via `/send /tmp/testfile.txt`, `alpha` saved it to `~/.securelink/received/testfile.txt` with byte-for-byte correct content (`test attachment content`, 24 bytes, matching exactly).
+- **RTT / link-quality indicator** - implemented (periodic `PING` every `SESSION_PING_INTERVAL_SECONDS` (10s) while a session is active, RTT computed from the matching `PONG`, reported to the OLED's line 6 via `ui_report_rtt()`) and confirmed to compile/link/run without error, but **not yet visually confirmed on the physical OLED** - unlike everything else in this section, this one still needs the user to physically look at the display. Flagged honestly rather than claimed as proven.
+
+### Real bug found and fixed: `~/.securelink` was root-owned
+File transfer's first test attempt failed silently on the receiving end (`(failed to save received file testfile.txt)` in history; msglog had also been silently failing the same way, unnoticed until this pass since nothing had needed to *write* there yet). Root-caused, not guessed at: `ls -la ~/.securelink` showed `drwxr-xr-x root root` on both Pis - a leftover from an **earlier debugging session that ran the app via `sudo openvt`** (see the Days 2-3 touch-input testing narrative above), which created the directory as root before the real `User=connor` systemd service ever got a chance to. Once root-owned, `connor` could read/list it but never write into it - not a permissions-bits problem alone, a genuine ownership problem, silently degrading two brand-new features to no-ops. Fixed with `chown -R connor:connor ~/.securelink` on both devices, then **folded into `docs/provision-permissions.sh` permanently** (now covers `~/.securelink` alongside `~/pki`/`~/keyshare`, with explicit `chown` - not just `chmod` - specifically because a permissions-only fix would not have caught this class of bug). Re-ran the script on both Pis, re-verified file transfer and msglog both work correctly afterward.
+
+### Full regression check after all of the above
+`test_revocation`, `test_sha256`, `test_aes128`, `test_hmac`, `test_message` - rebuilt and re-run natively on `alpha` after all of today's changes: **5/5 pass, zero regressions**. Both services confirmed `active` with zero failed systemd units after the final restart.
+
+### Not yet done
+- **Real scrollback** (converting `history_win` from a plain window to an `ncurses` pad, replacing the pause/resume gesture with genuine bidirectional scroll) - deliberately saved for last as its own dedicated, more invasive pass, not started yet.
+- RTT/OLED visual confirmation (see above) - needs the user's eyes on the physical device.
+- The dev-machine loopback test harness hit a real, still-unexplained quirk this session: a backgrounded `server.exe`'s stdin (via a `<>`-opened FIFO, a technique that worked reliably for the *client* side reading from a plain redirected file) appeared to report ready-with-immediate-EOF, causing the server side to self-quit almost instantly in every attempt. Worked around by moving the authoritative test to real Pi hardware (which has no such issue - real systemd services, real TTYs) rather than root-causing a dev-machine-only harness artifact under time pressure. Worth investigating if dev-machine server-side interactive testing is needed again.
 - Cold-boot-to-ready timing hasn't been formally measured/recorded yet (Day 6 asks for this explicitly).

@@ -46,10 +46,18 @@ typedef enum {
  * for each meaning live in one place (hw_expansion.c), not scattered
  * across every call site that wants to report a status change. */
 typedef enum {
-    HW_STATUS_DISCONNECTED,  /* red   - no active session */
-    HW_STATUS_CONNECTING,    /* amber - TCP/TLS handshake in progress,
+    HW_STATUS_DISCONNECTED,  /* red     - no active session */
+    HW_STATUS_CONNECTING,    /* amber   - TCP/TLS handshake in progress,
                                * or a reconnect-with-backoff retry pending */
-    HW_STATUS_CONNECTED      /* green - live mTLS session established */
+    HW_STATUS_CONNECTED,     /* green   - live mTLS session established */
+    HW_STATUS_ALERT           /* magenta - an unacknowledged incoming
+                               * message is pending (see
+                               * ui_notify_message_pending() in ui.h) -
+                               * deliberately distinct from the three
+                               * connection-state colors above so it can
+                               * never be mistaken for one, and matches
+                               * the same magenta used for the ncurses
+                               * UI's own "cyberpunk neon" palette. */
 } hw_connection_status;
 
 /*

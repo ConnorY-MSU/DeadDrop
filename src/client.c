@@ -536,6 +536,9 @@ int main(int argc, char *argv[])
      * side OLED is new as of the two-way redesign - previously only the
      * server had one wired up. */
     oled_fd = hw_oled_open();
+    ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
+        can periodically refresh background network metrics below
+        session.c/here's own role/status lines - see ui.h. */
     hw_oled_draw_text(oled_fd, 0, "SecureLink client");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);

@@ -481,6 +481,9 @@ int main(int argc, char *argv[])
      * screen, so it's obvious at a glance the service is actually
      * running, not just that the screen happens to be off. */
     oled_fd = hw_oled_open();
+    ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
+        can periodically refresh background network metrics below
+        this file's own role/status lines - see ui.h. */
     hw_oled_draw_text(oled_fd, 0, "SecureLink server");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);

@@ -26,6 +26,10 @@
 #include "lock.h"
 #include "wifi.h"
 #include "touch.h"
+#include "hw_expansion.h"
+#include "hw_oled.h"
+#include "msglog.h"
+#include "outbox.h"
 
 /* --- Module state -------------------------------------------------------
  *
@@ -63,28 +67,48 @@ static WINDOW *input_win = NULL;          /* derwin() inside the above */
 static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int ui_active = 0;
 
-/* --- Styling (Week 4 Days 2-3, "richer ncurses styling" - Phase 1 of
- * a two-phase aesthetic direction the user gave directly: start here,
- * eventually move toward a distinctive Flipper-Zero/Cyberpunk-2077-
- * style look for the truly final iteration - that's a later, separate
- * pass, not attempted here).
+/* --- Styling (Week 4 Days 2-3). Structural aesthetic pass on top of
+ * Phase 1's foundation (color, bordered panels, message-source
+ * color-coding): a boot splash, a persistent status-bar brand prefix, a
+ * restyled lock screen, and a two-tone compose prompt - all kept as-is
+ * across a color revision. The FIRST color pass here was a deliberately
+ * saturated "cyberpunk neon" look (magenta/cyan/yellow, heavy A_BOLD),
+ * confirmed working on real hardware; the user then asked for something
+ * SOFTER, closer to a standard terminal application - this palette is
+ * that second pass. Deliberately dropped A_BOLD almost everywhere
+ * (bold is what pushed the ANSI 8-color palette into its saturated
+ * "bright" variants - removing it is most of what "softer" actually
+ * means here, more than the specific hues chosen) and moved from
+ * magenta to a conventional white-on-blue "title bar" (the same
+ * convention nano/Midnight Commander and similar terminal apps use) and
+ * plain white body text with a quiet cyan accent, rather than a fully
+ * monochrome look, so the message-source and border distinctions Phase
+ * 1 established are still readable at a glance.
  *
  * Color palette confirmed against the REAL deployment target, not
  * assumed: TERM=linux on the actual Pi console reports COLORS=8,
  * COLOR_PAIRS=64 (the standard ANSI 8-color palette, not 256-color or
- * truecolor) - every color pair below stays within that, using A_BOLD
- * for "bright" variants (universally supported) rather than anything
- * that would look wrong or fail silently on the real hardware this
- * project targets.
+ * truecolor) - every color pair below stays within that. Deliberately
+ * did NOT reach for real Unicode double-line box-drawing glyphs - the
+ * console font in use (Lat15-Terminus, a codepage font, not a full
+ * Unicode font) has no verified glyph coverage for those without a real
+ * hardware round-trip to check, and every border in this file already
+ * uses ncurses' own single-line ACS box() drawing, proven working on
+ * this exact device since Phase 1.
  */
-#define CP_STATUS   1 /* status "title bar": black text on cyan */
+#define CP_STATUS   1 /* status "title bar": white text on blue - a
+                          conventional terminal-app title-bar look */
 #define CP_BORDER   2 /* panel borders: cyan on black */
-#define CP_PEER_MSG 3 /* incoming (peer) messages: green on black */
-#define CP_OWN_MSG  4 /* own sent messages: yellow on black */
-#define CP_SYSTEM   5 /* system/event notices: cyan on black, no bold -
+#define CP_PEER_MSG 3 /* incoming (peer) messages: plain white on black */
+#define CP_OWN_MSG  4 /* own sent messages: cyan on black - a quiet
+                          distinction from peer messages, not a loud one */
+#define CP_SYSTEM   5 /* system/event notices: white on black -
                           visually quieter than a real message */
-#define CP_LOCKED   6 /* lock screen: red on black */
-#define CP_INPUT    7 /* input line prompt: cyan on black */
+#define CP_LOCKED   6 /* lock screen / danger state: red on black */
+#define CP_INPUT    7 /* compose prompt: cyan on black */
+#define CP_BANNER   8 /* splash/lock banner box: white on black */
+#define CP_ACCENT   9 /* secondary accents (splash subtitle, WiFi
+                          transient states): cyan on black */
 
 /* Deliberately smaller than SL_MAX_BODY_LEN (message.h's 64 KiB
  * protocol cap) - this bounds one INTERACTIVELY TYPED line through a
@@ -258,6 +282,30 @@ static volatile int touch_thread_running = 0;
 static volatile int touch_thread_should_stop = 0;
 static int history_paused = 0;
 
+/* --- Message-pending LED flash + OLED background metrics --------------
+ *
+ * Both piggy-back on the touch thread's existing ~200ms poll loop
+ * (touch_read_tap()'s own timeout drives it regardless of whether a tap
+ * actually happens) rather than adding dedicated threads for either -
+ * see ui.h's matching comments on ui_notify_message_pending()/
+ * ui_set_oled_fd() for the full design reasoning.
+ */
+static volatile int message_pending_ack = 0;
+static int flash_hw_fd = -1;      /* set per-call by
+                                      ui_notify_message_pending() */
+static int metrics_oled_fd = -1;  /* set once by ui_set_oled_fd() */
+
+/* Toggle the flash roughly every 400ms (2 x the ~200ms loop period) -
+ * fast enough to read as a deliberate "flash," slow enough not to look
+ * like a malfunction. */
+#define UI_FLASH_TOGGLE_ITERS 2
+
+/* Refresh OLED metrics roughly every 30s (150 x ~200ms) - SSID/signal/
+ * link-rate are not fast-changing values, and each refresh is a real
+ * nmcli subprocess spawn (see wifi.c), not free; this is deliberately
+ * much coarser than the flash toggle above. */
+#define UI_METRICS_REFRESH_ITERS 150
+
 /* Must be called with ui_mutex held. Replaces history_win's PHYSICAL
  * content with a locked banner, then STOPS refreshing history_win (see
  * ui_add_history() below) until unlock - real incoming messages keep
@@ -266,15 +314,157 @@ static int history_paused = 0;
  * ui_add_history() never changes behavior based on lock state - see this
  * block's DECOUPLING note above), they just don't reach the physical
  * screen until wrefresh(history_win) happens again at unlock. */
+/* --- Boot splash + lock-screen banner: shared box-drawing helpers ---
+ *
+ * Both draw a "+===...===+ / | text | / +===...===+" box, sized to the
+ * text and centered, into whichever window is passed in (stdscr for the
+ * boot splash, history_win for the lock screen). Deliberately plain
+ * ASCII ('+', '=', '|') rather than Unicode box-drawing glyphs - see
+ * this file's STYLING block comment for why. Width/columns computed
+ * from the actual window/text at draw time (confirmed against real
+ * hardware: TERM=linux + the deployed Lat15-Terminus24x12 font reports
+ * 100 columns x 30 rows via `stty size` on /dev/tty1), not hardcoded
+ * against an assumed screen size.
+ */
+static void ui_draw_hline(WINDOW *win, int row, int col, int width)
+{
+    char buf[96];
+    int n = width;
+
+    if (n < 2) {
+        return;
+    }
+    if (n > (int)sizeof(buf) - 1) {
+        n = (int)sizeof(buf) - 1;
+    }
+    memset(buf, '=', (size_t)n);
+    buf[0] = '+';
+    buf[n - 1] = '+';
+    buf[n] = '\0';
+    mvwprintw(win, row, col, "%s", buf);
+}
+
+static void ui_draw_centered(WINDOW *win, int row, int col, int width,
+                              const char *text)
+{
+    char buf[96];
+    int textlen = (int)strlen(text);
+    int pad_total = width - 2 - textlen;
+    int pad_left, pad_right;
+
+    if (pad_total < 0) {
+        pad_total = 0;
+    }
+    pad_left = pad_total / 2;
+    pad_right = pad_total - pad_left;
+    /* Guards against a caller passing an unexpectedly huge width -
+     * "%*s" with a very large field width would still be memory-safe
+     * (snprintf truncates to sizeof(buf)), but capping here keeps the
+     * box actually looking like a box instead of silently truncating
+     * one border edge off-screen on a narrow terminal. */
+    if (pad_left > 40) {
+        pad_left = 40;
+    }
+    if (pad_right > 40) {
+        pad_right = 40;
+    }
+    snprintf(buf, sizeof(buf), "|%*s%s%*s|", pad_left, "", text,
+             pad_right, "");
+    mvwprintw(win, row, col, "%s", buf);
+}
+
+/* Shown once, full-screen on stdscr, before the panel layout exists -
+ * purely cosmetic and blocking nothing real: this runs before any
+ * thread (idle-input, touch, receiver) has started. 1.2s is a fixed,
+ * deliberate delay meant to be READ, not a technical necessity - for
+ * scale, Week 3 Day 4's own benchmark put a full mTLS handshake at
+ * ~12-14ms, two orders of magnitude faster than this splash alone. */
+static void show_splash(void)
+{
+    int box_width = 56;
+    int col, row;
+    const char *subtitle = "[ ENCRYPTED FIELD TERMINAL ]";
+
+    if (box_width > COLS - 2) {
+        box_width = COLS - 2;
+    }
+    if (box_width < 10) {
+        return; /* pathologically narrow terminal - skip rather than
+            risk garbled output; every other screen has its own margin
+            logic and doesn't depend on this having run. */
+    }
+    col = (COLS - box_width) / 2;
+    row = LINES / 2 - 3;
+    if (row < 0) {
+        row = 0;
+    }
+
+    clear();
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_BANNER));
+    }
+    ui_draw_hline(stdscr, row, col, box_width);
+    ui_draw_centered(stdscr, row + 1, col, box_width, "S E C U R E L I N K");
+    ui_draw_hline(stdscr, row + 2, col, box_width);
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_BANNER));
+    }
+
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_ACCENT));
+    }
+    {
+        int sublen = (int)strlen(subtitle);
+        int subcol = col + (box_width - sublen) / 2;
+        if (subcol < 0) {
+            subcol = col;
+        }
+        mvprintw(row + 4, subcol, "%s", subtitle);
+    }
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_ACCENT));
+    }
+
+    refresh();
+    napms(1200);
+    clear();
+    refresh();
+}
+
 static void draw_locked_overlay_locked(void)
 {
+    int win_width = getmaxx(history_win);
+    int box_width = win_width - 4;
+    int col;
+
     werase(history_win);
-    wattron(history_win, COLOR_PAIR(CP_LOCKED) | A_BOLD);
-    mvwprintw(history_win, 0, 0,
-              "Locked. Messages are still being received normally in the "
+
+    if (box_width > 40) {
+        box_width = 40; /* a compact banner even on a wide screen,
+            rather than stretching to fill it */
+    }
+    if (box_width < 10) {
+        box_width = 10;
+    }
+    col = (win_width - box_width) / 2;
+    if (col < 0) {
+        col = 0;
+    }
+
+    wattron(history_win, COLOR_PAIR(CP_LOCKED));
+    ui_draw_hline(history_win, 1, col, box_width);
+    ui_draw_centered(history_win, 2, col, box_width, "L O C K E D");
+    ui_draw_hline(history_win, 3, col, box_width);
+    wattroff(history_win, COLOR_PAIR(CP_LOCKED));
+
+    wattron(history_win, COLOR_PAIR(CP_SYSTEM));
+    mvwprintw(history_win, 5, 1,
+              "Messages are still being received normally in the "
               "background.\nEnter your PIN below and press Enter to "
               "unlock.");
-    wattroff(history_win, COLOR_PAIR(CP_LOCKED) | A_BOLD);
+    wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
+
     wrefresh(history_win);
 }
 
@@ -284,6 +474,10 @@ static void redraw_input_locked(void)
 {
     size_t i;
     int cp = CP_INPUT; /* overridden below for sensitive-entry modes */
+    int apply_uniform_color = 1; /* UI_MODE_NORMAL colors itself inline
+        instead (a two-tone ">> " prompt vs. typed text) and skips the
+        trailing mvwchgat below, which would otherwise flatten that
+        back to one uniform color across the whole line. */
 
     werase(input_win);
 
@@ -311,10 +505,12 @@ static void redraw_input_locked(void)
         }
         break;
     case UI_MODE_WIFI_SCANNING:
+        cp = CP_ACCENT;
         mvwprintw(input_win, 0, 0,
                   "Scanning for WiFi networks... (Ctrl+W to cancel)");
         break;
     case UI_MODE_WIFI_SELECT:
+        cp = CP_ACCENT;
         mvwprintw(input_win, 0, 0,
                   "Select network number (Ctrl+W to cancel): %s", input_buf);
         break;
@@ -327,26 +523,50 @@ static void redraw_input_locked(void)
         }
         break;
     case UI_MODE_WIFI_CONNECTING:
+        cp = CP_ACCENT;
         mvwprintw(input_win, 0, 0, "Connecting to %s...",
                   wifi_selected_ssid);
         break;
     case UI_MODE_NORMAL:
     default:
+        apply_uniform_color = 0;
         if (history_paused) {
+            if (has_colors()) {
+                wattron(input_win, COLOR_PAIR(CP_ACCENT));
+            }
             mvwprintw(input_win, 0, 0,
-                      "[PAUSED - tap lower half of history to resume] > %s",
-                      input_buf);
-        } else {
-            mvwprintw(input_win, 0, 0, "> %s", input_buf);
+                      "[PAUSED - tap lower half to resume]");
+            if (has_colors()) {
+                wattroff(input_win, COLOR_PAIR(CP_ACCENT));
+            }
+            waddch(input_win, ' ');
         }
+        /* Two-tone compose prompt: the ">> " glyph itself is a
+         * distinct color from the typed text after it - every other
+         * mode above still applies one flat color to the whole line
+         * via the trailing mvwchgat, this is the one deliberate
+         * exception. */
+        if (has_colors()) {
+            wattron(input_win, COLOR_PAIR(CP_INPUT));
+        }
+        wprintw(input_win, ">> ");
+        if (has_colors()) {
+            wattroff(input_win, COLOR_PAIR(CP_INPUT));
+        }
+        wprintw(input_win, "%s", input_buf);
         break;
     }
 
     /* Applied to the whole line after drawing (rather than wrapping
      * every mvwprintw/waddch call individually above) - simpler, and
      * every character on the input line should share the same color
-     * for a given mode anyway, masked PIN/password asterisks included. */
-    mvwchgat(input_win, 0, 0, -1, A_NORMAL, cp, NULL);
+     * for a given mode anyway, masked PIN/password asterisks included.
+     * Plain A_NORMAL, not A_BOLD - see this file's STYLING block
+     * comment on the softer, standard-terminal color pass. Skipped for
+     * UI_MODE_NORMAL - see above. */
+    if (apply_uniform_color) {
+        mvwchgat(input_win, 0, 0, -1, A_NORMAL, cp, NULL);
+    }
     wrefresh(input_win);
 }
 
@@ -374,14 +594,23 @@ void ui_init(const char *peer_label)
      * monochrome rather than crashing or looking broken. */
     if (has_colors()) {
         start_color();
-        init_pair(CP_STATUS, COLOR_BLACK, COLOR_CYAN);
+        init_pair(CP_STATUS, COLOR_WHITE, COLOR_BLUE);
         init_pair(CP_BORDER, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_PEER_MSG, COLOR_GREEN, COLOR_BLACK);
-        init_pair(CP_OWN_MSG, COLOR_YELLOW, COLOR_BLACK);
-        init_pair(CP_SYSTEM, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_PEER_MSG, COLOR_WHITE, COLOR_BLACK);
+        init_pair(CP_OWN_MSG, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_SYSTEM, COLOR_WHITE, COLOR_BLACK);
         init_pair(CP_LOCKED, COLOR_RED, COLOR_BLACK);
         init_pair(CP_INPUT, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_BANNER, COLOR_WHITE, COLOR_BLACK);
+        init_pair(CP_ACCENT, COLOR_CYAN, COLOR_BLACK);
     }
+
+    /* Boot splash - see its own comment above for why this is safe to
+     * run here (before any thread starts, before the panel windows
+     * exist). Runs once per process start, i.e. once per boot given
+     * this app's systemd unit (Restart=always) restarts the whole
+     * process on any exit, not just this function. */
+    show_splash();
 
     /* Layout: a 1-row status bar with a filled background (a "title
      * bar" look, via wbkgd() below) plus two bordered panels. Each
@@ -437,6 +666,33 @@ void ui_init(const char *peer_label)
     ui_active = 1;
 
     pthread_mutex_lock(&ui_mutex);
+    {
+        /* Replay recent persisted chat history (see msglog.h) so a
+         * reboot doesn't present a blank, context-free screen - each
+         * line is ALREADY formatted with its own embedded timestamp
+         * (msglog_append()'s own "[YYYY-MM-DD HH:MM:SS] who: text"),
+         * so this deliberately writes directly into history_win rather
+         * than going through ui_add_history() (which would prepend a
+         * SECOND, current-time timestamp on top of the log's own
+         * historical one - wrong). Written into the buffer the same
+         * way real live content is (see ui_add_history()'s DECOUPLING
+         * note) - it becomes visible on wrefresh() below (if unlocked)
+         * or stays queued behind the lock overlay (if locked), exactly
+         * like any other pre-existing history would. */
+        char recent[20][MSGLOG_LINE_MAX];
+        int n = msglog_load_recent(recent,
+                                     (int)(sizeof(recent) / sizeof(recent[0])));
+        if (n > 0) {
+            int i;
+            wattron(history_win, COLOR_PAIR(CP_SYSTEM));
+            wprintw(history_win, "--- previous session history ---\n");
+            for (i = 0; i < n; i++) {
+                wprintw(history_win, "%s\n", recent[i]);
+            }
+            wprintw(history_win, "--- end of previous history ---\n");
+            wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
+        }
+    }
     if (ui_mode == UI_MODE_LOCKED) {
         draw_locked_overlay_locked();
     } else {
@@ -470,7 +726,13 @@ void ui_set_status(const char *status_text)
      * filled "title bar" look rather than just colored text on a
      * black background. */
     werase(status_win);
-    mvwprintw(status_win, 0, 1, "%s", status_text != NULL ? status_text : "");
+    /* A persistent brand prefix, not just the raw status text - the
+     * status bar is the one thing visible in every mode (locked,
+     * mid-WiFi-setup, normal), so this is the actual "always-on"
+     * identity/chrome of the whole neon look, not just a one-time
+     * splash. */
+    mvwprintw(status_win, 0, 1, "SECURELINK :: %s",
+              status_text != NULL ? status_text : "");
     wrefresh(status_win);
     /* Put the cursor back in the input line - otherwise it visibly jumps
      * to wherever the status bar last wrote, which looks broken since
@@ -507,9 +769,34 @@ void ui_add_history(const char *prefix, const char *text)
          * peer_label session.c passes) - makes it possible to tell at
          * a glance who said what without reading every line. */
         int cp = CP_SYSTEM;
+        char ts_buf[12]; /* "[HH:MM:SS] " + NUL */
+        time_t now = time(NULL);
+        struct tm tm_now;
+#ifdef _WIN32
+        localtime_s(&tm_now, &now);
+#else
+        localtime_r(&now, &tm_now);
+#endif
+        strftime(ts_buf, sizeof(ts_buf), "[%H:%M:%S] ", &tm_now);
+
         if (prefix != NULL) {
             cp = (strcmp(prefix, "you") == 0) ? CP_OWN_MSG : CP_PEER_MSG;
         }
+        /* Timestamp itself always in the quiet system color, regardless
+         * of the line's own source color - it's metadata about the
+         * line, not part of what was actually said. Local wall-clock
+         * time only (this device's own clock at receive/send time) -
+         * deliberately NOT a value carried on the wire (see
+         * PROTOCOL.md's PONG entry for the same reasoning applied to
+         * RTT): two devices' clocks aren't guaranteed synchronized
+         * (Raspberry Pis have no hardware RTC - see Field WiFi and
+         * Network Resilience Concepts.md), so a wire-carried timestamp
+         * could be actively misleading across devices in a way a
+         * purely local one never is. */
+        wattron(history_win, COLOR_PAIR(CP_SYSTEM));
+        wprintw(history_win, "%s", ts_buf);
+        wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
+
         wattron(history_win, COLOR_PAIR(cp));
         if (prefix != NULL) {
             wprintw(history_win, "%s: %s\n", prefix, text != NULL ? text : "");
@@ -1046,7 +1333,9 @@ static volatile int idle_thread_should_stop = 0;
 
 static void *idle_input_thread_main(void *arg)
 {
-    char dummy[256];
+    char dummy[OUTBOX_MSG_MAX_LEN]; /* sized for a real queued message,
+        not just a throwaway buffer - see the UI_POLL_LINE handling
+        below, which now actually queues this instead of discarding it */
     time_t last_connectivity_check = 0;
     (void)arg;
 
@@ -1054,10 +1343,17 @@ static void *idle_input_thread_main(void *arg)
         ui_poll_result pr = ui_poll_line(dummy, sizeof(dummy), 200);
         if (pr == UI_POLL_LINE) {
             /* Something was typed and Enter pressed, but there's no
-             * active session to send it through - explain rather than
-             * silently dropping it, so this doesn't look like a bug to
-             * whoever's at the keyboard. */
-            ui_add_history(NULL, "(not connected - nothing sent)");
+             * active session to send it through - queue it (see
+             * outbox.h) rather than silently dropping it, so it goes
+             * out automatically the moment a session actually starts
+             * (session.c drains the outbox right after connecting). */
+            if (outbox_enqueue(dummy) == 0) {
+                ui_add_history(NULL, "(not connected - message queued, "
+                                      "will send once connected)");
+            } else {
+                ui_add_history(NULL, "(not connected - queue is full, "
+                                      "message NOT sent)");
+            }
         }
         /* UI_POLL_TIMEOUT: normal, keep looping. UI_POLL_QUIT: never
          * returned by the real ncurses ui_poll_line() - see ui.h. */
@@ -1176,13 +1472,92 @@ static void handle_tap_locked(int tap_row, int tap_col)
      * ignored rather than guessed at. */
 }
 
+/* Draws WiFi SSID/signal/link-rate and a basic connectivity indicator
+ * into the OLED's framebuffer, BELOW whatever session.c/client.c/
+ * server.c's own hw_oled_draw_text() calls already own (lines 0-1: role
+ * + status/message-preview - see hw_oled.h's line-numbering contract).
+ * Does NOT hold ui_mutex - this only touches the OLED (a completely
+ * separate device from the touchscreen ncurses manages) via hw_oled.h's
+ * own already-thread-safe-by-construction fd-based API (no shared
+ * mutable state of its own), same reasoning as the RGB LED calls
+ * elsewhere in this file needing no locking either. */
+static void refresh_oled_metrics(void)
+{
+    wifi_link_info info;
+    /* Sized to comfortably hold the longest possible formatted string
+     * (a WIFI_SSID_MAX-1 (63) char SSID plus its "WiFi: " prefix), not
+     * HW_OLED_COLS+1 - hw_oled_draw_text() already truncates safely to
+     * the display's own 21-char width (see hw_oled.h), so there's
+     * nothing to gain from ALSO truncating here at snprintf() time,
+     * and doing so was tripping -Wformat-truncation for no real benefit
+     * (this project holds a zero-warnings bar). */
+    char line[96];
+
+    if (metrics_oled_fd < 0) {
+        return;
+    }
+
+    if (wifi_get_link_info(&info) == 0) {
+        snprintf(line, sizeof(line), "WiFi: %s", info.ssid);
+        hw_oled_draw_text(metrics_oled_fd, 3, line);
+        snprintf(line, sizeof(line), "Sig %d%%  %s",
+                  info.signal_percent, info.rate);
+        hw_oled_draw_text(metrics_oled_fd, 4, line);
+    } else {
+        hw_oled_draw_text(metrics_oled_fd, 3, "WiFi: (none)");
+        hw_oled_draw_text(metrics_oled_fd, 4, "");
+    }
+
+    /* wifi_has_connectivity() already exists (the "no network found"
+     * prompt on the main UI uses it too, see the idle thread above) -
+     * reused rather than re-implementing an equivalent check here. */
+    hw_oled_draw_text(metrics_oled_fd, 5,
+                       wifi_has_connectivity() ? "Net: OK" : "Net: DOWN");
+
+    hw_oled_display(metrics_oled_fd);
+}
+
 static void *touch_thread_main(void *arg)
 {
+    int flash_toggle_counter = 0;
+    int flash_led_on = 0;
+    int metrics_counter = UI_METRICS_REFRESH_ITERS; /* draw once
+        immediately on the first loop iteration, rather than waiting a
+        full 30s for the first-ever refresh */
     (void)arg;
 
     while (!touch_thread_should_stop) {
         touch_point pt;
         int rc = touch_read_tap(touch_fd, &pt, 200);
+
+        /* Message-pending flash toggle - runs every iteration
+         * regardless of whether a tap happened, independent of the
+         * rc==1/rc<0 handling below. See ui.h's
+         * ui_notify_message_pending() comment for why HW_STATUS_ALERT
+         * (magenta) vs. off, and why a real tap (below) always restores
+         * HW_STATUS_CONNECTED specifically. */
+        if (message_pending_ack && flash_hw_fd >= 0) {
+            flash_toggle_counter++;
+            if (flash_toggle_counter >= UI_FLASH_TOGGLE_ITERS) {
+                flash_toggle_counter = 0;
+                flash_led_on = !flash_led_on;
+                if (flash_led_on) {
+                    hw_expansion_set_status_color(flash_hw_fd,
+                                                   HW_STATUS_ALERT);
+                } else {
+                    hw_expansion_set_led_mode(flash_hw_fd, HW_LED_MODE_OFF);
+                }
+            }
+        }
+
+        /* OLED background metrics refresh - same "every iteration,
+         * independent of taps" shape as the flash toggle above, just on
+         * a much coarser interval. */
+        metrics_counter++;
+        if (metrics_counter >= UI_METRICS_REFRESH_ITERS) {
+            metrics_counter = 0;
+            refresh_oled_metrics();
+        }
 
         if (rc == 1) {
             int tap_row = (int)(pt.y * LINES);
@@ -1202,6 +1577,20 @@ static void *touch_thread_main(void *arg)
             pthread_mutex_lock(&ui_mutex);
             handle_tap_locked(tap_row, tap_col);
             pthread_mutex_unlock(&ui_mutex);
+
+            /* ANY tap acknowledges a pending message flash, not just a
+             * tap on the message itself - see ui.h's comment. */
+            if (message_pending_ack) {
+                message_pending_ack = 0;
+                flash_toggle_counter = 0;
+                flash_led_on = 0;
+                if (flash_hw_fd >= 0) {
+                    hw_expansion_set_led_mode(flash_hw_fd,
+                                               HW_LED_MODE_MANUAL_RGB);
+                    hw_expansion_set_status_color(flash_hw_fd,
+                                                   HW_STATUS_CONNECTED);
+                }
+            }
         } else if (rc < 0) {
             /* Device error (e.g. unplugged) - stop trying rather than
              * spin on a broken fd. */
@@ -1239,6 +1628,43 @@ void ui_stop_touch(void)
     touch_thread_running = 0;
     touch_close(touch_fd);
     touch_fd = -1;
+}
+
+void ui_notify_message_pending(int hw_fd)
+{
+    /* Deliberate honest limit: the flash toggle and its acknowledgment
+     * are entirely driven by the touch thread (see touch_thread_main
+     * above), so if no touchscreen is attached at all (touch_open()
+     * failed in ui_start_touch(), touch_thread_running stays 0), a
+     * flash could be requested here but would never actually toggle or
+     * ever be acknowledgeable. Not worth a separate fallback thread
+     * just for that - this project's actual deployed hardware always
+     * has the touchscreen attached. */
+    flash_hw_fd = hw_fd;
+    message_pending_ack = 1;
+}
+
+void ui_set_oled_fd(int fd)
+{
+    metrics_oled_fd = fd;
+}
+
+void ui_report_rtt(int rtt_ms)
+{
+    char line[32];
+
+    if (metrics_oled_fd < 0) {
+        return;
+    }
+    /* Written immediately rather than waiting for
+     * refresh_oled_metrics()'s own ~30s timer - this already only
+     * arrives roughly every SESSION_PING_INTERVAL_SECONDS (session.c),
+     * so there's no risk of hammering the OLED with excessive I2C
+     * traffic, and a fresh RTT sample is more useful shown promptly
+     * than held back to line up with an unrelated refresh cycle. */
+    snprintf(line, sizeof(line), "RTT: %dms", rtt_ms);
+    hw_oled_draw_text(metrics_oled_fd, 6, line);
+    hw_oled_display(metrics_oled_fd);
 }
 
 #else /* !__linux__ */
@@ -1399,6 +1825,25 @@ void ui_start_touch(void)
 
 void ui_stop_touch(void)
 {
+}
+
+/* No case RGB LEDs or OLED exist on this project's Windows dev machine -
+ * see hw_expansion.h/hw_oled.h. No-ops, present only so
+ * client.c/server.c/session.c can call these unconditionally on either
+ * platform. */
+void ui_notify_message_pending(int hw_fd)
+{
+    (void)hw_fd;
+}
+
+void ui_set_oled_fd(int fd)
+{
+    (void)fd;
+}
+
+void ui_report_rtt(int rtt_ms)
+{
+    (void)rtt_ms;
 }
 
 #endif /* __linux__ */
