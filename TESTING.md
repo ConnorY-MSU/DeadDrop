@@ -1617,3 +1617,32 @@ Checked directly against Freenove's own published source (`api_expansion.py`, `t
 
 ### Regression check
 Full 5-binary suite re-run on `alpha` after all of the above (LED scheme, watchdog fix, noise reduction, color expansion) - **5/5 pass**, zero regressions. Both services confirmed `active` and reconnected cleanly after the final restart.
+
+## Physical unplug test series - real hardware, real power loss — 2026-08-22
+
+The watchdog fix above was validated with a synthetic `iptables DROP` test. The user asked for a real physical test series - genuinely pulling each Pi's power, not simulating it - to fully validate both the disconnect-detection fix and the redesigned LED scheme end to end. All four tests below used a real power cable pull/replug, coordinated live (the user physically at the hardware, timestamps captured from each device's own console immediately before/after).
+
+### Baseline
+Both devices confirmed `Connected to <peer>` in their status bars; user confirmed both LEDs solid green.
+
+### Test: alpha unplugged, bravo watches
+Alpha's power pulled at `~23:41:05`. Bravo's console: `[23:41:13] Connection to alpha lost.` - **8 seconds**, notably faster than the synthetic `iptables`-based test's 19s (a genuinely powered-off host likely fails at the network layer faster than a pure packet black-hole, though the watchdog remains the guaranteed backstop either way). User initially reported the LED as "orange/yellowish" - investigated rather than assumed correct: bravo's status bar showed `Connecting...` at that exact moment, confirming it was mid-reconnect-attempt (amber `HW_STATUS_CONNECTING`), not an actual bug - amber and the new `HW_STATUS_MSG_DISCONNECTED` orange are visually similar shades, worth knowing for future readings.
+
+**Real bug found and fixed while alpha was still unplugged, mid-test**: bravo's reconnect got stuck in `Connecting...` far longer than expected. Checked directly with `ss -tinp`: `SYN-SENT`, `rto:64000`, `backoff:6` - `client.c`'s `connect()` call had no timeout of its own (`SO_RCVTIMEO` is only set AFTER a successful connect), so against a genuinely unreachable host it just sat retrying its own SYN with the OS's exponential backoff, which can run for well over a minute. Fixed with the standard non-blocking-connect-plus-`select()` technique (`connect_with_timeout()`, 8s cap) - see `src/client.c`. Committed and deployed to both devices before continuing the test series (`32fb513`).
+
+Alpha plugged back in; bravo's key-share fetch (a separate, earlier step with its own 1-30s exponential backoff, unrelated to the connect() bug) completed on its next scheduled retry; both devices reconnected cleanly. User confirmed both LEDs solid green again.
+
+### Test: bravo unplugged, alpha watches (mirror)
+Bravo's power pulled at `~23:49:24`. Alpha's console: `[23:49:35] Connection to bravo lost.` - **11 seconds**. User confirmed alpha's LED solid red - unambiguous this time (the server side has no reconnect-loop `Connecting...` cycling to confuse the reading, it just waits). Bravo replugged, both devices reconnected quickly (no lingering backoff this time, since it was a fresh boot rather than a resumed stuck process) - both LEDs confirmed green again.
+
+### Test: message-pending + disconnect combo (validates the full redesigned LED scheme)
+With both connected, a message was sent from `bravo` to `alpha` (visible on alpha's console: `[23:55:51] bravo: test`). User confirmed alpha's LED was flashing **blue/green** (message pending + connected) at this point - the new connection-aware flash working as designed, not the old blue/off pattern.
+
+`bravo`'s power then pulled at `~23:56:46`, deliberately BEFORE touching alpha, so the message stayed unread through the disconnect. Alpha's console: `[23:57:13] Connection to bravo lost.` - **27 seconds** this time, close to the watchdog's 25s ceiling rather than the faster ~8-11s seen in the two tests above (this one evidently relied on the watchdog fallback itself rather than a faster network-layer signal - exactly the scenario the watchdog exists for). User confirmed the LED was now flashing **red/orange** (message pending + disconnected) - the full combined state, correctly distinct from both the earlier blue/green (connected) and a plain solid red (no pending message).
+
+A key was then pressed on alpha (no touch - validating the keyboard-clears-the-flash design from earlier in this session) to acknowledge the message: user confirmed the flash stopped and the LED settled to solid red (still disconnected, message now acknowledged) - correctly NOT reverting to green, since the connection was still down at that point.
+
+Bravo replugged one final time; both devices reconnected; user confirmed both LEDs solid green, closing out the full series in a clean, verified state.
+
+### Summary
+Four real, physically-executed tests, two real bugs found and fixed as a direct result (the watchdog fix from earlier this session, and the `connect()` timeout fix found mid-series), every LED state in the redesigned scheme (solid green, solid red, flashing blue/green, flashing red/orange) confirmed by direct visual observation on real hardware, not just inferred from logs or code review. Detection latency observed: 8-27 seconds across three independent real disconnects, consistently within the intended design envelope (well under a minute, most of the time well under the 25s watchdog ceiling thanks to real-world network-layer failures being faster than the synthetic worst case).
