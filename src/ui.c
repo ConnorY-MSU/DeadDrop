@@ -153,24 +153,44 @@ static int g_self_is_alpha = 1;
 #define CP_ACCENT   9 /* secondary accents (splash subtitle, WiFi
                           transient states): cyan on black */
 #define CP_TIMESTAMP 10 /* the "[HH:MM:SS] " prefix on every history
-                          line: blue on black - 2026-08-22, split out
+                          line: YELLOW on black - 2026-08-22, split out
                           from CP_SYSTEM specifically so timestamps read
                           as quiet metadata distinct from the system
                           notices that follow them, per direct request
                           to increase color differentiation between
-                          output "kinds." */
-#define CP_ERROR    11 /* errors/failures: red on black - see
+                          output "kinds." Was blue until 2026-08-23,
+                          when CP_NODE_BRAVO/CP_STATUS became blue too
+                          (see CP_NODE_ALPHA/CP_NODE_BRAVO below) -
+                          moved to yellow (unclaimed by any other pair)
+                          per direct request, since a blue timestamp
+                          prefix sitting right next to a blue "Bravo:"
+                          name made the two easy to visually conflate,
+                          exactly the identity-color confusion this
+                          whole scheme exists to prevent. */
+#define CP_ERROR    11 /* errors/failures: MAGENTA on black - see
                           ui_add_error()/ui_add_errorf(), the new
                           sibling to ui_add_history()/ui_add_historyf()
                           for anything that represents a real failure
                           (socket/handshake/send errors, rejected
                           certs, etc.), as opposed to routine status
-                          notices (still CP_SYSTEM). Same red as
-                          CP_LOCKED - never shown in the same place at
-                          the same time (that's a dedicated overlay
-                          window, this is a history line color), and
-                          "red = something's wrong" is the same
-                          intuitive meaning in both places. */
+                          notices (still CP_SYSTEM). Was red until
+                          2026-08-23, moved for the same reason
+                          CP_TIMESTAMP moved off blue - CP_NODE_ALPHA
+                          claimed red as Alpha's identity color, so an
+                          error line and an "Alpha: ..." message line
+                          were no longer visually distinguishable by
+                          color alone, defeating the entire point of
+                          identity coloring (mistaking a real failure
+                          for something Alpha said, or vice versa).
+                          Magenta is otherwise fully unclaimed in this
+                          palette and reads clearly as "something's
+                          off" without colliding with either identity.
+                          CP_LOCKED is intentionally NOT changed here -
+                          it's a full-screen overlay word ("LOCKED"),
+                          never adjacent to a "Name: text" line the way
+                          history-pane colors are, so it doesn't create
+                          the same misattribution risk red now does
+                          for CP_ERROR. */
 #define CP_NODE_ALPHA 12 /* Alpha's identity color: RED on black.
                           Originally just the splash's "Twin Nodes"
                           ALPHA box (2026-08-23); expanded the same day
@@ -1137,17 +1157,35 @@ void ui_init(const char *peer_label)
     /* This device IS whichever of the two names peer_label is NOT -
      * see g_self_is_alpha's own declaration comment. Computed before
      * anything else in here since the very first thing that needs it
-     * (CP_STATUS's background color, below) happens early too. Checks
-     * specifically for "Bravo" (self is Alpha unless the peer really
-     * is Bravo) rather than the reverse, so a NULL or unexpected
-     * peer_label defaults to the more common single-device dev/test
-     * invocation (client.c, peer "Alpha") rather than silently
-     * guessing wrong for an unrecognized string either way - there's
-     * no way to be genuinely correct for an input outside this
-     * project's fixed two-name set, so this just picks the
-     * least-surprising default instead of failing loudly over a
-     * cosmetic color choice. */
-    g_self_is_alpha = (peer_label == NULL || strcmp(peer_label, "Bravo") != 0);
+     * (CP_STATUS's background color, below) happens early too.
+     *
+     * REAL BUG FOUND AND FIXED (2026-08-23): this used to read
+     * `strcmp(peer_label, "Bravo") != 0` - i.e. "self is Alpha unless
+     * the peer is Bravo" - which is backwards. The peer's name and
+     * self's name are always the OPPOSITE one of this project's two
+     * fixed names (see peer_label's own parameter comment on
+     * run_symmetric_session() and self_label's matching comment in
+     * session.c, which has always had this the correct way around):
+     * if the PEER is Bravo, THIS device is the one talking to Bravo,
+     * which makes it Alpha - so the check must be `== 0`, not `!= 0`.
+     * Caught via direct hardware verification (decoding the actual
+     * /dev/vcsa1 attribute bytes for the status bar, not just its
+     * text) after a report that the status bar's color looked
+     * backwards - confirmed: alpha's bar was rendering blue (Bravo's
+     * color) and bravo's was rendering red (Alpha's color), exactly
+     * the inversion this formula produces. Every message-coloring/
+     * capitalization check earlier the same day happened to look
+     * correct anyway, since those all go through session.c's
+     * independently (and correctly) computed self_label, not this
+     * variable - only CP_STATUS (the status bar background) was
+     * actually wrong. NULL/unexpected peer_label still defaults to
+     * "self is Alpha" (matches this project's more common single-
+     * device dev/test invocation, client.c's own default peer
+     * "Alpha") - not a claim of correctness for a genuinely
+     * unrecognized name, just the least-surprising default for a
+     * cosmetic color choice with no way to be truly correct outside
+     * this project's fixed two-name set. */
+    g_self_is_alpha = (peer_label == NULL || strcmp(peer_label, "Bravo") == 0);
 
     initscr();
     cbreak();
@@ -1188,8 +1226,8 @@ void ui_init(const char *peer_label)
         init_pair(CP_INPUT, COLOR_CYAN, COLOR_BLACK);
         init_pair(CP_BANNER, COLOR_WHITE, COLOR_BLACK);
         init_pair(CP_ACCENT, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_TIMESTAMP, COLOR_BLUE, COLOR_BLACK);
-        init_pair(CP_ERROR, COLOR_RED, COLOR_BLACK);
+        init_pair(CP_TIMESTAMP, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(CP_ERROR, COLOR_MAGENTA, COLOR_BLACK);
         init_pair(CP_NODE_ALPHA, COLOR_RED, COLOR_BLACK);
         init_pair(CP_NODE_BRAVO, COLOR_BLUE, COLOR_BLACK);
     }
