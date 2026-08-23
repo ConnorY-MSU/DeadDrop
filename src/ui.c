@@ -1324,6 +1324,75 @@ void ui_destroy_history(void)
  * busy-loop. */
 #define UI_POLL_SLICE_MS 20
 
+/* Runs an actual WiFi scan and renders the result - either the network
+ * list (entering UI_MODE_WIFI_SELECT) or a "found nothing" error
+ * (falling back to UI_MODE_NORMAL). Factored out of ui_poll_line()'s
+ * own Ctrl+W handling (2026-08-23) so the exact same flow can also be
+ * triggered automatically at idle-thread startup if there's no
+ * connectivity yet - see idle_input_thread_main()'s own comment on
+ * why that's a separate, one-time call site rather than reusing the
+ * periodic 15s connectivity check below for it. MUST be called with
+ * ui_mutex NOT held (wifi_scan() is a slow, real subprocess call -
+ * see this file's WiFi block comment's SLOW OPERATIONS note) and with
+ * ui_mode already set to UI_MODE_WIFI_SCANNING by the caller (done
+ * while briefly holding ui_mutex) so the screen actually shows
+ * "Scanning..." while this runs, rather than looking frozen. */
+static void perform_wifi_scan_flow(void)
+{
+    int n = wifi_scan(wifi_scan_results, WIFI_SCAN_MAX_RESULTS);
+    wifi_scan_count = (n > 0) ? n : 0;
+
+    pthread_mutex_lock(&ui_mutex);
+    if (wifi_scan_count > 0) {
+        int i;
+        /* Remember exactly which ABSOLUTE line (see
+         * history_total_lines' declaration comment) the list gets
+         * drawn at, so a touch tap can be mapped back to a specific
+         * entry - see wifi_list_header_row's own declaration comment.
+         * Forcing history_following=1 here (regardless of any prior
+         * scroll state) and refreshing right after means the
+         * just-drawn list is what the viewport is actually showing
+         * when the user taps it - including staying correct if an
+         * incoming chat message arrives and nudges the live view up a
+         * line while the list is still showing, since
+         * handle_tap_locked()'s WIFI_SELECT branch reads
+         * history_view_line at TAP time, not a cached value from when
+         * the list was drawn. */
+        int wifi_width = getmaxx(history_win);
+        const char *header_text =
+            "WiFi networks found (Ctrl+W to cancel):";
+        wifi_list_header_row = history_total_lines;
+        wprintw(history_win, "%s\n", header_text);
+        history_total_lines += wrapped_row_count(
+            (int)strlen(header_text), wifi_width);
+        for (i = 0; i < wifi_scan_count; i++) {
+            char entry[128];
+            snprintf(entry, sizeof(entry), "  %d) %s%s",
+                     i + 1, wifi_scan_results[i].ssid,
+                     wifi_scan_results[i].secured
+                         ? " (secured)" : " (open)");
+            wprintw(history_win, "%s\n", entry);
+            history_total_lines += wrapped_row_count(
+                (int)strlen(entry), wifi_width);
+        }
+        history_following = 1;
+        refresh_history_viewport_locked();
+        ui_mode = UI_MODE_WIFI_SELECT;
+        input_len = 0;
+        input_buf[0] = '\0';
+    } else {
+        ui_mode = UI_MODE_NORMAL;
+    }
+    redraw_input_locked();
+    pthread_mutex_unlock(&ui_mutex);
+
+    if (wifi_scan_count <= 0) {
+        ui_add_error(
+            "WiFi scan found no networks (or nmcli failed) "
+            "- Ctrl+W to try again.");
+    }
+}
+
 ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                              int timeout_ms)
 {
@@ -1707,61 +1776,10 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
             }
 
             if (pending_action == UI_PENDING_WIFI_SCAN) {
-                int n = wifi_scan(wifi_scan_results, WIFI_SCAN_MAX_RESULTS);
-                wifi_scan_count = (n > 0) ? n : 0;
-
-                pthread_mutex_lock(&ui_mutex);
-                if (wifi_scan_count > 0) {
-                    int i;
-                    /* Remember exactly which ABSOLUTE line (see
-                     * history_total_lines' declaration comment) the list
-                     * gets drawn at, so a touch tap can be mapped back to
-                     * a specific entry - see wifi_list_header_row's own
-                     * declaration comment. Forcing history_following=1
-                     * here (regardless of any prior scroll state) and
-                     * refreshing right after means the just-drawn list is
-                     * what the viewport is actually showing when the
-                     * user taps it - including staying correct if an
-                     * incoming chat message arrives and nudges the live
-                     * view up a line while the list is still showing,
-                     * since handle_tap_locked()'s WIFI_SELECT branch
-                     * reads history_view_line at TAP time, not a cached
-                     * value from when the list was drawn. */
-                    {
-                        int wifi_width = getmaxx(history_win);
-                        const char *header_text =
-                            "WiFi networks found (Ctrl+W to cancel):";
-                        wifi_list_header_row = history_total_lines;
-                        wprintw(history_win, "%s\n", header_text);
-                        history_total_lines += wrapped_row_count(
-                            (int)strlen(header_text), wifi_width);
-                        for (i = 0; i < wifi_scan_count; i++) {
-                            char entry[128];
-                            snprintf(entry, sizeof(entry), "  %d) %s%s",
-                                     i + 1, wifi_scan_results[i].ssid,
-                                     wifi_scan_results[i].secured
-                                         ? " (secured)" : " (open)");
-                            wprintw(history_win, "%s\n", entry);
-                            history_total_lines += wrapped_row_count(
-                                (int)strlen(entry), wifi_width);
-                        }
-                    }
-                    history_following = 1;
-                    refresh_history_viewport_locked();
-                    ui_mode = UI_MODE_WIFI_SELECT;
-                    input_len = 0;
-                    input_buf[0] = '\0';
-                } else {
-                    ui_mode = UI_MODE_NORMAL;
-                }
-                redraw_input_locked();
-                pthread_mutex_unlock(&ui_mutex);
-
-                if (wifi_scan_count <= 0) {
-                    ui_add_error(
-                        "WiFi scan found no networks (or nmcli failed) "
-                        "- Ctrl+W to try again.");
-                }
+                /* Shared with the automatic no-connectivity-at-boot
+                 * trigger in idle_input_thread_main() - see
+                 * perform_wifi_scan_flow()'s own comment. */
+                perform_wifi_scan_flow();
             } else if (pending_action == UI_PENDING_WIFI_CONNECT) {
                 char errbuf[256];
                 char ssid_copy[WIFI_SSID_MAX];
@@ -1856,6 +1874,67 @@ static void *idle_input_thread_main(void *arg)
         below, which now actually queues this instead of discarding it */
     time_t last_connectivity_check = 0;
     (void)arg;
+
+    /* AUTOMATIC WIFI SETUP ON BOOT (2026-08-23, direct request): if
+     * there's no real network path out the moment this thread starts -
+     * which now happens very early in boot, right after ui_init() and
+     * well before the main thread's own peer-connect attempt even
+     * begins (see client.c/server.c's "REAL BUG FOUND AND FIXED"
+     * comment on why ui_init() moved earlier) - jump straight into
+     * the WiFi setup flow automatically instead of only hinting at
+     * Ctrl+W and waiting on a keypress that might never come.
+     *
+     * Runs exactly ONCE, here, before the main loop starts below - NOT
+     * folded into the loop's own periodic UI_CONNECTIVITY_CHECK_SECONDS
+     * re-check further down. That's deliberate: if the user cancels
+     * back out of WiFi setup (Ctrl+W) while still genuinely
+     * unconnected, this must NOT immediately shove them back into it
+     * 15 seconds later - that would be exactly the kind of unwanted
+     * interruption/cycling this exists to avoid, not cause. A
+     * cancelled-out user still gets the existing passive status-bar
+     * hint ("No network found - press Ctrl+W...") from the loop below,
+     * they just aren't forced back into the flow against their will.
+     *
+     * This is the very first thing this thread does, so ui_mode is
+     * still whatever ui_init() left it as (NORMAL, or LOCKED if a PIN
+     * is already configured) in the overwhelmingly common case - the
+     * ui_mode == UI_MODE_NORMAL guard below is what actually enforces
+     * this, taken under ui_mutex, the same guard Ctrl+W's own manual
+     * entry point already uses, so a locked screen still can't be
+     * bypassed into WiFi setup this way either (matches "don't expose
+     * network settings without unlocking first"). The touch thread
+     * (already running by this point - see ui_start_touch(), called
+     * from inside ui_init() itself) is the only other thing that could
+     * plausibly change ui_mode this early, and it's fine if it does:
+     * this check just reads whatever ui_mode genuinely is under the
+     * lock at that instant, so a coincidental tap racing this either
+     * lands first (this check correctly backs off, nothing to fix) or
+     * after (no different than any other Ctrl+W-vs-tap interleaving
+     * this file already handles). The main thread's own
+     * load_private_key()/keyshare_reconstruct() retry loop runs on a
+     * separate thread and never touches ui_mode or this thread's
+     * history/redraw calls at all, so it cannot interrupt this flow
+     * either - the two are fully independent, by construction, not
+     * just by luck. */
+    pthread_mutex_lock(&ui_mutex);
+    if (ui_mode == UI_MODE_NORMAL && !wifi_has_connectivity()) {
+        ui_mode = UI_MODE_WIFI_SCANNING;
+        redraw_input_locked();
+        pthread_mutex_unlock(&ui_mutex);
+        ui_add_history(NULL,
+            "No network detected at boot - starting WiFi setup "
+            "automatically (Ctrl+W to cancel).");
+        perform_wifi_scan_flow();
+        /* Seed the loop's own first-iteration check (below) to "just
+         * checked" rather than its default 0 (epoch, i.e. "overdue"),
+         * so it doesn't immediately re-evaluate connectivity and
+         * overwrite the status bar the instant this returns - one
+         * connectivity determination per boot is enough to act on
+         * here; the loop's normal 15s cadence takes over from here. */
+        last_connectivity_check = time(NULL);
+    } else {
+        pthread_mutex_unlock(&ui_mutex);
+    }
 
     while (!idle_thread_should_stop) {
         ui_poll_result pr = ui_poll_line(dummy, sizeof(dummy), 200);
