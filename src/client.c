@@ -278,26 +278,31 @@ static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
         snprintf(key_enc_path, sizeof(key_enc_path), "%s/key.enc",
                   keyshare_dir);
 
-        printf("Fetching this device's key-share from its paired "
-                "device over Tailscale (retrying until it's "
-                "reachable)...\n");
-        fflush(stdout);
+        /* Runs after ui_init()/ui_start_idle_input() now (see main()'s
+         * own comment on why that moved earlier) - ui_add_history()/
+         * ui_add_error(), not printf/fprintf, so a real, possibly very
+         * long wait here (keyshare_reconstruct()'s retry loop has no
+         * timeout) doesn't corrupt the ncurses screen, and the idle-
+         * input thread stays free to service a Ctrl+W WiFi-setup
+         * detour the whole time this blocks on the main thread. */
+        ui_add_history(NULL,
+            "Fetching this device's key-share from its paired device "
+            "over Tailscale (retrying until it's reachable)...");
         rc = keyshare_reconstruct(local_share_path, peer_ip, peer_hostname,
                                     custody_path, KEYSHARE_PORT, K);
         if (rc != 0) {
-            fprintf(stderr, "keyshare_reconstruct failed - check the "
-                    "-K directory's files exist and are readable\n");
+            ui_add_error("keyshare_reconstruct failed - check the "
+                          "-K directory's files exist and are readable");
             return -1;
         }
-        printf("Key-share reconstructed.\n");
-        fflush(stdout);
+        ui_add_history(NULL, "Key-share reconstructed.");
 
         pem_len = keyshare_decrypt_private_key(key_enc_path, K, pem_buf,
                                                  sizeof(pem_buf));
         memset(K, 0, sizeof(K));
         if (pem_len < 0) {
-            fprintf(stderr, "keyshare_decrypt_private_key failed - "
-                    "check the -K directory's key.enc file\n");
+            ui_add_error("keyshare_decrypt_private_key failed - "
+                          "check the -K directory's key.enc file");
             return -1;
         }
 
@@ -305,8 +310,8 @@ static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
                                                  WOLFSSL_FILETYPE_PEM);
         memset(pem_buf, 0, sizeof(pem_buf));
         if (rc != WOLFSSL_SUCCESS) {
-            fprintf(stderr,
-                "wolfSSL_CTX_use_PrivateKey_buffer failed (rc=%d)\n", rc);
+            ui_add_errorf(
+                "wolfSSL_CTX_use_PrivateKey_buffer failed (rc=%d)", rc);
             return -1;
         }
         return 0;
@@ -314,9 +319,9 @@ static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
 
     rc = wolfSSL_CTX_use_PrivateKey_file(ctx, key_path, WOLFSSL_FILETYPE_PEM);
     if (rc != WOLFSSL_SUCCESS) {
-        fprintf(stderr,
+        ui_add_errorf(
             "wolfSSL_CTX_use_PrivateKey_file failed (rc=%d) - check "
-            "the -k path was given correctly\n", rc);
+            "the -k path was given correctly", rc);
         return -1;
     }
     return 0;
@@ -564,15 +569,36 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* SECURITY: nothing printed from here through ui_init() below
-     * includes a filesystem path, deliberately - see server.c's
-     * matching comment. Confirmed via real physical-console testing
-     * that this output is genuinely visible on the touchscreen. */
+    /* REAL BUG FOUND AND FIXED (2026-08-23): ui_init()/ui_start_idle_input()
+     * used to run much later, only after certificate/key/CA loading
+     * (including load_private_key() below, which can call
+     * keyshare_reconstruct() - a retry loop with NO timeout by design,
+     * see keyshare.c) had already fully succeeded. That meant if this
+     * device had no network path to its peer at boot at all - e.g. it's
+     * in range of only an unrecognized WiFi network NetworkManager won't
+     * auto-join, a real field scenario the user hit directly - the whole
+     * boot sequence stalled forever with no UI, no WiFi-setup screen, no
+     * way for anyone to intervene at all. Moved up here specifically so
+     * the idle-input thread (Ctrl+W/WiFi setup, see ui.h's "IDLE INPUT"
+     * comment) is ALREADY running while load_private_key() blocks on the
+     * main thread below - a real network problem can now actually be
+     * fixed from the touchscreen/keyboard instead of requiring a silent,
+     * unrecoverable wait. Everything from here on goes through
+     * ui_add_error()/ui_add_history() instead of fprintf/printf, same
+     * "don't corrupt the ncurses screen" reasoning this file already
+     * documented below - it just starts earlier now. The original
+     * "nothing printed here includes a filesystem path" security property
+     * is unaffected either way: none of these messages ever included a
+     * raw path value, before or after this move. */
+    ui_init("alpha");
+    ui_start_idle_input();
+    ui_set_status("Loading credentials...");
+
     rc = wolfSSL_CTX_use_certificate_file(ctx, cert_path, WOLFSSL_FILETYPE_PEM);
     if (rc != WOLFSSL_SUCCESS) {
-        fprintf(stderr,
+        ui_add_errorf(
             "wolfSSL_CTX_use_certificate_file failed (rc=%d) - check "
-            "the -c path was given correctly\n", rc);
+            "the -c path was given correctly", rc);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -599,9 +625,9 @@ int main(int argc, char *argv[])
 
     rc = wolfSSL_CTX_load_verify_locations(ctx, ca_path, NULL);
     if (rc != WOLFSSL_SUCCESS) {
-        fprintf(stderr,
+        ui_add_errorf(
             "wolfSSL_CTX_load_verify_locations failed (rc=%d) - check "
-            "the -A path was given correctly\n", rc);
+            "the -A path was given correctly", rc);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -610,28 +636,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("wolfSSL initialized; certificate, key, and CA loaded.\n");
+    ui_add_history(NULL,
+        "wolfSSL initialized; certificate, key, and CA loaded.");
 
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
-    /* Everything from here on runs after the UI takes over the terminal
-     * (real ncurses on Linux; unchanged plain console on the dev
-     * machine - see ui.h). Every printf/fprintf below this point in
-     * main(), connect_and_run(), and session.c has been converted to
-     * ui_set_status()/ui_add_history() calls specifically because a
-     * stray direct print once ncurses is active would corrupt the
-     * screen it manages - see ui.h's top comment. Everything ABOVE this
-     * point (argument/cert/CTX setup) deliberately stays plain output,
-     * since it can fail before there's any UI to report through. */
-    ui_init("alpha");
-
-    /* Lock-screen interaction (Ctrl+L, PIN entry) needs to work even
-     * while disconnected/reconnecting, not just inside an active
-     * session - see ui.h's "IDLE INPUT" comment. Started here, once,
-     * covering the reconnect loop's idle periods; connect_and_run()
-     * brackets each run_symmetric_session() call with the matching
-     * stop/start pair. */
-    ui_start_idle_input();
+    /* Restore the "about to connect" status now that credential loading
+     * (which may have taken a while, or needed a WiFi-setup detour via
+     * the idle-input thread started above) has actually finished -
+     * ui_init() shows a generic version of this automatically at startup,
+     * overwritten by "Loading credentials..." above; this puts the
+     * accurate message back now that loading is done. */
+    ui_set_status("Connecting to alpha...");
 
     /* Case RGB status light (no-op on non-Linux / hardware-absent - see
      * hw_expansion.h). Opened once here, kept open for the whole
