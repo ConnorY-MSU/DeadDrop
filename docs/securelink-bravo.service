@@ -40,5 +40,57 @@ TTYVTDisallocate=yes
 Restart=always
 RestartSec=5
 
+# SANDBOXING (2026-08-23 security audit). A CAREFULLY SCOPED subset,
+# not a blanket hardening template - this device's real runtime needs
+# (sudo-invoked nmcli for WiFi setup, which itself talks to
+# NetworkManager over D-Bus/AF_UNIX; a real TTY at /dev/tty1; /dev/i2c-1
+# for the OLED/RGB hardware; /dev/input/eventN for touch; espeak-ng as
+# a forked child for TTS) rule out several of the usual aggressive
+# directives, and each exclusion below is deliberate, not an oversight:
+#
+# - NoNewPrivileges: NOT set (would prevent execve() of any setuid
+#   binary, including /usr/bin/sudo itself - the WiFi setup screen's
+#   sudo-invoked nmcli calls would silently stop working).
+# - RestrictAddressFamilies: NOT set - nmcli (invoked via sudo, but
+#   still a child of this process, inheriting the same seccomp filter)
+#   talks to NetworkManager over D-Bus, which needs AF_UNIX; enumerating
+#   every family every child process genuinely needs (including
+#   whatever wolfSSL/getaddrinfo/tailscale's own tooling touch) is real
+#   work not rushed through in one pass against a live field device.
+# - CapabilityBoundingSet: NOT restricted - an empty/reduced bounding
+#   set would neuter sudo too (a setuid-root exec only grants
+#   capabilities up to the PARENT's own bounding set at exec time).
+# - ProtectSystem=strict, PrivateDevices, PrivateTmp, SystemCallFilter:
+#   NOT set - each has plausible interaction with the hardware access
+#   (I2C/touch/TTY) or the espeak-ng subprocess this device needs, and
+#   verifying every one safely needs more time than a single pass
+#   allows without real risk of silently bricking a field device with
+#   no easy remote recovery path. Worth a dedicated future pass.
+#
+# What IS added below has been checked against every one of those real
+# runtime needs and found to have no plausible interaction - the app
+# never touches kernel tunables/modules/logs, cgroups, the system
+# clock/hostname, namespaces, realtime scheduling, personality(2), or
+# W^X memory mappings; and the app's own on-disk writes (message log,
+# PIN hash, received files - see msglog.c/lock.c/session.c) are ALL
+# confirmed, by direct source-code check before writing this, to live
+# under exactly one directory: $HOME/.securelink - so ProtectHome can
+# be read-only everywhere else in the home directory (~/pki, ~/keyshare,
+# ~/securelink itself all stay READABLE, just not writable, which is
+# all this process ever needs from them).
+ProtectHome=read-only
+ReadWritePaths=/home/connor/.securelink
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+
 [Install]
 WantedBy=multi-user.target

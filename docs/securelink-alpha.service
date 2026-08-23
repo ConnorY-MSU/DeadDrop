@@ -92,5 +92,32 @@ TTYVTDisallocate=yes
 Restart=always
 RestartSec=5
 
+# SANDBOXING (2026-08-23 security audit) - see securelink-bravo.service's
+# matching block for the full reasoning on what's included/excluded and
+# why. Identical here: this device's real runtime needs (sudo-invoked
+# nmcli over D-Bus for WiFi setup, a real TTY, /dev/i2c-1, touch input,
+# espeak-ng as a forked child) rule out several of the usual aggressive
+# directives (NoNewPrivileges, RestrictAddressFamilies,
+# CapabilityBoundingSet, ProtectSystem=strict, PrivateDevices,
+# PrivateTmp, SystemCallFilter) - each excluded deliberately, not by
+# oversight. What's included below has been checked against every one
+# of those needs and found to have no plausible interaction, and the
+# app's own on-disk writes (message log, PIN hash, received files) are
+# all confirmed, by direct source-code check, to live under exactly
+# $HOME/.securelink.
+ProtectHome=read-only
+ReadWritePaths=/home/connor/.securelink
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+
 [Install]
 WantedBy=multi-user.target
