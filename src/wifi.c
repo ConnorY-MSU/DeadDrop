@@ -105,6 +105,55 @@ static int run_nmcli(char *const argv[], char *out_buf, size_t out_buf_size)
  * "obviously" pointless. */
 #define WIFI_SCAN_SETTLE_SECONDS 4
 
+/* parse_escaped_ssid_field - shared by wifi_scan() and
+ * wifi_get_link_info(), extracted during the 2026-08-23 security audit
+ * (previously duplicated inline in both, byte-for-byte identical logic
+ * in two places - a real risk that a future fix to one copy wouldn't
+ * get applied to the other, the same silent-divergence bug class this
+ * project has hit before). Parses one colon-delimited, colon-escaped
+ * ("\:" for a literal ':') SSID field starting at *cursor, writes up
+ * to out_size-1 bytes (always NUL-terminated, silently truncating a
+ * pathologically long SSID rather than overflowing - real 802.11 SSIDs
+ * are capped at 32 bytes by the standard itself, but this is parsing
+ * text from an external CLI tool's output, not trusting that cap
+ * structurally). Advances *cursor past the field's trailing colon (to
+ * the start of whatever field follows) - if the line ends before an
+ * unescaped colon is found, *cursor is left at the terminating NUL.
+ * Genuinely fuzz-tested (build/wifi_fuzz.c, throwaway, ASan+UBSan,
+ * random+mutated inputs) after this extraction specifically so both
+ * call sites get that coverage instead of neither. */
+static void parse_escaped_ssid_field(const char **cursor, char *out_ssid,
+                                       size_t out_size)
+{
+    const char *p = *cursor;
+    size_t si = 0;
+
+    if (out_size == 0) {
+        /* Defensive only - every real call site passes a fixed,
+         * non-zero stack/struct buffer size, never a caller-supplied
+         * variable, so this never actually triggers. Guards against
+         * out_size - 1 underflowing to SIZE_MAX below if that ever
+         * changes, rather than relying on "no caller would ever do
+         * that" being true forever. */
+        *cursor = p;
+        return;
+    }
+
+    while (*p != '\0' && si < out_size - 1) {
+        if (p[0] == '\\' && p[1] == ':') {
+            out_ssid[si++] = ':';
+            p += 2;
+        } else if (*p == ':') {
+            p++; /* now points at the start of the next field */
+            break;
+        } else {
+            out_ssid[si++] = *p++;
+        }
+    }
+    out_ssid[si] = '\0';
+    *cursor = p;
+}
+
 int wifi_scan(wifi_network *out_networks, int max_results)
 {
     char buf[8192];
@@ -172,22 +221,12 @@ int wifi_scan(wifi_network *out_networks, int max_results)
          * escape this format uses. Split on the first UNESCAPED
          * colon to separate SSID from SECURITY. */
         char ssid[WIFI_SSID_MAX];
-        size_t si = 0;
-        char *p = line;
+        const char *p = line;
         int secured;
+        size_t si;
 
-        while (*p != '\0' && si < sizeof(ssid) - 1) {
-            if (p[0] == '\\' && p[1] == ':') {
-                ssid[si++] = ':';
-                p += 2;
-            } else if (*p == ':') {
-                p++; /* now points at the start of the SECURITY field */
-                break;
-            } else {
-                ssid[si++] = *p++;
-            }
-        }
-        ssid[si] = '\0';
+        parse_escaped_ssid_field(&p, ssid, sizeof(ssid));
+        si = strlen(ssid);
 
         /* REAL BUG FOUND AND FIXED (2026-08-23): nmcli's *human-
          * readable* SECURITY column prints "--" for an open network,
@@ -359,21 +398,10 @@ int wifi_get_link_info(wifi_link_info *out_info)
             /* Same escaped-colon-aware SSID parsing as wifi_scan() -
              * an SSID can legitimately contain a literal ':', escaped
              * as '\:' in nmcli's terse output. */
-            char *p = line + 4;
-            size_t si = 0;
+            const char *p = line + 4;
 
-            while (*p != '\0' && si < sizeof(out_info->ssid) - 1) {
-                if (p[0] == '\\' && p[1] == ':') {
-                    out_info->ssid[si++] = ':';
-                    p += 2;
-                } else if (*p == ':') {
-                    p++; /* now at the start of "signal:rate" */
-                    break;
-                } else {
-                    out_info->ssid[si++] = *p++;
-                }
-            }
-            out_info->ssid[si] = '\0';
+            parse_escaped_ssid_field(&p, out_info->ssid,
+                                       sizeof(out_info->ssid));
 
             out_info->signal_percent = atoi(p);
             {
