@@ -48,7 +48,32 @@
                                keyshare.h. Distinct from SERVER_PORT:
                                this is a separate, minimal bootstrap
                                protocol, not part of PROTOCOL.md. */
-#define LISTEN_BACKLOG 1
+/* REAL BUG FOUND VIA LIVE TESTING (2026-08-23, security audit - TLS
+ * negative-path re-verification): this was 1. This server handles
+ * exactly one connection at a time in a permanent for(;;) accept()
+ * loop (see main()'s own comment) - accept() is only called again
+ * after the CURRENT session fully ends, which for this app's normal
+ * operating mode (two paired devices holding one long-lived session,
+ * potentially for hours or days) can be an arbitrarily long time.
+ * CONN_TIMEOUT_SECONDS below only starts counting once accept()
+ * actually returns a socket - it does nothing for a connection still
+ * sitting in the OS-level accept queue, waiting for accept() to be
+ * called at all. With backlog=1, that queue overflowed after just two
+ * concurrent connection attempts during this exact test session
+ * (confirmed directly: `ss -tn` showed `Recv-Q 2` against `Send-Q 1`
+ * on the listening socket) - any THIRD attempt during that window,
+ * including the legitimate peer's own reconnect after a network blip,
+ * would have been silently dropped at the TCP level rather than
+ * queued, with no application-level log line at all (the app never
+ * even sees a connection it never accept()s). Raised to a small,
+ * still-deliberately-bounded value - enough to absorb a genuine
+ * reconnect race or a burst of a few probing/failed connections
+ * without ever accepting more than one real session at once (mTLS
+ * still rejects every additional connection's handshake as soon as
+ * it IS accept()ed, in the same way it always has - this only affects
+ * how many can wait in line before that rejection happens, not
+ * whether a bad cert is ever accepted). */
+#define LISTEN_BACKLOG 8
 
 #define SERIAL_BUF_SIZE 32
 
