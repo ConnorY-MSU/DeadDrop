@@ -460,17 +460,38 @@ static void ui_draw_centered(WINDOW *win, int row, int col, int width,
     mvwprintw(win, row, col, "%s", buf);
 }
 
+/* How long show_splash() will wait for a dismissal tap before giving up
+ * and proceeding on its own (2026-08-23 - see that function's own
+ * comment for why this is bounded, not a genuinely indefinite wait). */
+#define SPLASH_MAX_WAIT_MS 30000
+
 /* Shown once, full-screen on stdscr, before the panel layout exists -
  * purely cosmetic and blocking nothing real: this runs before any
- * thread (idle-input, touch, receiver) has started. 1.2s is a fixed,
- * deliberate delay meant to be READ, not a technical necessity - for
- * scale, Week 3 Day 4's own benchmark put a full mTLS handshake at
- * ~12-14ms, two orders of magnitude faster than this splash alone. */
+ * thread (idle-input, touch, receiver) has started.
+ *
+ * 2026-08-23 (direct request): now stays on screen until the touchscreen
+ * is tapped, rather than a fixed 1.2s display - for visual effect. This
+ * temporarily opens its OWN touch fd (touch_open()/touch_close(), not
+ * ui_start_touch()'s persistent one, which hasn't started yet at this
+ * point in ui_init() - see this file's touch block comment) and polls it
+ * directly in a bounded loop. Bounded, not genuinely indefinite: this
+ * project has an established "boots and works with zero manual steps"
+ * goal (see the touch block comment's own "receiving always works"
+ * reasoning applied elsewhere) - an unattended field reboot with nobody
+ * there to tap the screen must still eventually proceed on its own,
+ * not sit frozen on a splash forever. SPLASH_MAX_WAIT_MS (30s) is
+ * generous enough to be a real "walk up and see it, tap to continue"
+ * moment without meaningfully delaying a genuinely unattended boot.
+ * Falls back to the original fixed 1.2s display outright if no
+ * touchscreen is attached at all (touch_open() failing) - same
+ * "hardware absence is never fatal" discipline as every other touch-
+ * dependent code path in this project. */
 static void show_splash(void)
 {
     int box_width = 56;
     int col, row;
     const char *subtitle = "[ ENCRYPTED FIELD TERMINAL ]";
+    const char *dismiss_hint = "( tap screen to continue )";
 
     if (box_width > COLS - 2) {
         box_width = COLS - 2;
@@ -513,8 +534,47 @@ static void show_splash(void)
         attroff(COLOR_PAIR(CP_ACCENT));
     }
 
+    if (has_colors()) {
+        attron(COLOR_PAIR(CP_SYSTEM));
+    }
+    {
+        int hintlen = (int)strlen(dismiss_hint);
+        int hintcol = col + (box_width - hintlen) / 2;
+        if (hintcol < 0) {
+            hintcol = col;
+        }
+        mvprintw(row + 6, hintcol, "%s", dismiss_hint);
+    }
+    if (has_colors()) {
+        attroff(COLOR_PAIR(CP_SYSTEM));
+    }
+
     refresh();
-    napms(1200);
+
+    {
+        int splash_touch_fd = touch_open();
+        if (splash_touch_fd >= 0) {
+            int waited_ms = 0;
+            for (;;) {
+                touch_point pt;
+                int rc = touch_read_tap(splash_touch_fd, &pt, 200);
+                if (rc == 1) {
+                    break; /* tapped - dismiss now */
+                }
+                if (rc < 0) {
+                    break; /* device error/gone mid-wait - don't hang on it */
+                }
+                waited_ms += 200;
+                if (waited_ms >= SPLASH_MAX_WAIT_MS) {
+                    break; /* nobody tapped - proceed unattended */
+                }
+            }
+            touch_close(splash_touch_fd);
+        } else {
+            napms(1200); /* no touchscreen at all - original fixed delay */
+        }
+    }
+
     clear();
     refresh();
 }

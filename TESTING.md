@@ -1675,3 +1675,20 @@ Both services confirmed `active` and still fully functional (`Connected to <peer
 
 ### Full regression check
 `test_message` rebuilt (message.c changed) and the full 5-binary suite re-run - **5/5 pass**, zero regressions from adding the new message type.
+
+## Splash sticks around until tapped; a second real touch-hardware bug found — 2026-08-23
+
+`show_splash()` changed from a fixed 1.2s display to staying on screen until the touchscreen is tapped, for visual effect (direct request). Bounded, not genuinely indefinite: opens its own `touch_open()`/`touch_close()` pair (the persistent one from `ui_start_touch()` hasn't started yet at this point in `ui_init()`) and polls in a loop, but gives up and proceeds automatically after `SPLASH_MAX_WAIT_MS` (30s) if nothing taps it - this project has an established "boots and works with zero manual steps" goal, and a genuinely unattended field reboot must still complete on its own. Falls back to the original fixed 1.2s delay outright if no touchscreen is attached at all. A `( tap screen to continue )` hint was added to the banner itself so the new behavior is actually discoverable.
+
+Verified live on both devices: alpha's tap dismissed the splash immediately; bravo's did not, and the splash instead proceeded via the 30s fallback - correctly, with no hang, but revealing a real question about bravo's touch hardware.
+
+### Second real touch-hardware bug found on `bravo` specifically (not a new bug in this feature)
+A synchronized test - restart `bravo`, immediately start a raw `evtest` capture, ask the user to tap in real time - captured **zero raw touch events**, matching the exact evidence pattern from the earlier touch-keyboard investigation (see the 2026-08-22 entries above), but this time isolated to `bravo` specifically (`alpha`'s touch has worked correctly throughout every test this session: lock-dismiss, WiFi-select gestures, and now the splash dismiss). Investigated further rather than just re-flagging the same known issue:
+- `dmesg` on both devices: identical `edt_ft5x06` driver init messages, no errors, no difference between the two units.
+- `i2cdetect -y 11` on `bravo`: the controller responds at `0x38` (shown `UU` - claimed by its kernel driver, not missing from the bus) - the I2C-level connection and driver binding are both provably intact.
+- Despite that, real physical taps produce zero touch events.
+
+This combination (I2C bus fine, driver bound, but zero touch data ever surfaces) points to something downstream of the I2C data connection specifically on `bravo` - most likely a degraded capacitive sensing surface or a disconnected/faulty interrupt line (touch controllers commonly use a separate GPIO interrupt line, distinct from the I2C data lines, to signal "new touch data ready" - a fault there wouldn't show up as an I2C bus error at all). This is at the limit of what's diagnosable over SSH; a physical inspection (ribbon cable/connector reseat) is the next step, and it may simply be a faulty unit. Documented as a known, real hardware issue specific to `bravo`, not fixed here - the splash's 30s bounded fallback already handles it gracefully regardless (confirmed: no hang, boots to the normal UI on its own).
+
+### Splash banner design options
+Per request, `docs/splash-banner-options.md` presents five redesigned banner concepts (an enhanced classic frame, a big block-letter wordmark, a shield/lock icon treatment, a tactical HUD-style frame, and a minimalist boot-log style), each dimensionally verified - programmatically, not by hand-counting - against the confirmed real console size (100x30, `Lat15-Terminus24x12`), using plain ASCII only (matching this project's already-established no-Unicode-glyph-coverage constraint for this font). Awaiting the user's pick before wiring one into `show_splash()`.
