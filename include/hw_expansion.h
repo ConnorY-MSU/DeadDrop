@@ -44,20 +44,39 @@ typedef enum {
 
 /* Connection status this project cares about - the actual RGB values
  * for each meaning live in one place (hw_expansion.c), not scattered
- * across every call site that wants to report a status change. */
+ * across every call site that wants to report a status change.
+ *
+ * 2026-08-22 redesign: the message-pending indicator used to be a
+ * single magenta color, flashed against LED-off regardless of
+ * connection state - genuinely ambiguous (a flashing LED told you
+ * "message," but not whether the link was still up). Replaced with two
+ * connection-aware alert colors instead: ui.c's flash loop now
+ * alternates between the appropriate alert color and the current base
+ * connection color (green or red) - see ui_set_link_state() in ui.h -
+ * so "is there a message" and "is the link up" are both always readable
+ * from the same LED, never one at the expense of the other. */
 typedef enum {
-    HW_STATUS_DISCONNECTED,  /* red     - no active session */
-    HW_STATUS_CONNECTING,    /* amber   - TCP/TLS handshake in progress,
-                               * or a reconnect-with-backoff retry pending */
-    HW_STATUS_CONNECTED,     /* green   - live mTLS session established */
-    HW_STATUS_ALERT           /* magenta - an unacknowledged incoming
-                               * message is pending (see
-                               * ui_notify_message_pending() in ui.h) -
-                               * deliberately distinct from the three
-                               * connection-state colors above so it can
-                               * never be mistaken for one, and matches
-                               * the same magenta used for the ncurses
-                               * UI's own "cyberpunk neon" palette. */
+    HW_STATUS_DISCONNECTED,       /* red    - no active session */
+    HW_STATUS_CONNECTING,         /* amber  - TCP/TLS handshake in
+                                    * progress, or a reconnect-with-
+                                    * backoff retry pending */
+    HW_STATUS_CONNECTED,          /* green  - live mTLS session
+                                    * established, no unread message */
+    HW_STATUS_MSG_CONNECTED,      /* blue   - flash color: an
+                                    * unacknowledged incoming message is
+                                    * pending AND the link is currently
+                                    * up (see ui_notify_message_pending()/
+                                    * ui_set_link_state() in ui.h) -
+                                    * alternated with HW_STATUS_CONNECTED
+                                    * (green), never LED-off, so the link
+                                    * being up stays visible throughout
+                                    * the flash. */
+    HW_STATUS_MSG_DISCONNECTED    /* orange - flash color: an
+                                    * unacknowledged incoming message is
+                                    * pending AND the link is currently
+                                    * DOWN - alternated with
+                                    * HW_STATUS_DISCONNECTED (red) for the
+                                    * same reason. */
 } hw_connection_status;
 
 /*

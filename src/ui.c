@@ -118,6 +118,25 @@ static int ui_active = 0;
 #define CP_BANNER   8 /* splash/lock banner box: white on black */
 #define CP_ACCENT   9 /* secondary accents (splash subtitle, WiFi
                           transient states): cyan on black */
+#define CP_TIMESTAMP 10 /* the "[HH:MM:SS] " prefix on every history
+                          line: blue on black - 2026-08-22, split out
+                          from CP_SYSTEM specifically so timestamps read
+                          as quiet metadata distinct from the system
+                          notices that follow them, per direct request
+                          to increase color differentiation between
+                          output "kinds." */
+#define CP_ERROR    11 /* errors/failures: red on black - see
+                          ui_add_error()/ui_add_errorf(), the new
+                          sibling to ui_add_history()/ui_add_historyf()
+                          for anything that represents a real failure
+                          (socket/handshake/send errors, rejected
+                          certs, etc.), as opposed to routine status
+                          notices (still CP_SYSTEM). Same red as
+                          CP_LOCKED - never shown in the same place at
+                          the same time (that's a dedicated overlay
+                          window, this is a history line color), and
+                          "red = something's wrong" is the same
+                          intuitive meaning in both places. */
 
 /* Deliberately smaller than SL_MAX_BODY_LEN (message.h's 64 KiB
  * protocol cap) - this bounds one INTERACTIVELY TYPED line through a
@@ -328,6 +347,12 @@ static volatile int message_pending_ack = 0;
 static int flash_hw_fd = -1;      /* set per-call by
                                       ui_notify_message_pending() */
 static int metrics_oled_fd = -1;  /* set once by ui_set_oled_fd() */
+static volatile int hw_link_connected = 0; /* kept in sync by
+    ui_set_link_state(), called from client.c/server.c at the same
+    moments they call hw_expansion_set_status_color() with
+    HW_STATUS_CONNECTED/HW_STATUS_DISCONNECTED - see ui.h's comment.
+    Starts 0 (disconnected) since ui_init() always runs before any
+    connection attempt. */
 
 /* Toggle the flash roughly every 400ms (2 x the ~200ms loop period) -
  * fast enough to read as a deliberate "flash," slow enough not to look
@@ -340,8 +365,9 @@ static int metrics_oled_fd = -1;  /* set once by ui_set_oled_fd() */
  * much coarser than the flash toggle above. */
 #define UI_METRICS_REFRESH_ITERS 150
 
-/* Clears message_pending_ack and restores the LED to HW_STATUS_CONNECTED
- * (green) - shared by touch_thread_main() (a real tap - see
+/* Clears message_pending_ack and restores the LED to the current base
+ * connection color (green if hw_link_connected, red otherwise - see
+ * ui_set_link_state()) - shared by touch_thread_main() (a real tap - see
  * handle_tap_locked()'s caller) and ui_poll_line() (a real keystroke -
  * see its UI_MODE_NORMAL branch). Both count as "the device was used" as
  * of the 2026-08-22 rewrite: touch alone used to be the only way to clear
@@ -354,8 +380,8 @@ static int metrics_oled_fd = -1;  /* set once by ui_set_oled_fd() */
  * ui_poll_line() (the idle-input thread or session.c's own caller) since
  * hw_expansion's fd-based calls are thread-safe by construction (no
  * shared mutable state of their own - same reasoning already applied to
- * every other RGB LED call in this file) and message_pending_ack is
- * `volatile int`, not requiring ui_mutex. */
+ * every other RGB LED call in this file) and message_pending_ack/
+ * hw_link_connected are both `volatile int`, not requiring ui_mutex. */
 static void clear_message_pending_flash(void)
 {
     if (!message_pending_ack) {
@@ -364,7 +390,8 @@ static void clear_message_pending_flash(void)
     message_pending_ack = 0;
     if (flash_hw_fd >= 0) {
         hw_expansion_set_led_mode(flash_hw_fd, HW_LED_MODE_MANUAL_RGB);
-        hw_expansion_set_status_color(flash_hw_fd, HW_STATUS_CONNECTED);
+        hw_expansion_set_status_color(flash_hw_fd,
+            hw_link_connected ? HW_STATUS_CONNECTED : HW_STATUS_DISCONNECTED);
     }
 }
 
@@ -808,6 +835,33 @@ static void replay_msglog_into_pad_locked(void)
     }
 }
 
+void ui_show_help(void)
+{
+    /* Deliberately one ui_add_history() call per line rather than a
+     * single call with embedded '\n's: ui_add_history() bumps
+     * history_total_lines exactly once per call, and the real-
+     * scrollback math (see this file's touch block comment) assumes
+     * that 1 call == 1 physical pad row - a multi-line single call
+     * would silently break that alignment (see wrapped_row_count()'s
+     * own comment for the bug this exact assumption caused once
+     * already, for a different call site). */
+    static const char *const help_lines[] = {
+        "--- Quick help ---",
+        "Ctrl+L: lock now, or set a PIN if none is configured yet",
+        "Ctrl+W: WiFi setup (scan, select a network, connect)",
+        "Up/Down arrows: scroll message history",
+        "/send <path>: send a small local file",
+        "/save <text>: send a message that survives /clear",
+        "/clear: wipe chat history (keeps any /save'd messages)",
+        "/help: show this guide again",
+        "quit or exit: end the session",
+    };
+    size_t i;
+    for (i = 0; i < sizeof(help_lines) / sizeof(help_lines[0]); i++) {
+        ui_add_history(NULL, help_lines[i]);
+    }
+}
+
 void ui_init(const char *peer_label)
 {
     initscr();
@@ -852,6 +906,8 @@ void ui_init(const char *peer_label)
         init_pair(CP_INPUT, COLOR_CYAN, COLOR_BLACK);
         init_pair(CP_BANNER, COLOR_WHITE, COLOR_BLACK);
         init_pair(CP_ACCENT, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_TIMESTAMP, COLOR_BLUE, COLOR_BLACK);
+        init_pair(CP_ERROR, COLOR_RED, COLOR_BLACK);
     }
 
     /* Boot splash - see its own comment above for why this is safe to
@@ -930,28 +986,13 @@ void ui_init(const char *peer_label)
     /* Quick help guide - shown once per process start, i.e. once per
      * boot given this app's systemd unit (Restart=always - see
      * show_splash()'s comment for the same reasoning applied there).
-     * Deliberately one ui_add_history() call per line rather than a
-     * single call with embedded '\n's: ui_add_history() bumps
-     * history_total_lines exactly once per call, and the real-
-     * scrollback math (see this file's touch block comment) assumes
-     * that 1 call == 1 physical pad row - a multi-line single call
-     * would silently break that alignment. */
-    {
-        static const char *const help_lines[] = {
-            "--- Quick help ---",
-            "Ctrl+L: lock now, or set a PIN if none is configured yet",
-            "Ctrl+W: WiFi setup (scan, select a network, connect)",
-            "Up/Down arrows: scroll message history",
-            "/send <path>: send a small local file",
-            "/save <text>: send a message that survives /clear",
-            "/clear: wipe chat history (keeps any /save'd messages)",
-            "quit or exit: end the session",
-        };
-        size_t i;
-        for (i = 0; i < sizeof(help_lines) / sizeof(help_lines[0]); i++) {
-            ui_add_history(NULL, help_lines[i]);
-        }
-    }
+     * Factored into ui_show_help() (below) so session.c's "/help"
+     * command can print the identical content on demand - 2026-08-22:
+     * previously session.c ALSO re-printed a similar instructional line
+     * on every single connect/reconnect, which was pure repeated noise
+     * for anyone leaving the app running through a flaky link; that's
+     * gone now, replaced by "shown once at boot, or whenever you ask". */
+    ui_show_help();
 
     if (!pin_configured) {
         ui_add_history(NULL, "No PIN set - press Ctrl+L to set one and "
@@ -1005,20 +1046,28 @@ void ui_set_statusf(const char *fmt, ...)
     ui_set_status(buf);
 }
 
-void ui_add_history(const char *prefix, const char *text)
+/* Shared by ui_add_history() (is_error=0) and ui_add_error() (is_error=1,
+ * prefix always NULL in practice - see ui_add_error()'s own comment) -
+ * the two only ever differ in which color the message BODY gets
+ * (CP_SYSTEM vs CP_ERROR); everything else (timestamp handling, pad
+ * bookkeeping, lock/scroll gating) is identical, so this is the one
+ * place that logic lives rather than two near-duplicate copies. */
+static void ui_add_history_ex(const char *prefix, const char *text,
+                                int is_error)
 {
     if (!ui_active) {
         return;
     }
     pthread_mutex_lock(&ui_mutex);
     {
-        /* Color by source: NULL prefix is a system/event notice (quiet
-         * cyan, no bold); "you" (session.c's own convention for the
-         * local user's sent messages) gets a distinct color from an
-         * incoming peer message (any other non-NULL prefix, i.e. the
-         * peer_label session.c passes) - makes it possible to tell at
-         * a glance who said what without reading every line. */
-        int cp = CP_SYSTEM;
+        /* Color by source: NULL prefix is a system/event notice (or an
+         * error, if is_error - see this function's own comment); "you"
+         * (session.c's own convention for the local user's sent
+         * messages) gets a distinct color from an incoming peer message
+         * (any other non-NULL prefix, i.e. the peer_label session.c
+         * passes) - makes it possible to tell at a glance who said what
+         * without reading every line. */
+        int cp = is_error ? CP_ERROR : CP_SYSTEM;
         char ts_buf[12]; /* "[HH:MM:SS] " + NUL */
         time_t now = time(NULL);
         struct tm tm_now;
@@ -1032,20 +1081,21 @@ void ui_add_history(const char *prefix, const char *text)
         if (prefix != NULL) {
             cp = (strcmp(prefix, "you") == 0) ? CP_OWN_MSG : CP_PEER_MSG;
         }
-        /* Timestamp itself always in the quiet system color, regardless
-         * of the line's own source color - it's metadata about the
-         * line, not part of what was actually said. Local wall-clock
-         * time only (this device's own clock at receive/send time) -
-         * deliberately NOT a value carried on the wire (see
+        /* Timestamp itself always in its own quiet CP_TIMESTAMP color
+         * (2026-08-22 - previously shared CP_SYSTEM, split out per direct
+         * request so timestamps read as visually distinct metadata,
+         * regardless of the line's own source/error color. Local
+         * wall-clock time only (this device's own clock at receive/send
+         * time) - deliberately NOT a value carried on the wire (see
          * PROTOCOL.md's PONG entry for the same reasoning applied to
          * RTT): two devices' clocks aren't guaranteed synchronized
          * (Raspberry Pis have no hardware RTC - see Field WiFi and
          * Network Resilience Concepts.md), so a wire-carried timestamp
          * could be actively misleading across devices in a way a
          * purely local one never is. */
-        wattron(history_win, COLOR_PAIR(CP_SYSTEM));
+        wattron(history_win, COLOR_PAIR(CP_TIMESTAMP));
         wprintw(history_win, "%s", ts_buf);
-        wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
+        wattroff(history_win, COLOR_PAIR(CP_TIMESTAMP));
 
         wattron(history_win, COLOR_PAIR(cp));
         if (prefix != NULL) {
@@ -1089,6 +1139,11 @@ void ui_add_history(const char *prefix, const char *text)
     pthread_mutex_unlock(&ui_mutex);
 }
 
+void ui_add_history(const char *prefix, const char *text)
+{
+    ui_add_history_ex(prefix, text, 0);
+}
+
 void ui_add_historyf(const char *prefix, const char *fmt, ...)
 {
     char buf[512];
@@ -1101,6 +1156,32 @@ void ui_add_historyf(const char *prefix, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     ui_add_history(prefix, buf);
+}
+
+/* ui_add_error/ui_add_errorf - same as ui_add_history()/ui_add_historyf(),
+ * always with a NULL prefix (an error is a system-level event, never
+ * attributed to "you" or the peer - matches how every existing error
+ * call site already used NULL), but rendered in CP_ERROR (red) instead
+ * of CP_SYSTEM - added 2026-08-22 per direct request to make errors
+ * visually distinct from routine status notices, which previously all
+ * looked identical. */
+void ui_add_error(const char *text)
+{
+    ui_add_history_ex(NULL, text, 1);
+}
+
+void ui_add_errorf(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+
+    if (!ui_active) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ui_add_error(buf);
 }
 
 /* The "/clear" command's UI-side half (see session.c, which pairs this
@@ -1579,7 +1660,7 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                 pthread_mutex_unlock(&ui_mutex);
 
                 if (wifi_scan_count <= 0) {
-                    ui_add_history(NULL,
+                    ui_add_error(
                         "WiFi scan found no networks (or nmcli failed) "
                         "- Ctrl+W to try again.");
                 }
@@ -1610,7 +1691,7 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                     ui_add_historyf(NULL,
                         "Connected to WiFi network \"%s\".", ssid_copy);
                 } else {
-                    ui_add_historyf(NULL,
+                    ui_add_errorf(
                         "Failed to connect to \"%s\": %s", ssid_copy,
                         errbuf);
                 }
@@ -1690,6 +1771,10 @@ static void *idle_input_thread_main(void *arg)
                 ui_clear_history();
                 ui_add_history(NULL,
                     "(chat cleared - any /save'd messages were kept)");
+            } else if (strcmp(dummy, "/help") == 0) {
+                /* Same reasoning as "/clear" just above - purely local,
+                 * no connection needed. */
+                ui_show_help();
             } else if (strncmp(dummy, "/save ", 6) == 0) {
                 /* "/save" sends AND tags in one step (see session.c) -
                  * there's no session to send through here, so rather
@@ -1710,8 +1795,8 @@ static void *idle_input_thread_main(void *arg)
                                           "queued, will send once "
                                           "connected)");
                 } else {
-                    ui_add_history(NULL, "(not connected - queue is "
-                                          "full, message NOT sent)");
+                    ui_add_error("(not connected - queue is "
+                                  "full, message NOT sent)");
                 }
             }
         }
@@ -1874,10 +1959,15 @@ static void *touch_thread_main(void *arg)
 
         /* Message-pending flash toggle - runs every iteration
          * regardless of whether a tap happened, independent of the
-         * rc==1/rc<0 handling below. See ui.h's
-         * ui_notify_message_pending() comment for why HW_STATUS_ALERT
-         * (magenta) vs. off, and why a real tap (below) always restores
-         * HW_STATUS_CONNECTED specifically. */
+         * rc==1/rc<0 handling below. Alternates between the connection-
+         * aware alert color (blue if hw_link_connected, orange if not)
+         * and the matching BASE connection color (green/red) - NEVER
+         * LED-off, so the link's up/down state stays visible throughout
+         * the flash too, not just during the "on" phase - see ui.h's
+         * ui_notify_message_pending()/ui_set_link_state() comments for
+         * the full 2026-08-22 redesign reasoning, and
+         * clear_message_pending_flash() for why a real tap restores the
+         * matching base color specifically, not a hardcoded one. */
         if (message_pending_ack && flash_hw_fd >= 0) {
             flash_toggle_counter++;
             if (flash_toggle_counter >= UI_FLASH_TOGGLE_ITERS) {
@@ -1885,9 +1975,12 @@ static void *touch_thread_main(void *arg)
                 flash_led_on = !flash_led_on;
                 if (flash_led_on) {
                     hw_expansion_set_status_color(flash_hw_fd,
-                                                   HW_STATUS_ALERT);
+                        hw_link_connected ? HW_STATUS_MSG_CONNECTED
+                                           : HW_STATUS_MSG_DISCONNECTED);
                 } else {
-                    hw_expansion_set_led_mode(flash_hw_fd, HW_LED_MODE_OFF);
+                    hw_expansion_set_status_color(flash_hw_fd,
+                        hw_link_connected ? HW_STATUS_CONNECTED
+                                           : HW_STATUS_DISCONNECTED);
                 }
             }
         }
@@ -1971,16 +2064,29 @@ void ui_stop_touch(void)
 
 void ui_notify_message_pending(int hw_fd)
 {
-    /* Deliberate honest limit: the flash toggle and its acknowledgment
-     * are entirely driven by the touch thread (see touch_thread_main
+    /* Deliberate honest limit: the flash TOGGLE itself is entirely
+     * driven by the touch thread's poll loop (see touch_thread_main
      * above), so if no touchscreen is attached at all (touch_open()
      * failed in ui_start_touch(), touch_thread_running stays 0), a
-     * flash could be requested here but would never actually toggle or
-     * ever be acknowledgeable. Not worth a separate fallback thread
-     * just for that - this project's actual deployed hardware always
-     * has the touchscreen attached. */
+     * flash could be requested here but would never actually alternate
+     * colors. Acknowledgment, however, no longer depends on touch at
+     * all - see clear_message_pending_flash(), called from both the
+     * touch thread AND ui_poll_line() (any real keystroke) as of the
+     * 2026-08-22 rewrite - so a keyboard-only device (or one with a
+     * genuinely faulty touchscreen - see this file's touch block
+     * comment) can still dismiss the flash even though it would never
+     * have visibly toggled colors in the first place without touch. Not
+     * worth a separate fallback thread just to also make the toggle
+     * itself keyboard-driven - this project's actual deployed hardware
+     * always has the touchscreen attached, this is about acknowledgment
+     * robustness, not the visual effect. */
     flash_hw_fd = hw_fd;
     message_pending_ack = 1;
+}
+
+void ui_set_link_state(int connected)
+{
+    hw_link_connected = connected ? 1 : 0;
 }
 
 void ui_set_oled_fd(int fd)
@@ -2060,25 +2166,31 @@ static int stdin_ready(int timeout_ms)
 }
 #endif
 
-void ui_init(const char *peer_label)
+void ui_show_help(void)
 {
-    snprintf(fallback_peer_label, sizeof(fallback_peer_label), "%s",
-             peer_label != NULL ? peer_label : "?");
-    fallback_prompt_shown = 0;
-
-    /* Same quick help guide as the real ncurses ui_init() above, printed
-     * plainly - see that copy's comment for the content itself; kept in
-     * sync by hand since the two ui_init()s share no code (see this
-     * block's top comment on why this whole fallback exists separately). */
+    /* Same quick help guide as the real ncurses build - see that copy's
+     * comment for the content itself; kept in sync by hand since the two
+     * ui_init()s share no code (see this block's top comment on why this
+     * whole fallback exists separately). Callable both from ui_init()
+     * below and from session.c's "/help" command. */
     printf("--- Quick help ---\n"
            "Up/Down arrows: scroll message history\n"
            "/send <path>: send a small local file\n"
            "/save <text>: send a message that survives /clear\n"
            "/clear: wipe chat history (keeps any /save'd messages)\n"
+           "/help: show this guide again\n"
            "quit or exit: end the session\n"
            "(lock screen / WiFi setup are Linux+ncurses-only features,\n"
            " not available in this plain-console fallback)\n");
     fflush(stdout);
+}
+
+void ui_init(const char *peer_label)
+{
+    snprintf(fallback_peer_label, sizeof(fallback_peer_label), "%s",
+             peer_label != NULL ? peer_label : "?");
+    fallback_prompt_shown = 0;
+    ui_show_help();
 }
 
 void ui_set_status(const char *status_text)
@@ -2117,6 +2229,26 @@ void ui_add_historyf(const char *prefix, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     ui_add_history(prefix, buf);
+}
+
+/* No color to distinguish an error with on this plain-console fallback -
+ * a textual "ERROR: " prefix is the honest substitute. */
+void ui_add_error(const char *text)
+{
+    printf("\nERROR: %s\n", text != NULL ? text : "");
+    fallback_prompt_shown = 0;
+    fflush(stdout);
+}
+
+void ui_add_errorf(const char *fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    ui_add_error(buf);
 }
 
 void ui_clear_history(void)
@@ -2198,6 +2330,11 @@ void ui_stop_touch(void)
 void ui_notify_message_pending(int hw_fd)
 {
     (void)hw_fd;
+}
+
+void ui_set_link_state(int connected)
+{
+    (void)connected;
 }
 
 void ui_set_oled_fd(int fd)

@@ -51,11 +51,13 @@
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 4433
 
-/* Same timeout server.c applies to its side of each connection - without
- * this, a network that silently vanishes (no FIN/RST) would leave
- * wolfSSL_read() blocked forever instead of eventually erroring out,
- * which is what the reconnect loop below depends on to ever notice a
- * dead connection. */
+/* Same value server.c applies to its side of each connection - bounds a
+ * stalled pre-handshake connect/handshake attempt only. See server.c's
+ * matching #define comment (2026-08-22 correction) for why this does NOT
+ * also catch a post-handshake silent network loss - session.c's
+ * clear_recv_timeout() deliberately resets this to 0 (block indefinitely)
+ * once a session is live, and session.c's PING-based watchdog is what
+ * actually catches a peer whose network vanished silently mid-chat. */
 #define CONN_TIMEOUT_SECONDS 30
 
 /* Reconnect backoff: start at 1s, double on each consecutive failure,
@@ -248,7 +250,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
     sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == SOCKET_INVALID) {
-        ui_add_historyf(NULL, "socket() failed: %d", SOCK_LAST_ERROR());
+        ui_add_errorf("socket() failed: %d", SOCK_LAST_ERROR());
         return SESSION_DISCONNECTED;
     }
 
@@ -277,8 +279,8 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
         gai_rc = getaddrinfo(host, port_str, &hints, &res);
         if (gai_rc != 0) {
-            ui_add_historyf(NULL, "getaddrinfo failed for host '%s': %s",
-                             host, gai_strerror(gai_rc));
+            ui_add_errorf("getaddrinfo failed for host '%s': %s",
+                           host, gai_strerror(gai_rc));
             CLOSE_SOCKET(sock);
             return SESSION_DISCONNECTED;
         }
@@ -293,7 +295,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
         freeaddrinfo(res);
 
         if (rp == NULL) {
-            ui_add_historyf(NULL,
+            ui_add_errorf(
                 "getaddrinfo: no IPv4 address found for host '%s'", host);
             CLOSE_SOCKET(sock);
             return SESSION_DISCONNECTED;
@@ -302,7 +304,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
     rc = connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (rc == SOCKET_ERR_RET) {
-        ui_add_historyf(NULL, "connect() failed: %d", SOCK_LAST_ERROR());
+        ui_add_errorf("connect() failed: %d", SOCK_LAST_ERROR());
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
@@ -315,7 +317,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
 
     ssl = wolfSSL_new(ctx);
     if (ssl == NULL) {
-        ui_add_history(NULL, "wolfSSL_new failed");
+        ui_add_error("wolfSSL_new failed");
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
@@ -334,8 +336,8 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
         char errbuf[80];
-        ui_add_historyf(NULL, "Handshake failed: %s",
-                         wolfSSL_ERR_error_string(err, errbuf));
+        ui_add_errorf("Handshake failed: %s",
+                       wolfSSL_ERR_error_string(err, errbuf));
         wolfSSL_free(ssl);
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
@@ -343,6 +345,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     ui_set_status("mTLS handshake succeeded");
     *connected_ok = 1;
     hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
+    ui_set_link_state(1);
     hw_oled_draw_text(oled_fd, 0, "SecureLink bravo");
     hw_oled_draw_text(oled_fd, 1, "Connected");
     hw_oled_display(oled_fd);
@@ -529,6 +532,7 @@ int main(int argc, char *argv[])
     hw_fd = hw_expansion_open();
     hw_expansion_set_led_mode(hw_fd, HW_LED_MODE_MANUAL_RGB);
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+    ui_set_link_state(0);
 
     /* Case OLED (no-op on non-Linux / hardware-absent - see hw_oled.h),
      * opened once here and kept open for the whole reconnect loop, same
@@ -572,6 +576,7 @@ int main(int argc, char *argv[])
         }
 
         hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+        ui_set_link_state(0);
 
         ui_set_statusf("Disconnected - retrying in %d second(s)...",
                        reconnect_delay);
@@ -584,6 +589,7 @@ int main(int argc, char *argv[])
     }
 
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+    ui_set_link_state(0);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
     ui_stop_idle_input();

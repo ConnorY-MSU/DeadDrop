@@ -126,8 +126,11 @@ void hw_expansion_set_status_color(int fd, hw_connection_status status)
         case HW_STATUS_CONNECTED:
             rgb[0] = 0;   rgb[1] = 200; rgb[2] = 0;   /* green */
             break;
-        case HW_STATUS_ALERT:
-            rgb[0] = 255; rgb[1] = 0;   rgb[2] = 255; /* magenta */
+        case HW_STATUS_MSG_CONNECTED:
+            rgb[0] = 0;   rgb[1] = 100; rgb[2] = 255; /* blue */
+            break;
+        case HW_STATUS_MSG_DISCONNECTED:
+            rgb[0] = 255; rgb[1] = 100; rgb[2] = 0;   /* orange */
             break;
         default:
             return; /* unrecognized status - do nothing rather than

@@ -52,18 +52,30 @@
 
 #define SERIAL_BUF_SIZE 32
 
-/* How long a single connection is allowed to sit idle mid-handshake or
- * mid-read before we give up on it. Without this, a stalled or malicious
- * peer that opens a TCP connection and never completes the handshake (or
- * completes it and then never sends anything) blocks this server - which
- * handles exactly one connection at a time - from accepting anyone else,
- * including the legitimate peer's own reconnect attempt. 30s is generous
- * for a real handshake/read on a slow mobile network, short enough that a
- * stalled connection doesn't lock everyone else out for long. It also
- * doubles as the mechanism that eventually notices a peer whose network
- * simply vanished (no FIN/RST ever arrives) rather than blocking forever -
- * see client.c's reconnect loop, which depends on reads eventually erroring
- * out instead of hanging indefinitely. */
+/* How long a single connection is allowed to sit idle mid-handshake before
+ * we give up on it. Without this, a stalled or malicious peer that opens a
+ * TCP connection and never completes the handshake blocks this server -
+ * which handles exactly one connection at a time - from accepting anyone
+ * else, including the legitimate peer's own reconnect attempt. 30s is
+ * generous for a real handshake on a slow mobile network, short enough
+ * that a stalled connection doesn't lock everyone else out for long.
+ *
+ * CORRECTION (2026-08-22, found via a live silent-disconnect test - see
+ * session.c's SESSION_WATCHDOG_TIMEOUT_SECONDS): this does NOT also catch
+ * a peer whose network silently vanished post-handshake, despite an
+ * earlier version of this comment claiming it did. session.c's
+ * clear_recv_timeout() deliberately resets SO_RCVTIMEO to 0 (block
+ * indefinitely) right after the handshake completes, specifically so a
+ * normal idle chat session doesn't spuriously disconnect - which means
+ * there is no OS-level read timeout left during the actual conversation
+ * at all. Confirmed live: with a real silent packet-loss test (iptables
+ * DROP, simulating a real power-loss unplug - no FIN/RST ever arrives),
+ * the receiver thread's wolfSSL_read() call was confirmed via gdb to
+ * still be blocked in the kernel's recv() syscall itself, over 80 seconds
+ * later - getsockopt() confirmed SO_RCVTIMEO genuinely was 30s at handshake
+ * time, so the value itself was never the problem; it just doesn't apply
+ * post-handshake. Detecting THAT failure mode is now session.c's
+ * PING-based watchdog's job, not this timeout's. */
 #define CONN_TIMEOUT_SECONDS 30
 
 static void set_socket_timeout(socket_t s)
@@ -102,26 +114,25 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
     int rc;
 
     if (!preverify_ok) {
-        ui_add_history(NULL,
+        ui_add_error(
             "Verify callback: standard cert-chain verification failed.");
         return 0;
     }
 
     cert = wolfSSL_X509_STORE_CTX_get_current_cert(store);
     if (cert == NULL) {
-        ui_add_history(NULL, "Verify callback: no current cert available.");
+        ui_add_error("Verify callback: no current cert available.");
         return 0;
     }
 
     rc = wolfSSL_X509_get_serial_number(cert, serial_bytes, &serial_len);
     if (rc != WOLFSSL_SUCCESS) {
-        ui_add_history(NULL,
-            "Verify callback: could not read serial number.");
+        ui_add_error("Verify callback: could not read serial number.");
         return 0;
     }
 
     if (serial_len <= 0 || (size_t)(serial_len * 2) >= sizeof(serial_hex)) {
-        ui_add_historyf(NULL,
+        ui_add_errorf(
             "Verify callback: unexpected serial length (%d).", serial_len);
         return 0;
     }
@@ -131,18 +142,25 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
     }
     serial_hex[serial_len * 2] = '\0';
 
-    ui_add_historyf(NULL,
-        "Verify callback: checking serial %s against revocation list.",
-        serial_hex);
-
+    /* 2026-08-22: the routine "checking serial.../not revoked, proceeding"
+     * notices used to print on EVERY connection - not a security risk in
+     * themselves (a certificate serial number is public by design, sent
+     * in the clear as part of the cert during any TLS handshake - showing
+     * it here doesn't hand an attacker anything they couldn't already
+     * read straight off the certificate or a packet capture), but pure
+     * noise for an end user: revocation checking still happens on every
+     * connection either way, this only ever changed whether the routine
+     * "yes, fine" case got printed. Silenced per direct request, alongside
+     * the same "stop repeating routine detail on every reconnect" ask
+     * applied to session.c's connection-instructions hint. The actual
+     * REJECTED-cert case below stays visible - that's a real security
+     * event a user should see, not routine confirmation noise. */
     if (revocation_is_revoked(serial_hex)) {
-        ui_add_historyf(NULL,
+        ui_add_errorf(
             "Verify callback: serial %s is REVOKED - rejecting.", serial_hex);
         return 0;
     }
 
-    ui_add_historyf(NULL,
-        "Verify callback: serial %s not revoked, proceeding.", serial_hex);
     return 1;
 }
 
@@ -421,7 +439,7 @@ int main(int argc, char *argv[])
 
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == SOCKET_INVALID) {
-        ui_add_historyf(NULL, "socket() failed: %d", SOCK_LAST_ERROR());
+        ui_add_errorf("socket() failed: %d", SOCK_LAST_ERROR());
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
 #ifdef _WIN32
@@ -443,7 +461,7 @@ int main(int argc, char *argv[])
 
     rc = bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
     if (rc == SOCKET_ERR_RET) {
-        ui_add_historyf(NULL, "bind() failed: %d", SOCK_LAST_ERROR());
+        ui_add_errorf("bind() failed: %d", SOCK_LAST_ERROR());
         CLOSE_SOCKET(listen_sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
@@ -455,7 +473,7 @@ int main(int argc, char *argv[])
 
     rc = listen(listen_sock, LISTEN_BACKLOG);
     if (rc == SOCKET_ERR_RET) {
-        ui_add_historyf(NULL, "listen() failed: %d", SOCK_LAST_ERROR());
+        ui_add_errorf("listen() failed: %d", SOCK_LAST_ERROR());
         CLOSE_SOCKET(listen_sock);
         wolfSSL_CTX_free(ctx);
         wolfSSL_Cleanup();
@@ -474,6 +492,7 @@ int main(int argc, char *argv[])
     hw_fd = hw_expansion_open();
     hw_expansion_set_led_mode(hw_fd, HW_LED_MODE_MANUAL_RGB);
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+    ui_set_link_state(0);
 
     /* Case OLED (no-op on non-Linux / hardware-absent - see hw_oled.h),
      * same "opened once, lives for the whole process" reasoning as the
@@ -499,7 +518,7 @@ int main(int argc, char *argv[])
     for (;;) {
         socket_t client_sock = accept(listen_sock, NULL, NULL);
         if (client_sock == SOCKET_INVALID) {
-            ui_add_historyf(NULL, "accept() failed: %d", SOCK_LAST_ERROR());
+            ui_add_errorf("accept() failed: %d", SOCK_LAST_ERROR());
             continue;
         }
         ui_set_status("bravo connected - starting TLS handshake...");
@@ -511,7 +530,7 @@ int main(int argc, char *argv[])
 
         WOLFSSL *ssl = wolfSSL_new(ctx);
         if (ssl == NULL) {
-            ui_add_history(NULL, "wolfSSL_new failed");
+            ui_add_error("wolfSSL_new failed");
             CLOSE_SOCKET(client_sock);
             continue;
         }
@@ -529,11 +548,12 @@ int main(int argc, char *argv[])
         if (rc != WOLFSSL_SUCCESS) {
             int err = wolfSSL_get_error(ssl, rc);
             char errbuf[80];
-            ui_add_historyf(NULL, "Handshake failed: %s",
-                             wolfSSL_ERR_error_string(err, errbuf));
+            ui_add_errorf("Handshake failed: %s",
+                           wolfSSL_ERR_error_string(err, errbuf));
         } else {
             ui_set_status("mTLS handshake succeeded");
             hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
+            ui_set_link_state(1);
             hw_oled_draw_text(oled_fd, 0, "SecureLink alpha");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
@@ -546,6 +566,7 @@ int main(int argc, char *argv[])
             run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "bravo");
             ui_start_idle_input();
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
+            ui_set_link_state(0);
             hw_oled_draw_text(oled_fd, 0, "SecureLink alpha");
             hw_oled_draw_text(oled_fd, 1, "Waiting...");
             hw_oled_display(oled_fd);

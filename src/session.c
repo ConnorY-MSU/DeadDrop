@@ -49,10 +49,58 @@
 
 /* How often the sender loop sends a PING purely for a live RTT/link-
  * quality reading (see ui_report_rtt(), which feeds the OLED metrics
- * section) - not a liveness/keepalive mechanism in the traditional
- * "disconnect if no reply" sense (session.c already detects a dead
- * connection via wolfSSL_read() returning <= 0, independent of this). */
+ * section). ALSO now doubles as the watchdog's own heartbeat interval -
+ * see SESSION_WATCHDOG_TIMEOUT_SECONDS below - since the comment this
+ * replaced ("session.c already detects a dead connection via
+ * wolfSSL_read() returning <= 0, independent of this") turned out to be
+ * WRONG for a genuinely silent peer loss (see that #define's own
+ * comment for the real story, found via a live test). */
 #define SESSION_PING_INTERVAL_SECONDS 10
+
+/* REAL BUG FOUND AND FIXED (2026-08-22): a genuinely silent peer loss
+ * (network cable pulled, power lost - no FIN/RST ever arrives, unlike a
+ * graceful close/quit, which this project's code already detects
+ * instantly via wolfSSL_read() returning <= 0) went undetected
+ * INDEFINITELY - not just slowly, literally forever - despite
+ * CONN_TIMEOUT_SECONDS (client.c/server.c, 30s) being set via
+ * SO_RCVTIMEO on the raw socket. Root-caused via a live test (an
+ * iptables DROP rule silently discarding all traffic to/from the peer,
+ * simulating a real unplug) plus gdb (confirmed the receiver thread
+ * genuinely blocked inside the kernel's own recv() syscall, 80+ seconds
+ * in) plus a direct getsockopt() check (confirmed SO_RCVTIMEO really
+ * was 30s at handshake time - the value itself was never wrong). The
+ * actual cause: clear_recv_timeout() (below) deliberately RESETS
+ * SO_RCVTIMEO to 0 (block indefinitely) the moment a session goes live,
+ * specifically so a normal idle chat session doesn't spuriously
+ * disconnect every 30s of real silence - a genuinely correct design
+ * choice for the "peer is fine, just not talking right now" case, which
+ * simply has no read timeout left at all for the "peer's network
+ * silently died" case. An earlier attempt at fixing this by calling
+ * wolfSSL_set_using_nonblock() (based on a wolfSSL WANT_READ/blocking-
+ * socket quirk that seemed plausible at the time) did NOT help, because
+ * it was solving for the wrong layer - there was no timeout event to
+ * surface in the first place.
+ *
+ * Fixed with an explicit application-level watchdog instead of relying
+ * on the OS socket timeout for this: the sender loop already wakes up
+ * regularly to send a periodic PING (SESSION_PING_INTERVAL_SECONDS)
+ * purely for RTT reporting - it now ALSO checks how long it's been
+ * since ANY data was actually received from the peer
+ * (ctx.last_recv_epoch, updated by the receiver thread on every
+ * successfully parsed message - see receiver_thread_main()). If that
+ * exceeds this timeout, the sender loop forcibly calls SHUTDOWN_READ()
+ * on the raw socket - the EXACT SAME mechanism this file already uses
+ * to unblock a receiver thread stuck in a blocking read when the LOCAL
+ * user quits (see this function's other SHUTDOWN_READ() call) - which
+ * guarantees the blocked recv() returns immediately, REGARDLESS of
+ * wolfSSL's internal retry behavior, since a shutdown() on the read
+ * side of a socket is a hard, unconditional OS-level guarantee, not
+ * something that depends on getting wolfSSL's blocking/non-blocking
+ * semantics exactly right. Set to less than 3 PING intervals - long
+ * enough that a single lost PING or a slow link doesn't cause a false
+ * disconnect, short enough that a real loss is caught in well under a
+ * minute rather than never. */
+#define SESSION_WATCHDOG_TIMEOUT_SECONDS 25
 
 /*
  * clear_recv_timeout - undo client.c/server.c's pre-handshake SO_RCVTIMEO
@@ -143,6 +191,15 @@ typedef struct {
                                 * decides the session is over (peer
                                 * DISCONNECT, read error/close, or an
                                 * invalid message) */
+    volatile long last_recv_epoch; /* time(NULL) as of the last message
+                                * successfully received from the peer -
+                                * see SESSION_WATCHDOG_TIMEOUT_SECONDS'
+                                * comment for why this exists: written by
+                                * the receiver thread, read by the sender
+                                * loop, a single word so a lockless
+                                * read/write pair is fine for a liveness
+                                * heuristic (not a correctness-critical
+                                * value) */
     volatile int should_stop; /* set by the main thread once IT decides
                                 * the session is over (user quit/EOF) -
                                 * documentation of intent; shutdown() on
@@ -206,8 +263,8 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
                                   out_buf, sizeof(out_buf));
     if (total < 0) {
         pthread_mutex_unlock(&ctx->send_mutex);
-        ui_add_historyf(NULL, "(send failed: message too large, "
-                               "body_len=%u)", body_len);
+        ui_add_errorf("(send failed: message too large, "
+                       "body_len=%u)", body_len);
         return -1;
     }
 
@@ -229,8 +286,8 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
     if (rc != total) {
         int err = wolfSSL_get_error(ctx->ssl_write, rc);
         char errbuf[80];
-        ui_add_historyf(NULL, "(send failed: %s)",
-                         wolfSSL_ERR_error_string(err, errbuf));
+        ui_add_errorf("(send failed: %s)",
+                       wolfSSL_ERR_error_string(err, errbuf));
         return -1;
     }
     if (out_seq_num != NULL) {
@@ -443,7 +500,7 @@ static void *receiver_thread_main(void *arg)
     if (recv_buf == NULL || text_buf == NULL) {
         free(recv_buf);
         free(text_buf);
-        ui_add_history(NULL, "(internal error: out of memory)");
+        ui_add_error("(internal error: out of memory)");
         ctx->peer_ended = 1;
         return NULL;
     }
@@ -458,13 +515,19 @@ static void *receiver_thread_main(void *arg)
             break;
         }
         if (rs == RTHREAD_RECV_REJECTED) {
-            ui_add_historyf(NULL, "Received an invalid message from %s "
-                                   "- ending session.", ctx->peer_label);
+            ui_add_errorf("Received an invalid message from %s "
+                           "- ending session.", ctx->peer_label);
             ctx->peer_ended = 1;
             break;
         }
 
-        /* rs == RTHREAD_RECV_OK */
+        /* rs == RTHREAD_RECV_OK - the peer is demonstrably alive, having
+         * just sent something real (a TEXT_MESSAGE, ACK, PING, PONG,
+         * FILE, or DISCONNECT - any recognized message type at all).
+         * See SESSION_WATCHDOG_TIMEOUT_SECONDS' comment for why this
+         * matters: this is the ONLY place last_recv_epoch gets updated. */
+        ctx->last_recv_epoch = (long)time(NULL);
+
         if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
             /* msg.body is length-prefixed per PROTOCOL.md, NOT a
              * NUL-terminated C string - every consumer below needs a
@@ -587,12 +650,12 @@ static void *receiver_thread_main(void *arg)
                                         "~/.securelink/received/)");
                                     ui_notify_message_pending(ctx->hw_fd);
                                 } else {
-                                    ui_add_historyf(NULL,
+                                    ui_add_errorf(
                                         "(failed to fully write received "
                                         "file %s)", safe_name);
                                 }
                             } else {
-                                ui_add_historyf(NULL,
+                                ui_add_errorf(
                                     "(failed to save received file %s)",
                                     safe_name);
                             }
@@ -650,7 +713,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     session_result result;
 
     if (sl_session_init(ssl, &state) != 0) {
-        ui_add_history(NULL,
+        ui_add_error(
             "sl_session_init failed - wolfSSL_export_keying_material "
             "unavailable? (needs HAVE_KEYING_MATERIAL / "
             "--enable-keying-material)");
@@ -673,7 +736,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
      * all. Needs HAVE_WRITE_DUP / --enable-writedup - see docs/BUILD.md. */
     ctx.ssl_write = wolfSSL_write_dup(ssl);
     if (ctx.ssl_write == NULL) {
-        ui_add_history(NULL,
+        ui_add_error(
             "wolfSSL_write_dup failed - this wolfSSL build may lack "
             "HAVE_WRITE_DUP / --enable-writedup");
         return SESSION_DISCONNECTED;
@@ -685,12 +748,17 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     ctx.ping_outstanding = 0;
     ctx.peer_ended = 0;
     ctx.should_stop = 0;
+    /* Starts "now," not 0 - see SESSION_WATCHDOG_TIMEOUT_SECONDS'
+     * comment. Without this, a fresh session with a slightly slow first
+     * PONG could spuriously look like it's already been silent since
+     * epoch 0, an enormous (and wrong) duration. */
+    ctx.last_recv_epoch = (long)time(NULL);
     ctx.hw_fd = hw_fd;
     ctx.oled_fd = oled_fd;
     ctx.peer_label = peer_label;
 
     if (pthread_create(&rtid, NULL, receiver_thread_main, &ctx) != 0) {
-        ui_add_history(NULL, "run_symmetric_session: pthread_create failed");
+        ui_add_error("run_symmetric_session: pthread_create failed");
         pthread_mutex_destroy(&ctx.send_mutex);
         wolfSSL_free(ctx.ssl_write);
         return SESSION_DISCONNECTED;
@@ -704,7 +772,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     line = malloc(SL_MAX_BODY_LEN);
     file_body = malloc(SL_MAX_BODY_LEN);
     if (line == NULL || file_body == NULL) {
-        ui_add_history(NULL, "run_symmetric_session: out of memory");
+        ui_add_error("run_symmetric_session: out of memory");
         free(line);
         free(file_body);
         ctx.should_stop = 1;
@@ -716,12 +784,12 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     }
 
     ui_set_statusf("Connected to %s", peer_label);
-    ui_add_history(NULL, "Type a message and press Enter to send "
-                          "('quit' to exit, '/send <path>' to send a "
-                          "small file, '/save <text>' to send a message "
-                          "that survives '/clear'). Up/Down arrows "
-                          "scroll history. Incoming messages display "
-                          "automatically at any time.");
+    /* No per-connection instructional hint here anymore (2026-08-22,
+     * direct request) - this used to print the full "type a message..."
+     * paragraph on EVERY connect/reconnect, which meant a flaky link
+     * doing several reconnect cycles spammed the same instructions
+     * repeatedly. The guide is now shown once at boot (ui_init()) and
+     * on demand via the new "/help" command below - see ui_show_help(). */
 
     /* Drain anything queued while offline (see outbox.h) now that a
      * real session exists to send through - same TEXT_MESSAGE send +
@@ -793,6 +861,23 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             }
         }
 
+        /* Watchdog: forcibly end the session if nothing at all has been
+         * received from the peer in too long - see
+         * SESSION_WATCHDOG_TIMEOUT_SECONDS' comment for the full story
+         * on why this exists (a genuinely silent peer loss otherwise
+         * hangs forever, not just slowly, since the OS-level read
+         * timeout is deliberately disabled once a session is live).
+         * SHUTDOWN_READ() unblocks the receiver thread's blocked read
+         * immediately and unconditionally - the same mechanism this
+         * function already uses below for a local user quit - which
+         * then sets ctx.peer_ended itself; this loop's own peer_ended
+         * check at the top catches that on the very next iteration, so
+         * this doesn't need its own separate "already triggered" guard. */
+        if ((long)time(NULL) - ctx.last_recv_epoch >=
+                SESSION_WATCHDOG_TIMEOUT_SECONDS) {
+            SHUTDOWN_READ(sock);
+        }
+
         pr = ui_poll_line(line, SL_MAX_BODY_LEN, STDIN_POLL_MS);
 
         if (pr == UI_POLL_TIMEOUT) {
@@ -834,6 +919,16 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             ui_clear_history();
             ui_add_history(NULL,
                 "(chat cleared - any /save'd messages were kept)");
+            continue;
+        }
+
+        /* "/help" - same purely-local, no-connection-needed reasoning as
+         * "/clear" above. Re-prints the exact guide ui_init() already
+         * shows once at boot (see ui_show_help()) - this is what replaced
+         * the old per-connection instructional hint (see this function's
+         * top comment). */
+        if (strcmp(line, "/help") == 0) {
+            ui_show_help();
             continue;
         }
 
@@ -892,8 +987,8 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             FILE *f = fopen(filepath, "rb");
 
             if (f == NULL) {
-                ui_add_historyf(NULL, "(/send failed: cannot open '%s')",
-                                 filepath);
+                ui_add_errorf("(/send failed: cannot open '%s')",
+                               filepath);
                 continue;
             }
 
@@ -919,7 +1014,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                            name_len;
                 if (file_size < 0 || (size_t)file_size > max_data) {
                     fclose(f);
-                    ui_add_historyf(NULL,
+                    ui_add_errorf(
                         "(/send failed: '%s' is %ld bytes, max is %lu "
                         "bytes for a single-message file transfer)",
                         filepath, file_size, (unsigned long)max_data);
@@ -935,7 +1030,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                         1, (size_t)file_size, f);
                     fclose(f);
                     if (got != (size_t)file_size) {
-                        ui_add_historyf(NULL,
+                        ui_add_errorf(
                             "(/send failed: could not fully read '%s')",
                             filepath);
                         continue;

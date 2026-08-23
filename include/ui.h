@@ -106,6 +106,33 @@ void ui_add_history(const char *prefix, const char *text);
 void ui_add_historyf(const char *prefix, const char *fmt, ...);
 
 /*
+ * ui_add_error/ui_add_errorf - same as ui_add_history()/ui_add_historyf()
+ * with an implicit NULL prefix, but rendered in a distinct "error" color
+ * (red - see ui.c's CP_ERROR) instead of the routine system-notice color,
+ * so a real failure (socket/handshake/send errors, a rejected/revoked
+ * cert, an internal error, etc.) is visually distinguishable at a glance
+ * from ordinary status notices ("Connected to X", "(sent file: ...)").
+ * Use these instead of ui_add_history(NULL, ...)/ui_add_historyf(NULL, ...)
+ * for anything that represents an actual failure, not routine status.
+ * Thread-safe, same locking as ui_add_history(). On the non-Linux plain-
+ * console fallback (no color available), prints with a plain "ERROR: "
+ * text prefix instead - see ui.c.
+ */
+void ui_add_error(const char *text);
+void ui_add_errorf(const char *fmt, ...);
+
+/*
+ * ui_show_help - prints the quick-help guide (Ctrl+L/Ctrl+W/arrow keys/
+ * /send//save//clear//help/quit) into the history - called once from
+ * ui_init() at every process start (i.e. every boot), and by session.c's
+ * "/help" command on demand. Factored out specifically so it's the SAME
+ * content both places, and so session.c doesn't need its own hardcoded
+ * copy - see session.c's comment on why the connection-instructions hint
+ * that used to repeat on every reconnect was removed in favor of this.
+ */
+void ui_show_help(void);
+
+/*
  * ui_clear_history - the on-screen half of the "/clear" command (see
  * session.c, which pairs this with msglog.h's msglog_clear_except_saved()
  * to also rewrite the persisted log). Wipes the visible/retained chat
@@ -213,29 +240,48 @@ void ui_stop_touch(void);
 
 /*
  * MESSAGE-PENDING LED FLASH - user-requested, added on top of the
- * "cyberpunk neon" styling pass. An unread incoming message flashes the
- * FNK0100 case's RGB LEDs (a distinct magenta "alert" color, see
- * hw_expansion.h's HW_STATUS_ALERT) until the touchscreen is tapped -
- * ANY tap, in any mode, counts as acknowledgment, not just a tap
- * specifically on the message. The flash toggle itself is driven by the
- * existing touch thread's own ~200ms poll loop (see ui.c) rather than a
- * dedicated thread - one more background timer piggy-backing on
- * infrastructure that already exists and already runs for the whole
- * process lifetime.
+ * "cyberpunk neon" styling pass, redesigned 2026-08-22 to be connection-
+ * aware (see hw_expansion.h's HW_STATUS_MSG_CONNECTED/
+ * HW_STATUS_MSG_DISCONNECTED comments for the full reasoning). An unread
+ * incoming message flashes the FNK0100 case's RGB LEDs - alternating
+ * between the appropriate alert color (blue if the link is currently up,
+ * orange if it's down - see ui_set_link_state() below) and the matching
+ * BASE connection color (green/red), never LED-off - until the
+ * touchscreen is tapped OR a key is pressed (see
+ * clear_message_pending_flash() in ui.c) - ANY input, in any mode,
+ * counts as acknowledgment, not just a tap/keystroke specifically on the
+ * message. The flash toggle itself is driven by the existing touch
+ * thread's own ~200ms poll loop (see ui.c) rather than a dedicated
+ * thread - one more background timer piggy-backing on infrastructure
+ * that already exists and already runs for the whole process lifetime.
  *
  * ui_notify_message_pending() takes the hw_fd to flash directly (rather
  * than ui.c needing a separate persistent setter for it) because a
  * message can only ever arrive while genuinely connected -
  * session.c's receiver thread, the only caller, only runs during an
  * active session, and the hw_fd it already holds (ctx->hw_fd) is right
- * there. See ui.c's touch-thread comment for the accepted edge case
- * this implies for what color gets restored on acknowledgment.
+ * there.
  *
  * No-op on non-Linux (no case hardware exists there - see
  * hw_expansion.h) and silently does nothing if hw_fd < 0 (no case
  * hardware attached even on Linux) - safe to call unconditionally.
  */
 void ui_notify_message_pending(int hw_fd);
+
+/*
+ * ui_set_link_state - tells ui.c whether the mTLS session is currently
+ * up (connected != 0) or down (connected == 0), so the message-pending
+ * flash above (and clear_message_pending_flash()'s restore color) know
+ * which pair of colors to use. client.c/server.c call this at the SAME
+ * moments they already call hw_expansion_set_status_color() with
+ * HW_STATUS_CONNECTED/HW_STATUS_DISCONNECTED - a small amount of
+ * duplication (two calls at each transition point instead of one)
+ * rather than moving hw_expansion ownership into ui.c wholesale, which
+ * would be a much larger restructure for what this needs. Safe to call
+ * unconditionally, including on non-Linux (no-op there, matching every
+ * other hardware-facing function in this header).
+ */
+void ui_set_link_state(int connected);
 
 /*
  * OLED BACKGROUND METRICS - also user-requested. Once given the OLED's
