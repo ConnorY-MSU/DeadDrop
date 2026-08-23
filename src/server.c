@@ -417,7 +417,7 @@ int main(int argc, char *argv[])
      * screen it manages - see ui.h's top comment. Everything ABOVE this
      * point (argument/cert/CTX setup) deliberately stays plain output,
      * since it can fail before there's any UI to report through. */
-    ui_init("client");
+    ui_init("bravo");
 
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == SOCKET_INVALID) {
@@ -484,7 +484,7 @@ int main(int argc, char *argv[])
     ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
         can periodically refresh background network metrics below
         this file's own role/status lines - see ui.h. */
-    hw_oled_draw_text(oled_fd, 0, "SecureLink server");
+    hw_oled_draw_text(oled_fd, 0, "SecureLink alpha");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
@@ -502,7 +502,7 @@ int main(int argc, char *argv[])
             ui_add_historyf(NULL, "accept() failed: %d", SOCK_LAST_ERROR());
             continue;
         }
-        ui_set_status("Client connected - starting TLS handshake...");
+        ui_set_status("bravo connected - starting TLS handshake...");
 
         /* See CONN_TIMEOUT_SECONDS above: bounds how long a single stalled
          * or malicious connection can block every other connection,
@@ -534,7 +534,7 @@ int main(int argc, char *argv[])
         } else {
             ui_set_status("mTLS handshake succeeded");
             hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
-            hw_oled_draw_text(oled_fd, 0, "SecureLink server");
+            hw_oled_draw_text(oled_fd, 0, "SecureLink alpha");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
             /* Stop the idle-input thread before run_symmetric_session()
@@ -543,10 +543,10 @@ int main(int argc, char *argv[])
              * These two calls must bracket every run_symmetric_session()
              * call exactly like this. */
             ui_stop_idle_input();
-            run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "client");
+            run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "bravo");
             ui_start_idle_input();
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
-            hw_oled_draw_text(oled_fd, 0, "SecureLink server");
+            hw_oled_draw_text(oled_fd, 0, "SecureLink alpha");
             hw_oled_draw_text(oled_fd, 1, "Waiting...");
             hw_oled_display(oled_fd);
 

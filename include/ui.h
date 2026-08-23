@@ -65,8 +65,9 @@
  * atexit() safety net (see ui.c for why that's a safety net and not
  * the only cleanup path relied on). On non-Linux: no-op.
  *
- * peer_label: short text describing the OTHER side's role ("server"
- * or "client") - shown in the status bar's static portion.
+ * peer_label: short text naming the OTHER device ("alpha" or "bravo" -
+ * this project's fixed two-device naming, not a generic "server"/
+ * "client" role label) - shown in the status bar's static portion.
  */
 void ui_init(const char *peer_label);
 
@@ -92,8 +93,8 @@ void ui_set_statusf(const char *fmt, ...);
 
 /*
  * ui_add_history - append one line to the scrolling message/event
- * history window. `prefix` (e.g. "server", "client", NULL for none) is
- * rendered before `text`. Thread-safe - called from both the main
+ * history window. `prefix` (e.g. "alpha", "bravo", "you", NULL for
+ * none) is rendered before `text`. Thread-safe - called from both the main
  * thread (connection-level notices) and session.c's receiver thread
  * (incoming messages); see ui.c for the locking, and its comment on
  * why the lock is never held across a blocking wait.
@@ -103,6 +104,18 @@ void ui_add_history(const char *prefix, const char *text);
 /* ui_add_historyf - printf-style version of ui_add_history() - see
  * ui_set_statusf()'s comment above for why this exists. */
 void ui_add_historyf(const char *prefix, const char *fmt, ...);
+
+/*
+ * ui_clear_history - the on-screen half of the "/clear" command (see
+ * session.c, which pairs this with msglog.h's msglog_clear_except_saved()
+ * to also rewrite the persisted log). Wipes the visible/retained chat
+ * history outright and replays whatever's left in the log (i.e. only
+ * previously /save'd lines, once the caller has rewritten it) so nothing
+ * genuinely marked worth keeping disappears from view. Thread-safe, same
+ * locking as ui_add_history(). On the non-Linux plain-console fallback,
+ * this is a no-op notice only - see ui.c.
+ */
+void ui_clear_history(void);
 
 typedef enum {
     UI_POLL_TIMEOUT, /* timeout elapsed, no complete line yet - keep polling */

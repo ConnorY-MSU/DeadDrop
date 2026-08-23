@@ -718,7 +718,9 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     ui_set_statusf("Connected to %s", peer_label);
     ui_add_history(NULL, "Type a message and press Enter to send "
                           "('quit' to exit, '/send <path>' to send a "
-                          "small file). Incoming messages display "
+                          "small file, '/save <text>' to send a message "
+                          "that survives '/clear'). Up/Down arrows "
+                          "scroll history. Incoming messages display "
                           "automatically at any time.");
 
     /* Drain anything queued while offline (see outbox.h) now that a
@@ -817,6 +819,24 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             break;
         }
 
+        /* "/clear" - a purely LOCAL command (never sent to the peer -
+         * this device's own copy of the chat is all it can honestly
+         * promise to zero; the peer keeps their own separate copy
+         * regardless). Checked before the ctx.peer_ended check below,
+         * same reasoning as "quit"/"exit" above: this doesn't need a
+         * live connection to do its job. See msglog.h's
+         * msglog_clear_except_saved() and ui.h's ui_clear_history() for
+         * what each half actually does - together they zero both the
+         * on-disk log and the on-screen scrollback, keeping only
+         * whatever was previously sent via "/save <text>" below. */
+        if (strcmp(line, "/clear") == 0) {
+            msglog_clear_except_saved();
+            ui_clear_history();
+            ui_add_history(NULL,
+                "(chat cleared - any /save'd messages were kept)");
+            continue;
+        }
+
         if (ctx.peer_ended) {
             /* Peer ended the session while this line was being typed -
              * don't bother sending into an already-dead connection.
@@ -828,6 +848,38 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                                    "has been queued.", peer_label);
             result = SESSION_DISCONNECTED;
             break;
+        }
+
+        /* "/save <text>" - sends a normal TEXT_MESSAGE, same as typing
+         * the text alone would, EXCEPT it's also logged with the
+         * "[SAVED]" marker (msglog_append_saved(), not the usual
+         * msglog_append()) so a later "/clear" (above) keeps it instead
+         * of discarding it. Deliberately scoped to messages sent FROM
+         * this device, going forward - there's no way to retroactively
+         * mark an already-sent or already-received message as saved
+         * with this v1, a documented, honest limitation rather than an
+         * oversight (the append-only log has no cheap way to find and
+         * rewrite one specific earlier line without the same rewrite
+         * machinery msglog_clear_except_saved() already needs for a
+         * very different purpose). */
+        if (len > 6 && strncmp(line, "/save ", 6) == 0) {
+            const char *text = line + 6;
+            uint32_t sent_seq;
+
+            if (session_send(&ctx, SL_MSG_TEXT_MESSAGE,
+                              (const uint8_t *)text, (uint32_t)strlen(text),
+                              &sent_seq) != 0) {
+                outbox_enqueue(text); /* the SAVED tag itself doesn't
+                    survive an offline-queue retry - see this block's
+                    comment above on why that's an accepted limitation,
+                    not attempted here either */
+                result = SESSION_DISCONNECTED;
+                break;
+            }
+            track_pending_ack(&ctx, sent_seq, text);
+            msglog_append_saved("you", text);
+            ui_add_historyf("you", "[SAVED] %s", text);
+            continue;
         }
 
         /* "/send <path>" - a small local file, read from THIS device's

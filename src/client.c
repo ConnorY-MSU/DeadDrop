@@ -343,7 +343,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     ui_set_status("mTLS handshake succeeded");
     *connected_ok = 1;
     hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
-    hw_oled_draw_text(oled_fd, 0, "SecureLink client");
+    hw_oled_draw_text(oled_fd, 0, "SecureLink bravo");
     hw_oled_draw_text(oled_fd, 1, "Connected");
     hw_oled_display(oled_fd);
 
@@ -352,10 +352,10 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
      * after - see ui.h's "IDLE INPUT" comment. These two calls must
      * bracket every run_symmetric_session() call exactly like this. */
     ui_stop_idle_input();
-    result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "server");
+    result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "alpha");
     ui_start_idle_input();
 
-    hw_oled_draw_text(oled_fd, 0, "SecureLink client");
+    hw_oled_draw_text(oled_fd, 0, "SecureLink bravo");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
@@ -507,7 +507,7 @@ int main(int argc, char *argv[])
      * screen it manages - see ui.h's top comment. Everything ABOVE this
      * point (argument/cert/CTX setup) deliberately stays plain output,
      * since it can fail before there's any UI to report through. */
-    ui_init("server");
+    ui_init("alpha");
 
     /* Lock-screen interaction (Ctrl+L, PIN entry) needs to work even
      * while disconnected/reconnecting, not just inside an active
@@ -539,7 +539,7 @@ int main(int argc, char *argv[])
     ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
         can periodically refresh background network metrics below
         session.c/here's own role/status lines - see ui.h. */
-    hw_oled_draw_text(oled_fd, 0, "SecureLink client");
+    hw_oled_draw_text(oled_fd, 0, "SecureLink bravo");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 

@@ -56,7 +56,15 @@ static void ensure_log_dir(const char *log_path)
     MKDIR(dir);
 }
 
-void msglog_append(const char *who, const char *text)
+/* Written right after the timestamp, before `who`, on a line saved via
+ * msglog_append_saved() - see msglog.h's comment on both that function
+ * and msglog_clear_except_saved(), which greps for exactly this string
+ * to decide what survives a /clear. Kept human-readable on purpose (it
+ * shows up as-is in the replayed history, same as everything else in
+ * this file) rather than some non-printing sentinel. */
+#define MSGLOG_SAVED_MARKER "[SAVED] "
+
+static void msglog_append_ex(const char *who, const char *text, int saved)
 {
     char path[512];
     FILE *f;
@@ -83,10 +91,12 @@ void msglog_append(const char *who, const char *text)
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &tm_now);
 
     if (who != NULL) {
-        fprintf(f, "[%s] %s: %s\n", timestamp, who,
+        fprintf(f, "[%s] %s%s: %s\n", timestamp,
+                saved ? MSGLOG_SAVED_MARKER : "", who,
                 text != NULL ? text : "");
     } else {
-        fprintf(f, "[%s] %s\n", timestamp, text != NULL ? text : "");
+        fprintf(f, "[%s] %s%s\n", timestamp,
+                saved ? MSGLOG_SAVED_MARKER : "", text != NULL ? text : "");
     }
     fclose(f);
 
@@ -96,6 +106,76 @@ void msglog_append(const char *who, const char *text)
         top comment on the honest plaintext-at-rest limitation this
         permission bit is the only real protection for. */
 #endif
+}
+
+void msglog_append(const char *who, const char *text)
+{
+    msglog_append_ex(who, text, 0);
+}
+
+void msglog_append_saved(const char *who, const char *text)
+{
+    msglog_append_ex(who, text, 1);
+}
+
+void msglog_clear_except_saved(void)
+{
+    char path[512];
+    char tmp_path[520];
+    FILE *in;
+    FILE *out;
+    char line[MSGLOG_LINE_MAX + 64]; /* generous over MSGLOG_LINE_MAX -
+        a log LINE written by msglog_append_ex() isn't itself capped to
+        MSGLOG_LINE_MAX (that cap only bounds what msglog_load_recent()
+        hands back for REPLAY - see msglog.h), so this needs its own
+        independent margin to avoid truncating a genuinely long line
+        while filtering, not reuse of the replay-side constant. */
+
+    if (msglog_file_path(path, sizeof(path)) != 0) {
+        return;
+    }
+    if ((size_t)snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) >=
+            sizeof(tmp_path)) {
+        return;
+    }
+
+    in = fopen(path, "r");
+    if (in == NULL) {
+        return; /* no log yet - nothing to clear, not an error */
+    }
+    out = fopen(tmp_path, "w");
+    if (out == NULL) {
+        fclose(in);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), in) != NULL) {
+        /* A saved line looks like "[YYYY-MM-DD HH:MM:SS] [SAVED] ...";
+         * strstr() (rather than checking a fixed offset) is deliberate -
+         * it stays correct regardless of exact timestamp width and
+         * doesn't need to duplicate the timestamp format used above. */
+        if (strstr(line, MSGLOG_SAVED_MARKER) != NULL) {
+            fputs(line, out);
+        }
+    }
+
+    fclose(in);
+    fclose(out);
+
+#ifndef _WIN32
+    chmod(tmp_path, 0600);
+#endif
+    /* Atomically replace the old log with the filtered one - either the
+     * old file or the fully-written new one is what's on disk at any
+     * point, never a half-written file (rename() on POSIX and Windows
+     * with an existing destination target is not literally atomic on
+     * every filesystem, but is the closest portable primitive available
+     * here, and is the same guarantee every other "write to a temp file,
+     * then swap it in" pattern in this codebase relies on). */
+#ifdef _WIN32
+    remove(path); /* Windows rename() fails if the destination exists */
+#endif
+    rename(tmp_path, path);
 }
 
 /* Read at most this many trailing bytes of the log file when looking

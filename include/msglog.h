@@ -48,6 +48,32 @@
 void msglog_append(const char *who, const char *text);
 
 /*
+ * msglog_append_saved - same as msglog_append(), but marks the line as
+ * SAVED (a "[SAVED] " marker written right after the timestamp, before
+ * `who`) - see msglog_clear_except_saved()'s comment for what this
+ * marker actually protects. Intended for a message the user explicitly
+ * flagged (see session.c's "/save <text>" command) as worth keeping
+ * through a future /clear, not for general use.
+ */
+void msglog_append_saved(const char *who, const char *text);
+
+/*
+ * msglog_clear_except_saved - the "/clear" command's actual effect
+ * (see session.c): rewrites the log file in place, keeping ONLY lines
+ * previously written via msglog_append_saved() and discarding
+ * everything else. This is a real, on-disk zeroing (not just a
+ * clear of what's currently on screen) - the whole point of the
+ * feature is that plaintext chat content (see this header's top
+ * comment on the honest at-rest limitation) doesn't have to sit
+ * around indefinitely if the user wants it gone. Best-effort, same
+ * as msglog_append() - a failure here is not reported to the caller,
+ * though ui.c still shows a confirmation notice either way since the
+ * caller (session.c) doesn't have a failure signal to act on
+ * differently.
+ */
+void msglog_clear_except_saved(void);
+
+/*
  * msglog_load_recent - fill out_lines with up to max_lines of the most
  * RECENT entries from the log (oldest of the returned lines first,
  * matching natural reading order), each already formatted exactly as

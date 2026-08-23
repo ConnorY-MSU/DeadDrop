@@ -58,10 +58,19 @@
  */
 static WINDOW *status_win = NULL;
 static WINDOW *history_border_win = NULL; /* outer window, box() only */
-static WINDOW *history_win = NULL;        /* derwin() inside the above -
-    all existing call sites keep using this name/window for actual
-    content; only ui_init() and the touch row-math needed to change to
-    account for the border. See this file's STYLING block comment. */
+static WINDOW *history_win = NULL;        /* a PAD (newpad()), not a
+    plain window - holds real, retained scrollback (see this file's
+    touch block comment for why this changed from an earlier derwin()).
+    All existing call sites keep using this name for writing content
+    (wprintw() etc. work identically on a pad); only the "make it
+    visible on screen" step changed - see refresh_history_viewport_locked()
+    below, which replaces every old direct wrefresh(history_win) call. */
+static WINDOW *lock_overlay_win = NULL;   /* plain window, same screen
+    rectangle as history_win's viewport (see HISTORY_VIEWPORT_TOP_ROW/
+    HISTORY_VIEWPORT_LEFT_COL below) - shown INSTEAD OF prefresh()-ing
+    the pad while locked, so the lock banner never has to erase or
+    otherwise touch the pad's actual retained content (a real bug in
+    the pre-pad design - see this file's touch block comment). */
 static WINDOW *input_border_win = NULL;   /* outer window, box() only */
 static WINDOW *input_win = NULL;          /* derwin() inside the above */
 static pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -225,11 +234,12 @@ static char wifi_pending_password[LOCK_PIN_MAX_LEN + 1]; /* copied out of
     pin_entry_buf (reused here as the general masked-entry buffer - see
     its own declaration comment) right before ui_mutex is released, so
     the deferred connect call in ui_poll_line() has it after unlocking */
-static int wifi_list_header_row = -1; /* history_win row (its own
-    coordinate space) where the "WiFi networks found" header was last
-    drawn - entry i is at wifi_list_header_row + 1 + i. Used by the
-    touch thread to map a tap back to a specific network - see this
-    file's touch block comment for the known staleness edge case. */
+static long wifi_list_header_row = -1; /* ABSOLUTE line index (same
+    numbering as history_total_lines below, NOT a pad-relative row -
+    see this file's touch block comment for why that distinction now
+    matters) where the "WiFi networks found" header was last drawn -
+    entry i is at wifi_list_header_row + 1 + i. Used by the touch
+    thread to map a tap back to a specific network. */
 
 typedef enum {
     UI_PENDING_NONE,
@@ -256,18 +266,18 @@ typedef enum {
  *   equivalent to typing its number and pressing Enter - see
  *   wifi_list_header_row's declaration for how a tap row maps back to
  *   an entry, and its documented staleness edge case.
- * - UI_MODE_NORMAL: tapping the UPPER half of history_win's rows
- *   "pauses" it (stops wrefresh()-ing on new content, reusing the
- *   exact suppress-refresh technique the lock screen already uses -
- *   see ui_add_history()); tapping the LOWER half "resumes" (reveals
- *   everything that accumulated while paused via touchwin()+
- *   wrefresh()). Deliberately NOT true arbitrary scrollback (which
- *   would need converting history_win from a plain window to a pad,
- *   a real architecture change) - "pause so new messages don't push
- *   away what you're reading, then catch up" covers the actual
- *   motivation for touch-scrolling on a small display without that
- *   rewrite, and is documented here as the honest, deliberate scope
- *   chosen instead of literal scrollback.
+ *
+ * UI_MODE_NORMAL deliberately has NO touch gesture (as of the
+ * 2026-08-22 rewrite) - an earlier version used tapping the upper/lower
+ * half of history_win to scroll/pause scrollback, but real testing
+ * surfaced touch-hardware reliability problems (taps not reliably
+ * reaching the kernel at all in some sessions - see TESTING.md), on top
+ * of small touch targets already being a worse fit than dedicated keys
+ * for "hold still and pick a spot." Scrollback navigation moved to
+ * UP/DOWN arrow keys instead (ui_poll_line()'s UI_MODE_NORMAL branch,
+ * via scroll_history_locked()) - see history_win's declaration comment:
+ * it's still a real PAD holding up to HISTORY_PAD_LINES of retained
+ * history, just driven by keyboard input now, not touch.
  *
  * THREADING: unlike the idle-input thread, this thread does NOT need
  * ui_start_idle_input()/ui_stop_idle_input()-style bracketing around
@@ -280,7 +290,31 @@ static int touch_fd = -1;
 static pthread_t touch_thread;
 static volatile int touch_thread_running = 0;
 static volatile int touch_thread_should_stop = 0;
-static int history_paused = 0;
+
+/* --- Real scrollback state (history_win is a PAD - see its own
+ * declaration comment) -----------------------------------------------
+ *
+ * history_total_lines counts every line EVER written, even past
+ * HISTORY_PAD_LINES (once the pad itself internally scrolls and starts
+ * discarding its own oldest rows) - this is what makes it safe to use
+ * as a stable, ever-increasing coordinate for view position and for
+ * wifi_list_header_row above, unlike a raw pad row (getcury()), which
+ * ncurses pins back once the pad's own internal scrolling kicks in and
+ * would otherwise silently go stale/wrong the moment that happens.
+ *
+ * history_view_line is the absolute line index (same numbering)
+ * currently shown at the TOP of the viewport. history_following==1
+ * means "keep it pinned to the live/bottom position, recomputed on
+ * every write" (the normal, default state); pressing Up
+ * (scroll_history_locked()) sets history_following to 0 and pins
+ * history_view_line where the user scrolled to, so new incoming
+ * messages keep accumulating in the pad without visually yanking their
+ * view.
+ */
+#define HISTORY_PAD_LINES 3000
+static long history_total_lines = 0;
+static long history_view_line = 0;
+static int history_following = 1;
 
 /* --- Message-pending LED flash + OLED background metrics --------------
  *
@@ -306,19 +340,39 @@ static int metrics_oled_fd = -1;  /* set once by ui_set_oled_fd() */
  * much coarser than the flash toggle above. */
 #define UI_METRICS_REFRESH_ITERS 150
 
-/* Must be called with ui_mutex held. Replaces history_win's PHYSICAL
- * content with a locked banner, then STOPS refreshing history_win (see
- * ui_add_history() below) until unlock - real incoming messages keep
- * being written into history_win's off-screen buffer the whole time via
- * wprintw() there, regardless of lock state (the receiver thread calling
- * ui_add_history() never changes behavior based on lock state - see this
- * block's DECOUPLING note above), they just don't reach the physical
- * screen until wrefresh(history_win) happens again at unlock. */
+/* Clears message_pending_ack and restores the LED to HW_STATUS_CONNECTED
+ * (green) - shared by touch_thread_main() (a real tap - see
+ * handle_tap_locked()'s caller) and ui_poll_line() (a real keystroke -
+ * see its UI_MODE_NORMAL branch). Both count as "the device was used" as
+ * of the 2026-08-22 rewrite: touch alone used to be the only way to clear
+ * this, which meant a genuine touch-hardware fault (see this file's touch
+ * block comment) could leave the LED flashing indefinitely with no way to
+ * silence it short of a physical keypress the flash indicator itself
+ * doesn't require - now either input method clears it, so a working
+ * keyboard is always enough on its own regardless of touch's health.
+ * Callable from either the touch thread or the thread running
+ * ui_poll_line() (the idle-input thread or session.c's own caller) since
+ * hw_expansion's fd-based calls are thread-safe by construction (no
+ * shared mutable state of their own - same reasoning already applied to
+ * every other RGB LED call in this file) and message_pending_ack is
+ * `volatile int`, not requiring ui_mutex. */
+static void clear_message_pending_flash(void)
+{
+    if (!message_pending_ack) {
+        return;
+    }
+    message_pending_ack = 0;
+    if (flash_hw_fd >= 0) {
+        hw_expansion_set_led_mode(flash_hw_fd, HW_LED_MODE_MANUAL_RGB);
+        hw_expansion_set_status_color(flash_hw_fd, HW_STATUS_CONNECTED);
+    }
+}
+
 /* --- Boot splash + lock-screen banner: shared box-drawing helpers ---
  *
  * Both draw a "+===...===+ / | text | / +===...===+" box, sized to the
  * text and centered, into whichever window is passed in (stdscr for the
- * boot splash, history_win for the lock screen). Deliberately plain
+ * boot splash, lock_overlay_win for the lock screen). Deliberately plain
  * ASCII ('+', '=', '|') rather than Unicode box-drawing glyphs - see
  * this file's STYLING block comment for why. Width/columns computed
  * from the actual window/text at draw time (confirmed against real
@@ -432,13 +486,24 @@ static void show_splash(void)
     refresh();
 }
 
+/* Must be called with ui_mutex held. Draws into lock_overlay_win - a
+ * separate window covering the exact same screen rectangle as
+ * history_win's (pad) viewport (see both windows' declaration comments)
+ * - and shows it, rather than drawing into/erasing the pad itself. This
+ * is what actually fixes the older, previously-documented-but-deferred
+ * bug where locking used to werase() history_win directly, silently
+ * discarding the ENTIRE live in-memory scrollback on every lock cycle:
+ * with the pad/overlay split, locking never touches history_win's
+ * pad at all, so nothing retained there is ever at risk from a lock
+ * cycle again - this was the real architecture change that bug always
+ * needed, not a targeted patch. */
 static void draw_locked_overlay_locked(void)
 {
-    int win_width = getmaxx(history_win);
+    int win_width = getmaxx(lock_overlay_win);
     int box_width = win_width - 4;
     int col;
 
-    werase(history_win);
+    werase(lock_overlay_win);
 
     if (box_width > 40) {
         box_width = 40; /* a compact banner even on a wide screen,
@@ -452,29 +517,74 @@ static void draw_locked_overlay_locked(void)
         col = 0;
     }
 
-    wattron(history_win, COLOR_PAIR(CP_LOCKED));
-    ui_draw_hline(history_win, 1, col, box_width);
-    ui_draw_centered(history_win, 2, col, box_width, "L O C K E D");
-    ui_draw_hline(history_win, 3, col, box_width);
-    wattroff(history_win, COLOR_PAIR(CP_LOCKED));
+    wattron(lock_overlay_win, COLOR_PAIR(CP_LOCKED));
+    ui_draw_hline(lock_overlay_win, 1, col, box_width);
+    ui_draw_centered(lock_overlay_win, 2, col, box_width, "L O C K E D");
+    ui_draw_hline(lock_overlay_win, 3, col, box_width);
+    wattroff(lock_overlay_win, COLOR_PAIR(CP_LOCKED));
 
-    wattron(history_win, COLOR_PAIR(CP_SYSTEM));
-    /* REAL BUG FOUND (2026-08-22, via live touch-gesture re-testing):
-     * no trailing '\n' here left history_win's internal cursor sitting
-     * mid-line, right after "unlock." - anything appended later via a
-     * bare wprintw() (the WiFi-scan-results code, the only other
-     * consumer of this window besides ui_add_history(), which always
-     * includes its own trailing newline) silently concatenated onto
-     * that same physical line instead of starting a fresh one. Fixed
-     * by always ending on a clean line here too, regardless of what
-     * runs next. */
-    mvwprintw(history_win, 5, 1,
+    wattron(lock_overlay_win, COLOR_PAIR(CP_SYSTEM));
+    mvwprintw(lock_overlay_win, 5, 1,
               "Messages are still being received normally in the "
               "background.\nEnter your PIN below and press Enter to "
               "unlock.\n");
-    wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
+    wattroff(lock_overlay_win, COLOR_PAIR(CP_SYSTEM));
 
-    wrefresh(history_win);
+    wrefresh(lock_overlay_win);
+}
+
+/* history_win's viewport occupies the same screen rectangle the old
+ * derwin() used to (row 2 = status_win + history_border_win's top
+ * border edge; col 1 = history_border_win's left border edge - see
+ * ui_init()'s STYLING comment for that offset). */
+#define HISTORY_VIEWPORT_TOP_ROW 2
+#define HISTORY_VIEWPORT_LEFT_COL 1
+
+/* Must be called with ui_mutex held, and only while NOT locked (the
+ * lock overlay owns the screen instead - see draw_locked_overlay_locked()).
+ * This is the pad equivalent of every old direct wrefresh(history_win)
+ * call in this file - it is the ONE place that converts
+ * history_view_line/history_following into an actual prefresh() call,
+ * so every caller (ui_add_history(), the WiFi-list renderer, the
+ * scroll-tap gesture, unlock) stays in sync through one shared
+ * implementation rather than duplicating this math. */
+static void refresh_history_viewport_locked(void)
+{
+    int viewport_height = LINES - 6;
+    int viewport_width = COLS - 2;
+    long shift = (history_total_lines > HISTORY_PAD_LINES)
+                     ? (history_total_lines - HISTORY_PAD_LINES) : 0;
+    long top_line;
+    int pad_row;
+
+    if (viewport_height < 1) {
+        viewport_height = 1;
+    }
+    if (viewport_width < 1) {
+        viewport_width = 1;
+    }
+
+    if (history_following) {
+        top_line = (history_total_lines > viewport_height)
+                       ? (history_total_lines - viewport_height) : 0;
+    } else {
+        top_line = history_view_line;
+    }
+    if (top_line < shift) {
+        top_line = shift; /* can't scroll before the oldest line still
+            physically retained in the pad - see HISTORY_PAD_LINES */
+    }
+    history_view_line = top_line;
+
+    pad_row = (int)(top_line - shift);
+    if (pad_row < 0) {
+        pad_row = 0;
+    }
+
+    prefresh(history_win, pad_row, 0,
+             HISTORY_VIEWPORT_TOP_ROW, HISTORY_VIEWPORT_LEFT_COL,
+             HISTORY_VIEWPORT_TOP_ROW + viewport_height - 1,
+             HISTORY_VIEWPORT_LEFT_COL + viewport_width - 1);
 }
 
 /* Mode-aware input-line redraw - replaces the old single-purpose
@@ -539,12 +649,12 @@ static void redraw_input_locked(void)
     case UI_MODE_NORMAL:
     default:
         apply_uniform_color = 0;
-        if (history_paused) {
+        if (!history_following) {
             if (has_colors()) {
                 wattron(input_win, COLOR_PAIR(CP_ACCENT));
             }
             mvwprintw(input_win, 0, 0,
-                      "[PAUSED - tap lower half to resume]");
+                      "[SCROLLED - Down arrow to go forward]");
             if (has_colors()) {
                 wattroff(input_win, COLOR_PAIR(CP_ACCENT));
             }
@@ -579,6 +689,88 @@ static void redraw_input_locked(void)
     wrefresh(input_win);
 }
 
+/* Must be called with ui_mutex held. Steps the viewport up (older
+ * content, direction<0) or down (newer content, direction>0) by half a
+ * viewport - shared by the UP/DOWN arrow-key handling in ui_poll_line()'s
+ * UI_MODE_NORMAL branch, the only way to navigate scrollback as of the
+ * 2026-08-22 rewrite (see this file's touch block comment for why touch
+ * is no longer involved in this at all - real touch-hardware reliability
+ * problems surfaced during testing, on top of small-screen taps already
+ * being a worse fit for "hold still and pick a spot" than dedicated
+ * keys). */
+static void scroll_history_locked(int direction)
+{
+    int viewport_height = LINES - 6;
+    int step = viewport_height / 2;
+
+    if (step < 1) {
+        step = 1;
+    }
+
+    if (direction < 0) {
+        /* history_view_line already reflects the current live top even
+         * while history_following (refresh_history_viewport_locked()
+         * keeps it in sync every time it's called - see its own
+         * comment), so this is correct as the starting point whether
+         * or not a scroll was already in progress. */
+        long shift = (history_total_lines > HISTORY_PAD_LINES)
+                         ? (history_total_lines - HISTORY_PAD_LINES) : 0;
+        long new_top = history_view_line - step;
+        if (new_top < shift) {
+            new_top = shift;
+        }
+        history_view_line = new_top;
+        history_following = 0;
+    } else if (direction > 0 && !history_following) {
+        long live_top = (history_total_lines > viewport_height)
+                             ? (history_total_lines - viewport_height) : 0;
+        history_view_line += step;
+        if (history_view_line >= live_top) {
+            history_following = 1;
+        }
+    } else {
+        return; /* direction>0 while already following live - nothing to
+            do, avoid an unnecessary prefresh() */
+    }
+    refresh_history_viewport_locked();
+    redraw_input_locked(); /* keeps the [SCROLLED] indicator (see
+        redraw_input_locked()) in sync with history_following */
+}
+
+/* Must be called with ui_mutex held. Writes whatever msglog_load_recent()
+ * currently returns directly into history_win's pad, bumping
+ * history_total_lines per line - shared by ui_init() (replay what
+ * survived a previous boot) and ui_clear_history() (replay what
+ * survived a /clear - see msglog_clear_except_saved()). Each line is
+ * ALREADY formatted with its own embedded timestamp
+ * (msglog_append()'s own "[YYYY-MM-DD HH:MM:SS] who: text"), so this
+ * deliberately writes directly into history_win rather than going
+ * through ui_add_history() (which would prepend a SECOND, current-time
+ * timestamp on top of the log's own historical one - wrong). Does NOT
+ * itself call refresh_history_viewport_locked() or draw_locked_overlay_
+ * locked() - callers decide how/whether to reveal it, since ui_init()
+ * and ui_clear_history() need to do that differently (ui_init() may
+ * still be locked; ui_clear_history() never is, see its own comment). */
+static void replay_msglog_into_pad_locked(void)
+{
+    char recent[20][MSGLOG_LINE_MAX];
+    int n = msglog_load_recent(recent,
+                                 (int)(sizeof(recent) / sizeof(recent[0])));
+    if (n > 0) {
+        int i;
+        wattron(history_win, COLOR_PAIR(CP_SYSTEM));
+        wprintw(history_win, "--- previous session history ---\n");
+        history_total_lines++;
+        for (i = 0; i < n; i++) {
+            wprintw(history_win, "%s\n", recent[i]);
+            history_total_lines++;
+        }
+        wprintw(history_win, "--- end of previous history ---\n");
+        history_total_lines++;
+        wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
+    }
+}
+
 void ui_init(const char *peer_label)
 {
     initscr();
@@ -600,13 +792,24 @@ void ui_init(const char *peer_label)
      * palette rationale. has_colors() is checked defensively - a
      * terminal without color support (shouldn't happen with TERM=linux
      * on the real target, but conceivable elsewhere) just runs
-     * monochrome rather than crashing or looking broken. */
+     * monochrome rather than crashing or looking broken.
+     *
+     * CP_OWN_MSG/CP_PEER_MSG (2026-08-22): changed from cyan/white (too
+     * close to each other, and to CP_BORDER/CP_INPUT's own cyan, at a
+     * glance) to green/yellow specifically so "who said this" is
+     * readable from the color alone, not just the "you:"/"<peer>: "
+     * text prefix - a real, direct request after the softer "standard
+     * terminal" pass made every message line read as roughly the same
+     * color. Green for "you" (a common, low-effort-to-parse convention
+     * for one's own messages), yellow for the peer - both stay
+     * comfortably distinct from CP_LOCKED's red and CP_SYSTEM's neutral
+     * white on the same black background. */
     if (has_colors()) {
         start_color();
         init_pair(CP_STATUS, COLOR_WHITE, COLOR_BLUE);
         init_pair(CP_BORDER, COLOR_CYAN, COLOR_BLACK);
-        init_pair(CP_PEER_MSG, COLOR_WHITE, COLOR_BLACK);
-        init_pair(CP_OWN_MSG, COLOR_CYAN, COLOR_BLACK);
+        init_pair(CP_PEER_MSG, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(CP_OWN_MSG, COLOR_GREEN, COLOR_BLACK);
         init_pair(CP_SYSTEM, COLOR_WHITE, COLOR_BLACK);
         init_pair(CP_LOCKED, COLOR_RED, COLOR_BLACK);
         init_pair(CP_INPUT, COLOR_CYAN, COLOR_BLACK);
@@ -623,19 +826,20 @@ void ui_init(const char *peer_label)
 
     /* Layout: a 1-row status bar with a filled background (a "title
      * bar" look, via wbkgd() below) plus two bordered panels. Each
-     * bordered panel is an OUTER window (box() only) with an INNER
-     * derwin() for actual content - the standard ncurses pattern for a
-     * border that survives scrolling: an inner derwin() physically
-     * shares the same character grid as its parent's interior, so
-     * refreshing just the inner window updates content without ever
-     * touching, or needing to redraw, the border cells around it.
-     * Every existing call site (ui_add_history(), redraw_input_locked(),
-     * etc.) keeps using the SAME `history_win`/`input_win` names for
-     * content - only what they're created FROM changed here. */
+     * bordered panel is an OUTER window (box() only). history_border_win's
+     * interior is filled by a PAD (history_win - see its declaration
+     * comment for why, as of the 2026-08-22 real-scrollback rewrite) shown
+     * via prefresh() instead of an inner derwin(); input_border_win still
+     * uses the original inner-derwin() pattern (an input line has nothing
+     * to scroll back through). lock_overlay_win is a separate plain
+     * window sized/positioned to exactly cover history_win's viewport
+     * rectangle, shown instead of it while locked. */
     status_win = newwin(1, COLS, 0, 0);
 
     history_border_win = newwin(LINES - 4, COLS, 1, 0);
-    history_win = derwin(history_border_win, LINES - 6, COLS - 2, 1, 1);
+    history_win = newpad(HISTORY_PAD_LINES, COLS - 2);
+    lock_overlay_win = newwin(LINES - 6, COLS - 2, HISTORY_VIEWPORT_TOP_ROW,
+                               HISTORY_VIEWPORT_LEFT_COL);
 
     input_border_win = newwin(3, COLS, LINES - 3, 0);
     input_win = derwin(input_border_win, 1, COLS - 2, 1, 1);
@@ -675,42 +879,42 @@ void ui_init(const char *peer_label)
     ui_active = 1;
 
     pthread_mutex_lock(&ui_mutex);
-    {
-        /* Replay recent persisted chat history (see msglog.h) so a
-         * reboot doesn't present a blank, context-free screen - each
-         * line is ALREADY formatted with its own embedded timestamp
-         * (msglog_append()'s own "[YYYY-MM-DD HH:MM:SS] who: text"),
-         * so this deliberately writes directly into history_win rather
-         * than going through ui_add_history() (which would prepend a
-         * SECOND, current-time timestamp on top of the log's own
-         * historical one - wrong). Written into the buffer the same
-         * way real live content is (see ui_add_history()'s DECOUPLING
-         * note) - it becomes visible on wrefresh() below (if unlocked)
-         * or stays queued behind the lock overlay (if locked), exactly
-         * like any other pre-existing history would. */
-        char recent[20][MSGLOG_LINE_MAX];
-        int n = msglog_load_recent(recent,
-                                     (int)(sizeof(recent) / sizeof(recent[0])));
-        if (n > 0) {
-            int i;
-            wattron(history_win, COLOR_PAIR(CP_SYSTEM));
-            wprintw(history_win, "--- previous session history ---\n");
-            for (i = 0; i < n; i++) {
-                wprintw(history_win, "%s\n", recent[i]);
-            }
-            wprintw(history_win, "--- end of previous history ---\n");
-            wattroff(history_win, COLOR_PAIR(CP_SYSTEM));
-        }
-    }
+    replay_msglog_into_pad_locked();
     if (ui_mode == UI_MODE_LOCKED) {
         draw_locked_overlay_locked();
     } else {
-        wrefresh(history_win);
+        refresh_history_viewport_locked();
     }
     redraw_input_locked();
     pthread_mutex_unlock(&ui_mutex);
 
     ui_set_statusf("Connecting to %s...", peer_label ? peer_label : "?");
+
+    /* Quick help guide - shown once per process start, i.e. once per
+     * boot given this app's systemd unit (Restart=always - see
+     * show_splash()'s comment for the same reasoning applied there).
+     * Deliberately one ui_add_history() call per line rather than a
+     * single call with embedded '\n's: ui_add_history() bumps
+     * history_total_lines exactly once per call, and the real-
+     * scrollback math (see this file's touch block comment) assumes
+     * that 1 call == 1 physical pad row - a multi-line single call
+     * would silently break that alignment. */
+    {
+        static const char *const help_lines[] = {
+            "--- Quick help ---",
+            "Ctrl+L: lock now, or set a PIN if none is configured yet",
+            "Ctrl+W: WiFi setup (scan, select a network, connect)",
+            "Up/Down arrows: scroll message history",
+            "/send <path>: send a small local file",
+            "/save <text>: send a message that survives /clear",
+            "/clear: wipe chat history (keeps any /save'd messages)",
+            "quit or exit: end the session",
+        };
+        size_t i;
+        for (i = 0; i < sizeof(help_lines) / sizeof(help_lines[0]); i++) {
+            ui_add_history(NULL, help_lines[i]);
+        }
+    }
 
     if (!pin_configured) {
         ui_add_history(NULL, "No PIN set - press Ctrl+L to set one and "
@@ -813,19 +1017,25 @@ void ui_add_history(const char *prefix, const char *text)
             wprintw(history_win, "%s\n", text != NULL ? text : "");
         }
         wattroff(history_win, COLOR_PAIR(cp));
+        history_total_lines++;
     }
-    /* Always write into history_win's buffer (above), regardless of lock
-     * or pause state - see this file's lock-screen block comment's
+    /* Always write into history_win's pad (above), regardless of lock
+     * or scroll state - see this file's lock-screen block comment's
      * DECOUPLING note: the receiver thread calling this must never
-     * behave differently based on UI state. Only the PHYSICAL screen
-     * update is gated: while locked, skip wrefresh() so the
-     * accumulating real content stays invisible behind the lock overlay
-     * (drawn once, at lock time) until unlock explicitly reveals it -
-     * and likewise while history_paused (see this file's touch block
-     * comment), so a deliberate "hold still, I'm reading this" tap
-     * isn't immediately undone by the next incoming message. */
-    if (ui_mode != UI_MODE_LOCKED && !history_paused) {
-        wrefresh(history_win);
+     * behave differently based on UI state; the pad genuinely retains
+     * it either way (see history_win's declaration comment - this is
+     * what actually changed in the 2026-08-22 real-scrollback rewrite).
+     * Only the PHYSICAL screen update is gated: while locked, skip it
+     * entirely so the lock overlay stays undisturbed on screen until
+     * unlock explicitly reveals the pad again - and likewise while
+     * history_following is 0 (see this file's touch block comment), so
+     * a deliberate "I scrolled back to read this" tap isn't immediately
+     * undone by the next incoming message; refresh_history_viewport_locked()
+     * itself still tracks history_view_line correctly meanwhile (see its
+     * own comment), it just isn't asked to actually paint the screen
+     * until the user scrolls back to live or unlocks. */
+    if (ui_mode != UI_MODE_LOCKED && history_following) {
+        refresh_history_viewport_locked();
     }
     redraw_input_locked();
     pthread_mutex_unlock(&ui_mutex);
@@ -843,6 +1053,40 @@ void ui_add_historyf(const char *prefix, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     ui_add_history(prefix, buf);
+}
+
+/* The "/clear" command's UI-side half (see session.c, which pairs this
+ * with msglog_clear_except_saved() - THIS function only touches the
+ * live on-screen pad, it never touches the log file itself, so the
+ * caller must have already rewritten the file before calling this, or
+ * the replay below would just bring the "cleared" content right back).
+ * Wipes history_win's pad content outright (unlike locking, which only
+ * ever hides the pad behind lock_overlay_win without erasing it - see
+ * draw_locked_overlay_locked()'s comment) and resets all scrollback
+ * state back to a fresh, empty, live-following pad, then replays
+ * whatever's left in the log (i.e. only /save'd lines, once the caller
+ * has done its part) so nothing genuinely marked worth keeping
+ * disappears from view either. Always leaves history_following=1
+ * (there's nothing scrolled-back-to anymore) and never touches lock
+ * state - /clear is only ever reachable from an active, unlocked
+ * session (see session.c), so there's no lock-overlay interaction to
+ * consider here the way ui_init() has to. */
+void ui_clear_history(void)
+{
+    if (!ui_active) {
+        return;
+    }
+    pthread_mutex_lock(&ui_mutex);
+    werase(history_win);
+    wmove(history_win, 0, 0);
+    history_total_lines = 0;
+    history_view_line = 0;
+    history_following = 1;
+    replay_msglog_into_pad_locked();
+    if (ui_mode != UI_MODE_LOCKED) {
+        refresh_history_viewport_locked();
+    }
+    pthread_mutex_unlock(&ui_mutex);
 }
 
 /* Each individual lock hold inside ui_poll_line() is capped at this
@@ -912,6 +1156,14 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
             usleep(1000);
             continue;
         }
+
+        /* A real keystroke happened - counts as "the device was used"
+         * for the message-pending LED flash, same as a touch tap (see
+         * clear_message_pending_flash()'s own comment for why both
+         * count, independent of each other's hardware health). Done
+         * unconditionally here (before the mode/key dispatch below)
+         * rather than duplicated in every branch that could be reached. */
+        clear_message_pending_flash();
 
         {
             ui_poll_result result = UI_POLL_TIMEOUT;
@@ -992,11 +1244,19 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                     /* else: silently drop the keystroke once
                      * UI_INPUT_MAX is hit - an honest, deliberate cap
                      * (see its #define), not a bug. */
+                } else if (ch == KEY_UP) {
+                    /* Scrollback navigation (2026-08-22) - see
+                     * scroll_history_locked()'s own comment for why
+                     * this replaced an earlier touch-tap gesture
+                     * entirely, rather than existing alongside it. */
+                    scroll_history_locked(-1);
+                } else if (ch == KEY_DOWN) {
+                    scroll_history_locked(1);
                 }
-                /* Any other key (arrows, function keys, resize, etc.):
-                 * ignored - out of scope for this project's UI, see
-                 * ui.h's touch/keyboard scope note for the same kind
-                 * of deliberate, documented limit. */
+                /* Any other key (function keys, resize, etc.): ignored -
+                 * out of scope for this project's UI, see ui.h's touch/
+                 * keyboard scope note for the same kind of deliberate,
+                 * documented limit. */
             } else if (ui_mode == UI_MODE_LOCKED) {
                 if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
                     time_t now = time(NULL);
@@ -1013,14 +1273,18 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                         wrong_attempt_count = 0;
                         next_allowed_check_time = 0;
                         last_activity_time = time(NULL);
-                        /* Reveal history_win: it was never wrefresh()'d
-                         * while locked (see ui_add_history()), so
+                        /* Reveal history_win's pad: its screen region was
+                         * showing lock_overlay_win the whole time locked
+                         * (see draw_locked_overlay_locked()), so
                          * touchwin() is needed to force a full redraw -
                          * ncurses' normal diff-based refresh could
-                         * otherwise miss content that changed while
-                         * this window wasn't the one being refreshed. */
+                         * otherwise miss content that changed while this
+                         * window wasn't the one being refreshed. Whatever
+                         * scroll position the user had before locking
+                         * (history_view_line/history_following) is left
+                         * exactly as it was - locking never altered it. */
                         touchwin(history_win);
-                        wrefresh(history_win);
+                        refresh_history_viewport_locked();
                         redraw_input_locked();
                     } else {
                         int delay;
@@ -1222,23 +1486,33 @@ ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
                 pthread_mutex_lock(&ui_mutex);
                 if (wifi_scan_count > 0) {
                     int i;
-                    /* Remember exactly where (within history_win's own
-                     * row coordinates) the list gets drawn, so a
-                     * touch tap can be mapped back to a specific
-                     * entry - see this file's touch block comment for
-                     * the known edge case (an incoming chat message
-                     * scrolling history_win further while this list
-                     * is showing would make this stale). */
-                    wifi_list_header_row = getcury(history_win);
+                    /* Remember exactly which ABSOLUTE line (see
+                     * history_total_lines' declaration comment) the list
+                     * gets drawn at, so a touch tap can be mapped back to
+                     * a specific entry - see wifi_list_header_row's own
+                     * declaration comment. Forcing history_following=1
+                     * here (regardless of any prior scroll state) and
+                     * refreshing right after means the just-drawn list is
+                     * what the viewport is actually showing when the
+                     * user taps it - including staying correct if an
+                     * incoming chat message arrives and nudges the live
+                     * view up a line while the list is still showing,
+                     * since handle_tap_locked()'s WIFI_SELECT branch
+                     * reads history_view_line at TAP time, not a cached
+                     * value from when the list was drawn. */
+                    wifi_list_header_row = history_total_lines;
                     wprintw(history_win,
                             "WiFi networks found (Ctrl+W to cancel):\n");
+                    history_total_lines++;
                     for (i = 0; i < wifi_scan_count; i++) {
                         wprintw(history_win, "  %d) %s%s\n", i + 1,
                                 wifi_scan_results[i].ssid,
                                 wifi_scan_results[i].secured
                                     ? " (secured)" : " (open)");
+                        history_total_lines++;
                     }
-                    wrefresh(history_win);
+                    history_following = 1;
+                    refresh_history_viewport_locked();
                     ui_mode = UI_MODE_WIFI_SELECT;
                     input_len = 0;
                     input_buf[0] = '\0';
@@ -1351,17 +1625,38 @@ static void *idle_input_thread_main(void *arg)
     while (!idle_thread_should_stop) {
         ui_poll_result pr = ui_poll_line(dummy, sizeof(dummy), 200);
         if (pr == UI_POLL_LINE) {
-            /* Something was typed and Enter pressed, but there's no
-             * active session to send it through - queue it (see
-             * outbox.h) rather than silently dropping it, so it goes
-             * out automatically the moment a session actually starts
-             * (session.c drains the outbox right after connecting). */
-            if (outbox_enqueue(dummy) == 0) {
-                ui_add_history(NULL, "(not connected - message queued, "
-                                      "will send once connected)");
+            /* "/clear" works here too, not just inside an active
+             * session (see session.c's own "/clear" handling and its
+             * comment) - a security-motivated "wipe my chat" command
+             * shouldn't have to wait for a connection to exist. */
+            if (strcmp(dummy, "/clear") == 0) {
+                msglog_clear_except_saved();
+                ui_clear_history();
+                ui_add_history(NULL,
+                    "(chat cleared - any /save'd messages were kept)");
+            } else if (strncmp(dummy, "/save ", 6) == 0) {
+                /* "/save" sends AND tags in one step (see session.c) -
+                 * there's no session to send through here, so rather
+                 * than silently queuing the raw "/save <text>" string
+                 * as if it were a literal chat message (it would be
+                 * sent verbatim, "/save" and all, once a session
+                 * starts - wrong), say so plainly instead. */
+                ui_add_history(NULL,
+                    "(/save requires an active connection - not queued)");
             } else {
-                ui_add_history(NULL, "(not connected - queue is full, "
-                                      "message NOT sent)");
+                /* Something was typed and Enter pressed, but there's no
+                 * active session to send it through - queue it (see
+                 * outbox.h) rather than silently dropping it, so it goes
+                 * out automatically the moment a session actually starts
+                 * (session.c drains the outbox right after connecting). */
+                if (outbox_enqueue(dummy) == 0) {
+                    ui_add_history(NULL, "(not connected - message "
+                                          "queued, will send once "
+                                          "connected)");
+                } else {
+                    ui_add_history(NULL, "(not connected - queue is "
+                                          "full, message NOT sent)");
+                }
             }
         }
         /* UI_POLL_TIMEOUT: normal, keep looping. UI_POLL_QUIT: never
@@ -1421,13 +1716,16 @@ static void handle_tap_locked(int tap_row, int tap_col)
          * this is the honest analog to "wake/dismiss a screensaver". */
         redraw_input_locked();
     } else if (ui_mode == UI_MODE_WIFI_SELECT) {
-        /* history_win's CONTENT starts at absolute screen row 2 now
-         * (row 0 = status bar, row 1 = history_border_win's top border
-         * edge, row 2 = first content row) - see ui_init()'s STYLING
-         * comment for the bordered-panel layout this offset comes
-         * from. */
-        int history_row = tap_row - 2;
-        int idx = history_row - (wifi_list_header_row + 1);
+        /* history_win's viewport starts at absolute screen row
+         * HISTORY_VIEWPORT_TOP_ROW (2) - see that #define. Converting a
+         * screen row to an ABSOLUTE line index (matching
+         * wifi_list_header_row's own numbering - see its declaration
+         * comment) needs history_view_line added back in, unlike the
+         * pre-pad version of this code: the viewport no longer always
+         * starts at the very first line ever written. */
+        long absolute_line = history_view_line +
+                              (tap_row - HISTORY_VIEWPORT_TOP_ROW);
+        long idx = absolute_line - (wifi_list_header_row + 1);
 
         if (wifi_list_header_row >= 0 && idx >= 0 &&
             idx < wifi_scan_count) {
@@ -1451,34 +1749,13 @@ static void handle_tap_locked(int tap_row, int tap_col)
             ui_mode = UI_MODE_WIFI_PASSWORD;
             redraw_input_locked();
         }
-    } else if (ui_mode == UI_MODE_NORMAL) {
-        /* Same border-offset reasoning as the WIFI_SELECT branch above. */
-        int history_height = LINES - 6;
-        int history_row = tap_row - 2;
-
-        if (history_row >= 0 && history_row < history_height) {
-            if (history_row < history_height / 2) {
-                if (!history_paused) {
-                    history_paused = 1;
-                    redraw_input_locked();
-                }
-            } else if (history_paused) {
-                history_paused = 0;
-                /* Reveal everything that accumulated while paused -
-                 * touchwin() forces a full redraw, same reasoning as
-                 * the lock screen's unlock path: ncurses' normal
-                 * diff-based refresh can miss content that changed
-                 * while this window wasn't the one being refreshed. */
-                touchwin(history_win);
-                wrefresh(history_win);
-                redraw_input_locked();
-            }
-        }
     }
-    /* Other modes (WIFI_SCANNING, WIFI_PASSWORD, WIFI_CONNECTING,
-     * SET_PIN_NEW, SET_PIN_CONFIRM): no touch gesture defined - a tap
-     * during one of these transient/sensitive-entry states is simply
-     * ignored rather than guessed at. */
+    /* UI_MODE_NORMAL: no touch gesture (as of the 2026-08-22 rewrite -
+     * scrollback navigation moved to UP/DOWN arrow keys instead, see
+     * scroll_history_locked() and this file's touch block comment for
+     * why). Other modes (WIFI_SCANNING, WIFI_PASSWORD, WIFI_CONNECTING,
+     * SET_PIN_NEW, SET_PIN_CONFIRM): still no touch gesture defined - a
+     * tap during any of these is simply ignored rather than guessed at. */
 }
 
 /* Draws WiFi SSID/signal/link-rate and a basic connectivity indicator
@@ -1588,18 +1865,15 @@ static void *touch_thread_main(void *arg)
             pthread_mutex_unlock(&ui_mutex);
 
             /* ANY tap acknowledges a pending message flash, not just a
-             * tap on the message itself - see ui.h's comment. */
-            if (message_pending_ack) {
-                message_pending_ack = 0;
-                flash_toggle_counter = 0;
-                flash_led_on = 0;
-                if (flash_hw_fd >= 0) {
-                    hw_expansion_set_led_mode(flash_hw_fd,
-                                               HW_LED_MODE_MANUAL_RGB);
-                    hw_expansion_set_status_color(flash_hw_fd,
-                                                   HW_STATUS_CONNECTED);
-                }
-            }
+             * tap on the message itself - see ui.h's comment and
+             * clear_message_pending_flash()'s own. Resetting this
+             * thread's own local toggle-animation bookkeeping too
+             * (harmless either way, since clear_message_pending_flash()
+             * already stops the toggle loop from re-entering on the next
+             * iteration by clearing message_pending_ack itself). */
+            flash_toggle_counter = 0;
+            flash_led_on = 0;
+            clear_message_pending_flash();
         } else if (rc < 0) {
             /* Device error (e.g. unplugged) - stop trying rather than
              * spin on a broken fd. */
@@ -1735,6 +2009,20 @@ void ui_init(const char *peer_label)
     snprintf(fallback_peer_label, sizeof(fallback_peer_label), "%s",
              peer_label != NULL ? peer_label : "?");
     fallback_prompt_shown = 0;
+
+    /* Same quick help guide as the real ncurses ui_init() above, printed
+     * plainly - see that copy's comment for the content itself; kept in
+     * sync by hand since the two ui_init()s share no code (see this
+     * block's top comment on why this whole fallback exists separately). */
+    printf("--- Quick help ---\n"
+           "Up/Down arrows: scroll message history\n"
+           "/send <path>: send a small local file\n"
+           "/save <text>: send a message that survives /clear\n"
+           "/clear: wipe chat history (keeps any /save'd messages)\n"
+           "quit or exit: end the session\n"
+           "(lock screen / WiFi setup are Linux+ncurses-only features,\n"
+           " not available in this plain-console fallback)\n");
+    fflush(stdout);
 }
 
 void ui_set_status(const char *status_text)
@@ -1773,6 +2061,17 @@ void ui_add_historyf(const char *prefix, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     ui_add_history(prefix, buf);
+}
+
+void ui_clear_history(void)
+{
+    /* Nothing to clear on-screen here - this fallback is a plain,
+     * non-scrolling console (see this block's top comment), it never
+     * kept any of its own history buffer the way ncurses' pad does.
+     * session.c's msglog_clear_except_saved() call still runs and does
+     * the real (on-disk) work regardless of this being a no-op. */
+    printf("(chat log cleared - any /save'd messages were kept)\n");
+    fflush(stdout);
 }
 
 ui_poll_result ui_poll_line(char *out_line, size_t out_line_size,
