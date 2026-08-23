@@ -23,6 +23,7 @@
     #include <netdb.h>
     #include <unistd.h>
     #include <errno.h>
+    #include <fcntl.h>
     typedef int socket_t;
     #define SOCKET_INVALID (-1)
     #define SOCKET_ERR_RET (-1)
@@ -81,6 +82,116 @@ static void set_socket_timeout(socket_t s)
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
+}
+
+/* REAL BUG FOUND AND FIXED (2026-08-22, live physical-unplug test series):
+ * a plain blocking connect() to a genuinely powered-off peer doesn't fail
+ * quickly - there's no host to send a TCP RST, so the OS just keeps
+ * retransmitting the initial SYN with its own exponential backoff
+ * (confirmed live via `ss -ti`: SYN-SENT, backoff climbing, rto growing
+ * toward 60+ seconds) until its own internal retry budget (platform-
+ * dependent, commonly a minute or more) is exhausted. Since this call
+ * was never given its own timeout (SO_RCVTIMEO/SO_SNDTIMEO are only set
+ * AFTER a successful connect(), by set_socket_timeout() above), a fresh
+ * reconnect attempt against a still-dead peer could block for a long
+ * time in "Connecting..." (amber) - not wrong, exactly, but far less
+ * responsive than RECONNECT_INITIAL_DELAY_SECONDS' fast-retry design
+ * intends, and the outer reconnect backoff barely gets to run since this
+ * inner call eats most of the time.
+ *
+ * Fixed with the standard portable technique: switch to non-blocking
+ * right before connect(), let it return immediately (EINPROGRESS/
+ * EWOULDBLOCK is the expected, non-error result), use select() to wait
+ * up to CONNECT_TIMEOUT_SECONDS for the socket to become writable (the
+ * signal a non-blocking connect() has resolved, one way or the other),
+ * then check SO_ERROR to find out whether it actually succeeded. Restores
+ * blocking mode afterward - everything past this point (the handshake,
+ * the session) still assumes a blocking socket, unchanged. */
+#define CONNECT_TIMEOUT_SECONDS 8
+
+static int set_nonblocking(socket_t s, int enable)
+{
+#ifdef _WIN32
+    u_long mode = enable ? 1 : 0;
+    return ioctlsocket(s, FIONBIO, &mode) == 0 ? 0 : -1;
+#else
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    if (enable) {
+        flags |= O_NONBLOCK;
+    } else {
+        flags &= ~O_NONBLOCK;
+    }
+    return fcntl(s, F_SETFL, flags) == 0 ? 0 : -1;
+#endif
+}
+
+/* Returns 0 on success, -1 on failure (timeout or a real connect error) -
+ * SOCK_LAST_ERROR() reflects the actual reason either way (ETIMEDOUT-ish
+ * for our own timeout path, or whatever SO_ERROR reported). */
+static int connect_with_timeout(socket_t s, const struct sockaddr *addr,
+                                  size_t addr_len)
+{
+    int rc;
+
+    if (set_nonblocking(s, 1) != 0) {
+        return -1; /* couldn't even switch modes - fall through to a
+            regular blocking connect() at the call site would be nicer,
+            but this is not expected to fail on any real platform this
+            project targets, so treating it as a hard error is simpler
+            and honest about an unexpected condition. */
+    }
+
+    rc = connect(s, addr, (socklen_t)addr_len);
+    if (rc == 0) {
+        set_nonblocking(s, 0); /* connected immediately (e.g. localhost) -
+            still restore blocking mode for everything after this */
+        return 0;
+    }
+
+#ifdef _WIN32
+    if (SOCK_LAST_ERROR() != WSAEWOULDBLOCK) {
+        return -1;
+    }
+#else
+    if (SOCK_LAST_ERROR() != EINPROGRESS) {
+        return -1;
+    }
+#endif
+
+    {
+        fd_set wfds;
+        struct timeval tv;
+        int sel_rc;
+
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        tv.tv_sec = CONNECT_TIMEOUT_SECONDS;
+        tv.tv_usec = 0;
+
+        sel_rc = select((int)(s + 1), NULL, &wfds, NULL, &tv);
+        if (sel_rc <= 0) {
+            /* 0 = our own timeout elapsed; <0 = a real select() error -
+             * either way, this attempt didn't complete in time. */
+            set_nonblocking(s, 0);
+            return -1;
+        }
+    }
+
+    {
+        int err = 0;
+        socklen_t len = sizeof(err);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0 ||
+                err != 0) {
+            set_nonblocking(s, 0);
+            return -1;
+        }
+    }
+
+    set_nonblocking(s, 0);
+    return 0;
 }
 
 static void print_usage(const char *prog_name)
@@ -302,9 +413,11 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
         }
     }
 
-    rc = connect(sock, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    if (rc == SOCKET_ERR_RET) {
-        ui_add_errorf("connect() failed: %d", SOCK_LAST_ERROR());
+    rc = connect_with_timeout(sock, (struct sockaddr *)&server_addr,
+                                sizeof(server_addr));
+    if (rc != 0) {
+        ui_add_errorf("connect() failed or timed out after %ds: %d",
+                       CONNECT_TIMEOUT_SECONDS, SOCK_LAST_ERROR());
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
