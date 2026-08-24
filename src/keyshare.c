@@ -421,9 +421,38 @@ int keyshare_reconstruct(const char *local_share_path,
         return -1; /* missing local file - retrying won't fix this */
     }
 
-    if (start_listener(my_custody_share_path, peer_expected_hostname,
-                        listen_port) != 0) {
-        return -1;
+    /* REAL BUG FOUND AND FIXED (2026-08-24): this used to call
+     * start_listener() exactly once, with no retry at all - a single
+     * hard failure here (most commonly get_own_tailscale_ip() failing
+     * because this device's own Tailscale connection isn't up yet at
+     * this exact instant, e.g. genuinely no known WiFi network in
+     * range yet, or the tailscaled/network-online.target boot-ordering
+     * window closing before Tailscale actually finished establishing a
+     * connection) propagated straight out of keyshare_reconstruct(),
+     * failing load_private_key(), and exiting the whole process - the
+     * fetch-from-peer loop below has always retried forever "by
+     * design" for exactly this class of problem, but that resilience
+     * never covered this earlier, mandatory prerequisite step at all.
+     * Confirmed live: alpha hit exactly this - "keyshare_reconstruct
+     * failed" on screen, then a full process restart back to the
+     * splash banner, repeating for as long as its network stayed
+     * unready, which on a real field device with an unpredictable WiFi
+     * environment can be many restart cycles rather than a one-off.
+     * Fixed by giving this step the identical retry-with-backoff
+     * treatment the fetch-from-peer loop already has (same constants,
+     * same shape) instead of a second, different resilience mechanism
+     * - a transient "not ready yet" here is exactly as recoverable as
+     * a transient "peer not reachable yet" already was. */
+    {
+        int listener_backoff = BACKOFF_INITIAL_SECONDS;
+        while (start_listener(my_custody_share_path, peer_expected_hostname,
+                               listen_port) != 0) {
+            sleep((unsigned int)listener_backoff);
+            listener_backoff *= 2;
+            if (listener_backoff > BACKOFF_MAX_SECONDS) {
+                listener_backoff = BACKOFF_MAX_SECONDS;
+            }
+        }
     }
 
     for (;;) {
