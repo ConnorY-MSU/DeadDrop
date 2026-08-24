@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <string.h>
+#include <fcntl.h>
 
 /* A sane spoken-aloud length cap - this project's messages can be up to
  * SL_MAX_BODY_LEN (64KB) per PROTOCOL.md, and nobody wants that read
@@ -54,6 +55,38 @@ void hw_tts_speak(const char *text)
             _exit(1);
         }
         if (grandchild == 0) {
+            /* REAL BUG FOUND AND FIXED (2026-08-24): this never
+             * redirected its own stdout/stderr, so it silently
+             * inherited whatever the parent securelink process has -
+             * on the real deployed service that's the physical console
+             * (StandardOutput=tty/StandardError=tty in the systemd
+             * unit), not a log file. Confirmed live: under this
+             * project's own systemd sandboxing (Finding #4,
+             * ProtectHome=read-only), espeak-ng links libpulse, which
+             * tries to create ~/.config/pulse on first use and fails
+             * ("Failed to create secure directory: Read-only file
+             * system") - a message that isn't fatal to espeak-ng
+             * itself (confirmed: it still exits 0 and keeps working,
+             * presumably falling back to ALSA directly - there's no
+             * real PulseAudio server installed here anyway, just the
+             * client library) but WAS visually corrupting the live
+             * ncurses screen on every single spoken message, since
+             * that stderr text landed directly on the same physical
+             * console the chat UI draws to. Silencing this process's
+             * own stdio - not widening ReadWritePaths to give
+             * ~/.config back - is the correct fix: espeak-ng doesn't
+             * need that directory to actually work, so there's nothing
+             * to unlock, just noise to stop routing onto the screen. */
+            {
+                int devnull = open("/dev/null", O_WRONLY);
+                if (devnull >= 0) {
+                    dup2(devnull, STDOUT_FILENO);
+                    dup2(devnull, STDERR_FILENO);
+                    if (devnull > STDERR_FILENO) {
+                        close(devnull);
+                    }
+                }
+            }
             /* Grandchild: the process that actually becomes espeak-ng.
              * If espeak-ng isn't on PATH, execlp() itself fails and this
              * process just exits - nothing upstream blocks or needs to
