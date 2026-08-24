@@ -142,13 +142,20 @@ static void fill_random(uint8_t *buf, size_t len)
     }
 }
 
-/* Iteration count for PBKDF2-HMAC-SHA256. Starting point pending real
- * hardware measurement on the actual deployed Pi 5 (see TESTING.md for
- * the live timing this was tuned against) - the target is "clearly,
- * deliberately slow for an attacker running billions of guesses/second
- * offline" while staying comfortably under a second for the one
- * legitimate PIN entry a real person is waiting on. */
-#define LOCK_PBKDF2_ITERATIONS 200000
+/* Iteration count for PBKDF2-HMAC-SHA256. Measured live on real Pi 5
+ * hardware (see TESTING.md), not assumed from generic guidance - the
+ * commonly cited OWASP/NIST iteration counts are calibrated for
+ * server-class CPUs handling many concurrent login checks, not a
+ * single ARM SBC where one local human is waiting on one interactive
+ * PIN entry. First attempt at 200,000 iterations measured ~1.9 SECONDS
+ * per check on this exact hardware - functionally correct but a
+ * genuinely bad, sluggish user experience for something checked on
+ * every single PIN entry, correct or not. Tuned down to land in the
+ * few-hundred-ms range instead: clearly, meaningfully slower than the
+ * original single SHA-256 round it replaced (by roughly three orders
+ * of magnitude), while staying comfortable for the one legitimate
+ * check a real person is actively waiting on. */
+#define LOCK_PBKDF2_ITERATIONS 40000
 
 static void hash_salted_pin(const uint8_t *salt, const char *pin,
                              size_t pin_len, uint8_t out_digest[LOCK_HASH_LEN])
