@@ -1,10 +1,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 
 #include "lock.h"
-#include "sha256.h"
+
+/* REAL SECURITY FIX (2026-08-24): PIN hashing used to be a single
+ * round of hand-rolled SHA-256 (salt || pin, hashed once). That was
+ * already documented elsewhere in this project as the one deliberate,
+ * accepted exception where the Week 1 hand-rolled primitive touched
+ * something actually trust-critical, rather than staying confined to
+ * pedagogical/benchmark code paths. A single SHA-256 round is fast
+ * enough that an attacker who ever extracts pin_hash directly (a
+ * pulled SD card, a backup, a bug) can brute-force a short PIN offline
+ * in a trivial amount of time - the live UI's own wrong-attempt delay
+ * (ui.c, persisted per Finding #6) only slows down someone going
+ * through the actual PIN-entry screen, not someone computing hashes
+ * against the extracted salt+digest directly.
+ *
+ * Fixed by switching to PBKDF2-HMAC-SHA256 via wolfSSL's own
+ * wc_PBKDF2() - not a second hand-rolled implementation, reusing a
+ * dependency this project already trusts and links for the entire TLS
+ * layer, with a real, tunable work factor. This also fully closes the
+ * "one accepted exception" gap: hand-rolled crypto no longer touches
+ * anything trust-critical in this project at all, not even the one
+ * spot that used to be carved out. */
+#include <wolfssl/options.h>
+#include <wolfssl/wolfcrypt/pwdbased.h>
+#include <wolfssl/wolfcrypt/hmac.h> /* WC_SHA256 */
 
 #ifdef _WIN32
     #include <direct.h>
@@ -118,14 +142,33 @@ static void fill_random(uint8_t *buf, size_t len)
     }
 }
 
+/* Iteration count for PBKDF2-HMAC-SHA256. Starting point pending real
+ * hardware measurement on the actual deployed Pi 5 (see TESTING.md for
+ * the live timing this was tuned against) - the target is "clearly,
+ * deliberately slow for an attacker running billions of guesses/second
+ * offline" while staying comfortably under a second for the one
+ * legitimate PIN entry a real person is waiting on. */
+#define LOCK_PBKDF2_ITERATIONS 200000
+
 static void hash_salted_pin(const uint8_t *salt, const char *pin,
                              size_t pin_len, uint8_t out_digest[LOCK_HASH_LEN])
 {
-    sha256_context ctx;
-    sha256_init(&ctx);
-    sha256_update(&ctx, salt, LOCK_SALT_LEN);
-    sha256_update(&ctx, (const uint8_t *)pin, pin_len);
-    sha256_final(&ctx, out_digest);
+    int rc = wc_PBKDF2(out_digest, (const byte *)pin, (int)pin_len,
+                        salt, LOCK_SALT_LEN, LOCK_PBKDF2_ITERATIONS,
+                        LOCK_HASH_LEN, WC_SHA256);
+    if (rc != 0) {
+        /* wc_PBKDF2() failing at all (bad params, allocation failure)
+         * is not something retrying or falling back to something
+         * weaker should ever paper over - zero the output so a
+         * caller that somehow ignored this would compare against an
+         * all-zero digest instead of silently trusting a garbage or
+         * partially-written buffer. lock_set_pin()/lock_check_pin()
+         * don't currently check this return value themselves (the
+         * original single-round SHA-256 version had no failure mode
+         * to check either), but a defined, safe-if-ignored failure
+         * output is a small, cheap improvement over an undefined one. */
+        memset(out_digest, 0, LOCK_HASH_LEN);
+    }
 }
 
 int lock_pin_exists(void)
