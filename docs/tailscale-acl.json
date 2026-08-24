@@ -64,6 +64,36 @@
 			"action": "accept",
 			"src":    ["tag:securelink-server"],
 			"dst":    ["tag:securelink-client:4434"]
+		},
+		{
+			// REAL GAP FOUND AND FIXED (2026-08-24): this ACL never
+			// granted SSH (port 22) at all - every prior remote
+			// administration session to either device this whole
+			// project only ever worked because the dev machine and
+			// the target Pi happened to be physically co-located,
+			// reachable over the LAN via mDNS, which bypasses this
+			// ACL entirely (it only governs Tailscale-routed traffic).
+			// The first time a device was genuinely remote with no
+			// shared LAN (alpha, sent to a paired device's home for
+			// real field testing), SSH-over-Tailscale was the only
+			// path available and it was silently blocked the whole
+			// time - `tailscale ping` still succeeded, since ICMP
+			// diagnostics aren't gated the same way application ports
+			// are, which is what made this look like a working tunnel
+			// with an unrelated problem rather than an ACL gap.
+			//
+			// Scoped to SSH only, from the dev machine's own tag
+			// (which also happens to be shared with bravo, the actual
+			// production client device, per this file's own top
+			// comment - the dev machine and bravo have always shared
+			// tag:securelink-client rather than getting a distinct
+			// admin-only tag, a deliberate, already-documented
+			// tradeoff for this small tailnet, not a new one
+			// introduced here) to both device tags, not a blanket
+			// allow-everything rule.
+			"action": "accept",
+			"src":    ["tag:securelink-client"],
+			"dst":    ["tag:securelink-server:22", "tag:securelink-client:22"]
 		}
 	]
 }
