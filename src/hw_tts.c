@@ -19,8 +19,8 @@
 #include <fcntl.h>
 
 /* A sane spoken-aloud length cap - this project's messages can be up to
- * SL_MAX_BODY_LEN (64KB) per PROTOCOL.md, and nobody wants that read
- * aloud in full. Deliberately not tied to SL_MAX_BODY_LEN (message.h
+ * DD_MAX_BODY_LEN (64KB) per PROTOCOL.md, and nobody wants that read
+ * aloud in full. Deliberately not tied to DD_MAX_BODY_LEN (message.h
  * isn't even included here) - this is a UX choice about what's
  * reasonable to speak, unrelated to the protocol's own length limit. */
 #define HW_TTS_MAX_CHARS 200
@@ -57,7 +57,7 @@ void hw_tts_speak(const char *text)
         if (grandchild == 0) {
             /* REAL BUG FOUND AND FIXED (2026-08-24): this never
              * redirected its own stdout/stderr, so it silently
-             * inherited whatever the parent securelink process has -
+             * inherited whatever the parent deaddrop process has -
              * on the real deployed service that's the physical console
              * (StandardOutput=tty/StandardError=tty in the systemd
              * unit), not a log file. Confirmed live: under this

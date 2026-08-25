@@ -55,7 +55,7 @@ int lock_pin_file_path(char *buf, size_t buf_size)
     if (home == NULL) {
         return -1;
     }
-    if ((size_t)snprintf(buf, buf_size, "%s/.securelink/pin_hash", home)
+    if ((size_t)snprintf(buf, buf_size, "%s/.deaddrop/pin_hash", home)
             >= buf_size) {
         return -1;
     }
@@ -76,7 +76,7 @@ static int lock_ratelimit_file_path(char *buf, size_t buf_size)
     if (home == NULL) {
         return -1;
     }
-    if ((size_t)snprintf(buf, buf_size, "%s/.securelink/lock_ratelimit",
+    if ((size_t)snprintf(buf, buf_size, "%s/.deaddrop/lock_ratelimit",
                           home) >= buf_size) {
         return -1;
     }

@@ -29,7 +29,7 @@
  * duplication cost little and avoided coupling; this is ~200 lines of
  * genuinely intricate, thread-safety-critical logic (a receiver thread
  * that must never be blocked by the sender, a mutex-protected shared
- * sl_session_state, a socket-shutdown trick to unblock a thread stuck in
+ * dd_session_state, a socket-shutdown trick to unblock a thread stuck in
  * a blocking read) - duplicating something this delicate across two files
  * would double the surface area for a subtle threading bug to hide in,
  * for no real benefit, since client.c and server.c now need functionally
@@ -50,10 +50,10 @@
  *   explicit that concurrent read+write on the SAME object from two
  *   threads is unsafe (a shared internal I/O buffer), so this isn't
  *   optional plumbing, it's the actual safety mechanism.
- * - sl_try_parse_message() is called exclusively from the receiver thread
+ * - dd_try_parse_message() is called exclusively from the receiver thread
  *   (only it ever reads incoming bytes), so the fields it touches
  *   (last_seen_seq_num/have_seen_any) need no cross-thread protection at
- *   all. sl_serialize_message()+wolfSSL_write(), however, can be called
+ *   all. dd_serialize_message()+wolfSSL_write(), however, can be called
  *   from EITHER thread - the local user's typed messages from the caller
  *   thread, and an automatic PONG reply to an incoming PING from the
  *   receiver thread - and both go out through the same single write-dup
@@ -123,8 +123,8 @@ void session_perform_local_destroy(void);
  * issued while the peer is unreachable, from EITHER call site (this
  * file's own outbox-drain loop in run_symmetric_session(), or ui.c's
  * idle-input thread for the fully-offline case) - whichever one
- * eventually finds a live session first sends SL_MSG_DESTROY instead of
- * a normal SL_MSG_TEXT_MESSAGE when it dequeues this exact string. Uses
+ * eventually finds a live session first sends DD_MSG_DESTROY instead of
+ * a normal DD_MSG_TEXT_MESSAGE when it dequeues this exact string. Uses
  * ASCII SOH (0x01), which no real keyboard can type and ui_poll_line()
  * never produces from normal input, specifically so a legitimate user's
  * own message could never be mistaken for this sentinel by coincidence.

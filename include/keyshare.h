@@ -26,7 +26,7 @@
  * without the remote_share, which never left the other device.
  *
  * BOOTSTRAP AUTHENTICATION: the remote_share fetch, at every startup,
- * needs authenticating - and it can't use this device's own SecureLink
+ * needs authenticating - and it can't use this device's own DeadDrop
  * mTLS key (that key is the very thing being unlocked). This module
  * uses Tailscale's own node identity instead, a separate credential
  * already established by Week 4 Day 1: `tailscale whois <ip>` on
@@ -65,7 +65,7 @@
  * local_share_path:       file holding this device's own local_share (R).
  * peer_tailscale_ip:      the paired device's Tailscale IP to connect to.
  * peer_expected_hostname: the paired device's expected Tailscale node
- *   hostname (e.g. "securelink-bravo", matched against the short name
+ *   hostname (e.g. "deaddrop-bravo", matched against the short name
  *   portion of `tailscale whois`'s "Name:" field, before the tailnet's
  *   own MagicDNS suffix) - verified on every connection, incoming or
  *   outgoing, before anything is trusted or served.

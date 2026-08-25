@@ -281,7 +281,7 @@ int wifi_connect(const char *ssid, const char *password,
     }
 
     /* REAL BUG FOUND AND FIXED (2026-08-23): this service runs as an
-     * unprivileged user (see securelink-alpha.service/-bravo.service's
+     * unprivileged user (see deaddrop-alpha.service/-bravo.service's
      * User=connor), and plain `nmcli device wifi connect` for an SSID
      * with no existing saved connection profile requires NetworkManager
      * to ADD a brand new system-wide profile, not just activate one

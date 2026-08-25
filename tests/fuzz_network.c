@@ -37,7 +37,7 @@
  * Network-level fuzz test - Week 3 Day 5, added on top of the in-process
  * fuzz_message.c harness after an explicit request to make testing more
  * intensive. This is a genuinely different test class, not just more of
- * the same: fuzz_message.c calls sl_try_parse_message() directly with a
+ * the same: fuzz_message.c calls dd_try_parse_message() directly with a
  * pre-assembled buffer, which can never exercise how the REAL server
  * process behaves when malformed bytes arrive over an actual socket -
  * TCP fragmentation, wolfSSL_read()'s own buffering, the accept loop,
@@ -229,7 +229,7 @@ static int run_one_iteration(WOLFSSL_CTX *ctx, int iteration,
 
     /* Build one malformed post-handshake payload. Several strategies,
      * chosen randomly each iteration - deliberately bypasses
-     * sl_serialize_message() entirely, since the whole point is sending
+     * dd_serialize_message() entirely, since the whole point is sending
      * bytes the real protocol layer never would, exactly what an actual
      * malicious or buggy peer might do on the wire. */
     strategy = rand() % 6;
@@ -248,28 +248,28 @@ static int run_one_iteration(WOLFSSL_CTX *ctx, int iteration,
             break;
         case 2: /* a well-formed-looking header claiming an absurd body_length,
                   * with no actual body/tag bytes following at all */
-            memset(payload, 0, SL_HEADER_SIZE);
-            payload[0] = SL_VERSION;
-            payload[1] = SL_MSG_TEXT_MESSAGE;
+            memset(payload, 0, DD_HEADER_SIZE);
+            payload[0] = DD_VERSION;
+            payload[1] = DD_MSG_TEXT_MESSAGE;
             payload[8] = 0xFF; payload[9] = 0xFF;
             payload[10] = 0xFF; payload[11] = 0xFF; /* huge claimed length */
-            payload_len = SL_HEADER_SIZE;
+            payload_len = DD_HEADER_SIZE;
             break;
         case 3: /* a real header, real-looking but garbage HMAC tag, no body */
-            memset(payload, 0, SL_HEADER_SIZE + SL_HMAC_SIZE);
-            payload[0] = SL_VERSION;
-            payload[1] = SL_MSG_PING;
+            memset(payload, 0, DD_HEADER_SIZE + DD_HMAC_SIZE);
+            payload[0] = DD_VERSION;
+            payload[1] = DD_MSG_PING;
             {
                 size_t j;
-                for (j = SL_HEADER_SIZE; j < SL_HEADER_SIZE + SL_HMAC_SIZE; j++) {
+                for (j = DD_HEADER_SIZE; j < DD_HEADER_SIZE + DD_HMAC_SIZE; j++) {
                     payload[j] = (uint8_t)(rand() % 256);
                 }
             }
-            payload_len = SL_HEADER_SIZE + SL_HMAC_SIZE;
+            payload_len = DD_HEADER_SIZE + DD_HMAC_SIZE;
             break;
         case 4: /* all-zero, a plausible minimum-size buffer */
-            memset(payload, 0, SL_HEADER_SIZE + SL_HMAC_SIZE);
-            payload_len = SL_HEADER_SIZE + SL_HMAC_SIZE;
+            memset(payload, 0, DD_HEADER_SIZE + DD_HMAC_SIZE);
+            payload_len = DD_HEADER_SIZE + DD_HMAC_SIZE;
             break;
         case 5:
         default: /* large random payload, near MAX_PAYLOAD */

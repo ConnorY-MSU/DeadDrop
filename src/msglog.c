@@ -27,7 +27,7 @@ static int msglog_file_path(char *buf, size_t buf_size)
     if (home == NULL) {
         return -1;
     }
-    if ((size_t)snprintf(buf, buf_size, "%s/.securelink/message_log.txt",
+    if ((size_t)snprintf(buf, buf_size, "%s/.deaddrop/message_log.txt",
                           home) >= buf_size) {
         return -1;
     }

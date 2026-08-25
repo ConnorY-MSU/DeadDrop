@@ -25,7 +25,7 @@
 # Paths persisted (see Week 4 Build Log's Day 5 section for why each
 # one is on this list):
 #   /var/lib/tailscale                     - Tailscale node auth state
-#   $HOME/.securelink                      - PIN salt+hash
+#   $HOME/.deaddrop                      - PIN salt+hash
 #   /etc/NetworkManager/system-connections - WiFi profiles joined via
 #                                             the Days 2-3 UI (nmcli)
 #   $HOME/pki                              - this device's cert/key
@@ -77,7 +77,7 @@ fi
 # --- Step 3: create subdirectories and migrate any existing real content in ---
 declare -A PATHS=(
     [var-lib-tailscale]="/var/lib/tailscale"
-    [dot-securelink]="$REAL_HOME/.securelink"
+    [dot-deaddrop]="$REAL_HOME/.deaddrop"
     [nm-system-connections]="/etc/NetworkManager/system-connections"
     [pki]="$REAL_HOME/pki"
     [keyshare]="$REAL_HOME/keyshare"
@@ -109,7 +109,7 @@ done
 # Special case: move revoked_serials.txt into the pki persist copy too,
 # if it exists in its old location and hasn't been moved yet - see the
 # header comment above for why it lives here now.
-OLD_REVOKED="$REAL_HOME/securelink/revoked_serials.txt"
+OLD_REVOKED="$REAL_HOME/deaddrop/revoked_serials.txt"
 NEW_REVOKED="$PERSIST_MNT/pki/revoked_serials.txt"
 if [ -f "$OLD_REVOKED" ] && [ ! -f "$NEW_REVOKED" ]; then
     echo "Moving revoked_serials.txt into the persisted pki/ directory"
@@ -131,7 +131,7 @@ add_fstab_line() {
 
 add_fstab_line "$PERSIST_IMG  $PERSIST_MNT  ext4  loop,defaults,nofail  0  2"
 add_fstab_line "$PERSIST_MNT/var-lib-tailscale  /var/lib/tailscale  none  bind,nofail  0  0"
-add_fstab_line "$PERSIST_MNT/dot-securelink  $REAL_HOME/.securelink  none  bind,nofail  0  0"
+add_fstab_line "$PERSIST_MNT/dot-deaddrop  $REAL_HOME/.deaddrop  none  bind,nofail  0  0"
 
 # REAL INCIDENT (Day 5 live testing on both Pis): without the two
 # x-systemd.* options below, this bind mount has no ordering guarantee

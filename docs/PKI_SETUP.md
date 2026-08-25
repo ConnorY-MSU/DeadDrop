@@ -6,15 +6,15 @@ Exact steps used to generate this project's private CA, server certificate, and 
 
 ## Where these files live
 
-**`C:\Users\yette\securelink-pki`** — deliberately outside any git repository (not even gitignored inside one; physical separation avoids the "one `git add -f` away from a leaked key" failure mode) and outside OneDrive sync (confirmed OneDrive is scoped to `C:\Users\yette\OneDrive\` specifically; this folder is a sibling, not a child, of that path).
+**`C:\Users\yette\deaddrop-pki`** — deliberately outside any git repository (not even gitignored inside one; physical separation avoids the "one `git add -f` away from a leaked key" failure mode) and outside OneDrive sync (confirmed OneDrive is scoped to `C:\Users\yette\OneDrive\` specifically; this folder is a sibling, not a child, of that path).
 
 The folder itself has restricted NTFS permissions — inherited ACLs removed, access granted only to the local user account and `SYSTEM`:
 
 ```powershell
-New-Item -ItemType Directory -Path C:\Users\yette\securelink-pki -Force
-icacls C:\Users\yette\securelink-pki /inheritance:r
-icacls C:\Users\yette\securelink-pki /grant:r "<DOMAIN>\<user>:(OI)(CI)F"
-icacls C:\Users\yette\securelink-pki /grant:r "SYSTEM:(OI)(CI)F"
+New-Item -ItemType Directory -Path C:\Users\yette\deaddrop-pki -Force
+icacls C:\Users\yette\deaddrop-pki /inheritance:r
+icacls C:\Users\yette\deaddrop-pki /grant:r "<DOMAIN>\<user>:(OI)(CI)F"
+icacls C:\Users\yette\deaddrop-pki /grant:r "SYSTEM:(OI)(CI)F"
 ```
 
 All commands below were run from the **MSYS2 UCRT64 terminal** (same reasoning as `docs/BUILD.md` — needs to match the toolchain the rest of the project uses), from inside that folder:
@@ -22,7 +22,7 @@ All commands below were run from the **MSYS2 UCRT64 terminal** (same reasoning a
 ```bash
 export MSYSTEM=UCRT64
 source /etc/profile
-cd /c/Users/yette/securelink-pki
+cd /c/Users/yette/deaddrop-pki
 ```
 
 ---
@@ -41,7 +41,7 @@ Passphrase-protected deliberately, and only for this key — it never needs unat
 openssl req -x509 -new -key ca_key.pem -sha256 -days 3650 -out ca_cert.pem
 ```
 
-Subject: `C=US, ST=Montana, L=Bozeman, O=SecureLink, OU=Developer, CN=SecureLink Root CA, emailAddress=yetterconnor@gmail.com`
+Subject: `C=US, ST=Montana, L=Bozeman, O=DeadDrop, OU=Developer, CN=DeadDrop Root CA, emailAddress=yetterconnor@gmail.com`
 
 `-x509` produces a self-signed certificate directly (this is what makes it a root CA rather than a request). `-days 3650` ≈ 10 years, appropriate for a long-lived private root.
 
@@ -59,7 +59,7 @@ No `-aes256` — this key needs to load without a passphrase prompt, since it's 
 openssl req -new -key server_key.pem -out server_csr.pem
 ```
 
-Subject CN: `SecureLink-Server` — deliberately distinct from the CA's CN, to avoid the CN-mixup class of mistake flagged in [[02-Week 2 - TLS and mTLS/X.509 and PKI Concepts|X.509 and PKI Concepts]].
+Subject CN: `DeadDrop-Server` — deliberately distinct from the CA's CN, to avoid the CN-mixup class of mistake flagged in [[02-Week 2 - TLS and mTLS/X.509 and PKI Concepts|X.509 and PKI Concepts]].
 
 ## Step 5 — Sign the server CSR with the CA
 
@@ -79,7 +79,7 @@ openssl req -new -key client_key.pem -out client_csr.pem
 openssl x509 -req -in client_csr.pem -CA ca_cert.pem -CAkey ca_key.pem -CAcreateserial -out client_cert.pem -days 825 -sha256
 ```
 
-Subject CN: `SecureLink-Client`.
+Subject CN: `DeadDrop-Client`.
 
 ## Step 7 — File permissions
 
@@ -90,7 +90,7 @@ chmod 600 ca_key.pem server_key.pem client_key.pem
 **Note:** MSYS2's `chmod`/`ls -la` on NTFS is a POSIX-permission *emulation* layer and doesn't map 1:1 onto real Windows ACLs — after running this, `ls -la` still displayed `-rw-r--r--` (644), which looked wrong at first. The actual enforced permission is the folder-level `icacls` restriction set up before any of these files existed (inherited by every file created inside it, per the `(OI)(CI)` inheritance flags). Confirmed directly:
 
 ```powershell
-icacls C:\Users\yette\securelink-pki\ca_key.pem
+icacls C:\Users\yette\deaddrop-pki\ca_key.pem
 # -> NT AUTHORITY\SYSTEM:(I)(F)
 #    <DOMAIN>\<user>:(I)(F)
 ```
@@ -109,9 +109,9 @@ openssl x509 -in <cert>.pem -noout -subject -issuer -serial -dates
 
 | File | Subject CN | Issuer CN | Serial | Validity |
 |---|---|---|---|---|
-| `ca_cert.pem` | SecureLink Root CA | SecureLink Root CA (self-signed) | `3A16E969A5C16B51EDE568B433EAC76A57156094` | 2026-08-16 → 2036-08-13 |
-| `server_cert.pem` | SecureLink-Server | SecureLink Root CA | `68A7E95F14813C60A047706956F72BA0CCCC83F8` | 2026-08-16 → 2028-11-18 |
-| `client_cert.pem` | SecureLink-Client | SecureLink Root CA | `68A7E95F14813C60A047706956F72BA0CCCC83F9` | 2026-08-16 → 2028-11-18 |
+| `ca_cert.pem` | DeadDrop Root CA | DeadDrop Root CA (self-signed) | `3A16E969A5C16B51EDE568B433EAC76A57156094` | 2026-08-16 → 2036-08-13 |
+| `server_cert.pem` | DeadDrop-Server | DeadDrop Root CA | `68A7E95F14813C60A047706956F72BA0CCCC83F8` | 2026-08-16 → 2028-11-18 |
+| `client_cert.pem` | DeadDrop-Client | DeadDrop Root CA | `68A7E95F14813C60A047706956F72BA0CCCC83F9` | 2026-08-16 → 2028-11-18 |
 
 Serial numbers confirmed sequential and distinct (`...83F8`, `...83F9`) — the property the revocation check depends on.
 
@@ -136,7 +136,7 @@ Both certificates cryptographically verified against the CA — proves the signa
 
 ## Resulting files
 
-Nine files in `securelink-pki/`: `ca_key.pem` (private, encrypted), `ca_cert.pem` (public), `ca_cert.srl`, `server_key.pem` (private, plain), `server_csr.pem`, `server_cert.pem`, `client_key.pem` (private, plain), `client_csr.pem`, `client_cert.pem`.
+Nine files in `deaddrop-pki/`: `ca_key.pem` (private, encrypted), `ca_cert.pem` (public), `ca_cert.srl`, `server_key.pem` (private, plain), `server_csr.pem`, `server_cert.pem`, `client_key.pem` (private, plain), `client_csr.pem`, `client_cert.pem`.
 
 **What eventually goes where** (Week 4): each Pi gets its own private key + own signed cert + the CA's public cert only. `ca_key.pem` never leaves this dev machine.
 

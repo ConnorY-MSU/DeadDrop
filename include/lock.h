@@ -19,7 +19,7 @@
  * that way. The lock screen gates what a person standing at the device
  * can SEE and TYPE - it has no mechanism by which it could touch the
  * network/crypto layer even if it wanted to, since it's never given a
- * socket, a WOLFSSL*, or a sl_session_state* to touch. That's not an
+ * socket, a WOLFSSL*, or a dd_session_state* to touch. That's not an
  * accident to be careful about at every call site - it's structural:
  * this header doesn't even #include message.h or expose anything that
  * takes those types.
@@ -32,7 +32,7 @@
  * screen at all already requires physical possession of a powered,
  * connected device) doesn't depend on it.
  *
- * Path: lock_pin_file_path() resolves to "$HOME/.securelink/pin_hash"
+ * Path: lock_pin_file_path() resolves to "$HOME/.deaddrop/pin_hash"
  * (falling back to $USERPROFILE on Windows, for dev-machine build
  * portability only - the lock screen itself is a Linux/ncurses-only UI
  * feature, see ui.h). A single, well-known, non-configurable path

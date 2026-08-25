@@ -9,7 +9,7 @@
  * reboot or crash doesn't lose the whole conversation the way the
  * previously purely-in-memory ncurses history did.
  *
- * Lives at $HOME/.securelink/message_log.txt - deliberately the SAME
+ * Lives at $HOME/.deaddrop/message_log.txt - deliberately the SAME
  * directory the PIN hash already uses (see lock.c's
  * lock_pin_file_path()), which means it's automatically covered by
  * the existing Week 4 Day 5 overlay-persistence bind mount with zero

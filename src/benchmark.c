@@ -48,7 +48,7 @@
 #define SMALL_PAYLOAD "Hey, you free to grab dinner tonight?"
 #define SMALL_PAYLOAD_ITERATIONS 2000
 
-/* Larger payload: "a few KB", well under SL_MAX_BODY_LEN (64 KiB).
+/* Larger payload: "a few KB", well under DD_MAX_BODY_LEN (64 KiB).
  * 4096 bytes chosen as a clean, round few-KB size. */
 #define LARGE_PAYLOAD_SIZE 4096
 #define LARGE_PAYLOAD_ITERATIONS 500
@@ -234,7 +234,7 @@ static void run_handshake_benchmark(WOLFSSL_CTX *ctx, const char *host,
             break;
         }
         wolfSSL_set_fd(ssl, (int)sock);
-        /* Needed because the (untimed) block below calls sl_session_init(),
+        /* Needed because the (untimed) block below calls dd_session_init(),
          * which exports keying material after the handshake completes -
          * without this, wolfSSL would have already freed the temporary
          * arrays that export needs. */
@@ -258,11 +258,11 @@ static void run_handshake_benchmark(WOLFSSL_CTX *ctx, const char *host,
              * below instead. */
             failures++;
         } else {
-            sl_session_state state;
+            dd_session_state state;
             samples[valid++] = sample_ms;
-            if (sl_session_init(ssl, &state) == 0) {
-                uint8_t buf[SL_HEADER_SIZE + SL_HMAC_SIZE];
-                int n = sl_serialize_message(&state, SL_MSG_DISCONNECT,
+            if (dd_session_init(ssl, &state) == 0) {
+                uint8_t buf[DD_HEADER_SIZE + DD_HMAC_SIZE];
+                int n = dd_serialize_message(&state, DD_MSG_DISCONNECT,
                                               NULL, 0, buf, sizeof(buf));
                 if (n > 0) {
                     wolfSSL_write(ssl, buf, n);
@@ -298,7 +298,7 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
     socket_t sock;
     WOLFSSL *ssl = NULL;
     int rc;
-    sl_session_state state;
+    dd_session_state state;
     uint8_t *payload = NULL;
     uint8_t *send_buf = NULL;
     uint8_t *recv_buf = NULL;
@@ -319,7 +319,7 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
     }
     wolfSSL_set_fd(ssl, (int)sock);
     /* Same requirement as run_handshake_benchmark() above: the upcoming
-     * sl_session_init() call needs wolfSSL's handshake arrays to still be
+     * dd_session_init() call needs wolfSSL's handshake arrays to still be
      * around after wolfSSL_connect() returns, which only happens if this
      * is called before the handshake, not after. Missing here is exactly
      * the Day 2 wolfSSL_export_keying_material-fails-silently bug. */
@@ -336,14 +336,14 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
         return;
     }
 
-    if (sl_session_init(ssl, &state) != 0) {
-        fprintf(stderr, "run_throughput_benchmark: sl_session_init failed\n");
+    if (dd_session_init(ssl, &state) != 0) {
+        fprintf(stderr, "run_throughput_benchmark: dd_session_init failed\n");
         goto cleanup;
     }
 
     payload = malloc(payload_len > 0 ? payload_len : 1);
-    send_buf = malloc(SL_MAX_MSG_SIZE);
-    recv_buf = malloc(SL_MAX_MSG_SIZE);
+    send_buf = malloc(DD_MAX_MSG_SIZE);
+    recv_buf = malloc(DD_MAX_MSG_SIZE);
     samples = malloc(sizeof(double) * (size_t)iterations);
     if (payload == NULL || send_buf == NULL || recv_buf == NULL ||
         samples == NULL) {
@@ -362,9 +362,9 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
 
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
-        total = sl_serialize_message(&state, SL_MSG_TEXT_MESSAGE, payload,
+        total = dd_serialize_message(&state, DD_MSG_TEXT_MESSAGE, payload,
                                       (uint32_t)payload_len,
-                                      send_buf, SL_MAX_MSG_SIZE);
+                                      send_buf, DD_MAX_MSG_SIZE);
         if (total < 0) {
             fprintf(stderr, "iteration %d: serialize failed\n", completed);
             break;
@@ -379,24 +379,24 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
          * client.c's receive_one_message(), inlined here since this is
          * the only place in this file that needs it. */
         for (;;) {
-            sl_parsed_message msg;
+            dd_parsed_message msg;
             size_t consumed = 0;
-            sl_parse_result pr = sl_try_parse_message(&state, recv_buf,
+            dd_parse_result pr = dd_try_parse_message(&state, recv_buf,
                                                         have, &msg,
                                                         &consumed);
-            if (pr == SL_PARSE_OK) {
+            if (pr == DD_PARSE_OK) {
                 memmove(recv_buf, recv_buf + consumed, have - consumed);
                 have -= consumed;
                 break;
             }
-            if (pr == SL_PARSE_REJECTED) {
+            if (pr == DD_PARSE_REJECTED) {
                 fprintf(stderr, "iteration %d: rejected reply\n", completed);
                 broke_on_error = 1;
                 break;
             }
             {
                 int n = wolfSSL_read(ssl, (char *)(recv_buf + have),
-                                      (int)(SL_MAX_MSG_SIZE - have));
+                                      (int)(DD_MAX_MSG_SIZE - have));
                 if (n <= 0) {
                     fprintf(stderr, "iteration %d: read failed\n", completed);
                     broke_on_error = 1;
@@ -416,8 +416,8 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
     print_stats(label, samples, completed);
 
     {
-        uint8_t dbuf[SL_HEADER_SIZE + SL_HMAC_SIZE];
-        int n = sl_serialize_message(&state, SL_MSG_DISCONNECT, NULL, 0,
+        uint8_t dbuf[DD_HEADER_SIZE + DD_HMAC_SIZE];
+        int n = dd_serialize_message(&state, DD_MSG_DISCONNECT, NULL, 0,
                                       dbuf, sizeof(dbuf));
         if (n > 0) {
             wolfSSL_write(ssl, dbuf, n);
@@ -495,7 +495,7 @@ int main(int argc, char *argv[])
 
     wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, NULL);
 
-    printf("SecureLink benchmark - DEV-MACHINE NUMBERS ONLY, not final\n"
+    printf("DeadDrop benchmark - DEV-MACHINE NUMBERS ONLY, not final\n"
            "performance. Re-run on the Pi once it's up in Week 4.\n\n");
 
     run_handshake_benchmark(ctx, host, port, HANDSHAKE_ITERATIONS);

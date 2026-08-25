@@ -30,7 +30,7 @@ static int consttime_tag_cmp(const uint8_t *a, const uint8_t *b, size_t len)
     return diff; /* 0 iff equal */
 }
 
-int sl_session_init(WOLFSSL *ssl, sl_session_state *state)
+int dd_session_init(WOLFSSL *ssl, dd_session_state *state)
 {
     int rc;
 
@@ -39,14 +39,14 @@ int sl_session_init(WOLFSSL *ssl, sl_session_state *state)
     rc = wolfSSL_export_keying_material(
         ssl,
         state->hmac_key, sizeof(state->hmac_key),
-        SL_HMAC_KEY_LABEL, strlen(SL_HMAC_KEY_LABEL),
+        DD_HMAC_KEY_LABEL, strlen(DD_HMAC_KEY_LABEL),
         NULL, 0,   /* no context value (use_context = 0 below) */
         0);
     if (rc != WOLFSSL_SUCCESS) {
         int err = wolfSSL_get_error(ssl, rc);
         char errbuf[80];
         fprintf(stderr,
-            "sl_session_init: wolfSSL_export_keying_material failed "
+            "dd_session_init: wolfSSL_export_keying_material failed "
             "(rc=%d, err=%d: %s) - did the caller call "
             "wolfSSL_KeepArrays(ssl) before the handshake? wolfSSL frees "
             "handshake arrays after completion by default, and the "
@@ -68,25 +68,25 @@ int sl_session_init(WOLFSSL *ssl, sl_session_state *state)
     return 0;
 }
 
-int sl_serialize_message(sl_session_state *state, uint8_t msg_type,
+int dd_serialize_message(dd_session_state *state, uint8_t msg_type,
                           const uint8_t *body, uint32_t body_len,
                           uint8_t *out_buf, size_t out_buf_size)
 {
     size_t total;
 
-    if (body_len > SL_MAX_BODY_LEN) {
+    if (body_len > DD_MAX_BODY_LEN) {
         return -1;
     }
     if (body_len > 0 && body == NULL) {
         return -1;
     }
 
-    total = (size_t)SL_HEADER_SIZE + body_len + SL_HMAC_SIZE;
+    total = (size_t)DD_HEADER_SIZE + body_len + DD_HMAC_SIZE;
     if (out_buf_size < total) {
         return -1;
     }
 
-    out_buf[0] = SL_VERSION;
+    out_buf[0] = DD_VERSION;
     out_buf[1] = msg_type;
     out_buf[2] = 0;
     out_buf[3] = 0; /* reserved, must be sent as 0x0000 */
@@ -94,31 +94,31 @@ int sl_serialize_message(sl_session_state *state, uint8_t msg_type,
     put_u32_be(out_buf + 8, body_len);
 
     if (body_len > 0) {
-        memcpy(out_buf + SL_HEADER_SIZE, body, body_len);
+        memcpy(out_buf + DD_HEADER_SIZE, body, body_len);
     }
 
     /* HMAC covers header + body -- everything before the tag itself. */
     hmac_sha256(state->hmac_key, sizeof(state->hmac_key),
-                out_buf, SL_HEADER_SIZE + body_len,
-                out_buf + SL_HEADER_SIZE + body_len);
+                out_buf, DD_HEADER_SIZE + body_len,
+                out_buf + DD_HEADER_SIZE + body_len);
 
     state->next_seq_num++;
 
     return (int)total;
 }
 
-sl_parse_result sl_try_parse_message(sl_session_state *state,
+dd_parse_result dd_try_parse_message(dd_session_state *state,
                                       const uint8_t *buf, size_t have,
-                                      sl_parsed_message *out_msg,
+                                      dd_parsed_message *out_msg,
                                       size_t *consumed)
 {
     uint32_t body_len;
     size_t total;
-    uint8_t computed_tag[SL_HMAC_SIZE];
+    uint8_t computed_tag[DD_HMAC_SIZE];
 
     /* Can't even read body_length yet. */
-    if (have < SL_HEADER_SIZE) {
-        return SL_PARSE_INCOMPLETE;
+    if (have < DD_HEADER_SIZE) {
+        return DD_PARSE_INCOMPLETE;
     }
 
     body_len = get_u32_be(buf + 8);
@@ -131,14 +131,14 @@ sl_parse_result sl_try_parse_message(sl_session_state *state,
      * "message" actually ends, so *consumed is left at 0: there is no
      * safe resync point, and the caller should close the connection
      * rather than keep parsing this buffer. */
-    if (body_len > SL_MAX_BODY_LEN) {
+    if (body_len > DD_MAX_BODY_LEN) {
         *consumed = 0;
-        return SL_PARSE_REJECTED;
+        return DD_PARSE_REJECTED;
     }
 
-    total = (size_t)SL_HEADER_SIZE + body_len + SL_HMAC_SIZE;
+    total = (size_t)DD_HEADER_SIZE + body_len + DD_HMAC_SIZE;
     if (have < total) {
-        return SL_PARSE_INCOMPLETE;
+        return DD_PARSE_INCOMPLETE;
     }
 
     /* From here on we know the full message is buffered, so *consumed is
@@ -151,36 +151,36 @@ sl_parse_result sl_try_parse_message(sl_session_state *state,
     out_msg->msg_type = buf[1];
     out_msg->seq_num  = get_u32_be(buf + 4);
     out_msg->body_len = body_len;
-    out_msg->body     = buf + SL_HEADER_SIZE;
+    out_msg->body     = buf + DD_HEADER_SIZE;
 
-    if (out_msg->version != SL_VERSION) {
-        return SL_PARSE_REJECTED;
+    if (out_msg->version != DD_VERSION) {
+        return DD_PARSE_REJECTED;
     }
 
     switch (out_msg->msg_type) {
-        case SL_MSG_TEXT_MESSAGE:
-        case SL_MSG_PING:
-        case SL_MSG_PONG:
-        case SL_MSG_DISCONNECT:
-        case SL_MSG_ACK:
-        case SL_MSG_FILE:
-        case SL_MSG_DESTROY:
+        case DD_MSG_TEXT_MESSAGE:
+        case DD_MSG_PING:
+        case DD_MSG_PONG:
+        case DD_MSG_DISCONNECT:
+        case DD_MSG_ACK:
+        case DD_MSG_FILE:
+        case DD_MSG_DESTROY:
             break;
         default:
-            return SL_PARSE_REJECTED;
+            return DD_PARSE_REJECTED;
     }
 
     /* Replay/reorder check: strictly greater than the last seq_num we've
      * accepted from this peer in this session. */
     if (state->have_seen_any && out_msg->seq_num <= state->last_seen_seq_num) {
-        return SL_PARSE_REJECTED;
+        return DD_PARSE_REJECTED;
     }
 
     hmac_sha256(state->hmac_key, sizeof(state->hmac_key),
-                buf, SL_HEADER_SIZE + body_len, computed_tag);
-    if (consttime_tag_cmp(computed_tag, buf + SL_HEADER_SIZE + body_len,
-                           SL_HMAC_SIZE) != 0) {
-        return SL_PARSE_REJECTED;
+                buf, DD_HEADER_SIZE + body_len, computed_tag);
+    if (consttime_tag_cmp(computed_tag, buf + DD_HEADER_SIZE + body_len,
+                           DD_HMAC_SIZE) != 0) {
+        return DD_PARSE_REJECTED;
     }
 
     /* Only advance replay state once a message is fully accepted --
@@ -190,5 +190,5 @@ sl_parse_result sl_try_parse_message(sl_session_state *state,
     state->last_seen_seq_num = out_msg->seq_num;
     state->have_seen_any = 1;
 
-    return SL_PARSE_OK;
+    return DD_PARSE_OK;
 }

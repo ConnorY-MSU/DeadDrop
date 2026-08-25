@@ -10,7 +10,7 @@ Development happens on Windows, using the MSYS2 toolchain set up in Week 1 (`C:\
 
 ### Why UCRT64 specifically
 
-MSYS2 has multiple parallel environments (MSYS/UCRT64/CLANG64/MINGW64), each producing binaries linked against a different runtime. All of Week 1's `securelink` code was built with the UCRT64 `gcc`. Building wolfSSL under a different environment (e.g. plain MSYS) would produce a library linked against a different runtime (`msys-2.0.dll`), which won't link cleanly against the rest of this project. wolfSSL must be built under UCRT64 to match.
+MSYS2 has multiple parallel environments (MSYS/UCRT64/CLANG64/MINGW64), each producing binaries linked against a different runtime. All of Week 1's `deaddrop` code was built with the UCRT64 `gcc`. Building wolfSSL under a different environment (e.g. plain MSYS) would produce a library linked against a different runtime (`msys-2.0.dll`), which won't link cleanly against the rest of this project. wolfSSL must be built under UCRT64 to match.
 
 ### Getting the UCRT64 environment active in a scripted/non-interactive shell
 
@@ -38,7 +38,7 @@ pacman -S autoconf automake libtool git
 
 ## Getting the source
 
-Clone as a **sibling directory to `securelink`**, not inside it — wolfSSL is a third-party dependency, not project code, and shouldn't be vendored into this repo's git history.
+Clone as a **sibling directory to `deaddrop`**, not inside it — wolfSSL is a third-party dependency, not project code, and shouldn't be vendored into this repo's git history.
 
 MSYS2's default home (`~`) is **not** your Windows user folder — it's a separate internal directory. Windows drives are reachable via the `/c/`-style mount instead:
 
@@ -47,7 +47,7 @@ cd /c/Users/yette
 git clone https://github.com/wolfSSL/wolfssl.git
 ```
 
-Result: `C:\Users\yette\wolfssl`, next to `C:\Users\yette\securelink`.
+Result: `C:\Users\yette\wolfssl`, next to `C:\Users\yette\deaddrop`.
 
 ---
 

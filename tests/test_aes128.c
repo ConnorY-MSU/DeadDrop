@@ -170,7 +170,7 @@ int main(void) {
         print_hex("  ciphertext block B", ecb_cipher_b, 16);
         printf("  -> identical plaintext blocks under the same key ALWAYS produce identical\n");
         printf("     ciphertext blocks in raw ECB -- this is the exact leak behind the \"ECB\n");
-        printf("     penguin\" image. This is why SecureLink never uses raw ECB as a mode.\n");
+        printf("     penguin\" image. This is why DeadDrop never uses raw ECB as a mode.\n");
     }
     all_pass &= ecb_leak;
 

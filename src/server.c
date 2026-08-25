@@ -630,7 +630,7 @@ int main(int argc, char *argv[])
     ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
         can periodically refresh background network metrics below
         this file's own role/status lines - see ui.h. */
-    hw_oled_draw_text(oled_fd, 0, "SecureLink Alpha");
+    hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
@@ -665,7 +665,7 @@ int main(int argc, char *argv[])
 
         /* See client.c's matching comment: wolfSSL frees its handshake
          * arrays once the handshake completes, but handle_connection()
-         * needs them afterward (via sl_session_init() in message.c) to
+         * needs them afterward (via dd_session_init() in message.c) to
          * derive the per-session HMAC key. Must be called before
          * wolfSSL_accept(). */
         wolfSSL_KeepArrays(ssl);
@@ -680,7 +680,7 @@ int main(int argc, char *argv[])
             ui_set_status("mTLS handshake succeeded");
             hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
             ui_set_link_state(1);
-            hw_oled_draw_text(oled_fd, 0, "SecureLink Alpha");
+            hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
             /* Stop the idle-input thread before run_symmetric_session()
@@ -693,7 +693,7 @@ int main(int argc, char *argv[])
             ui_start_idle_input();
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
             ui_set_link_state(0);
-            hw_oled_draw_text(oled_fd, 0, "SecureLink Alpha");
+            hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
             hw_oled_draw_text(oled_fd, 1, "Waiting...");
             hw_oled_display(oled_fd);
 

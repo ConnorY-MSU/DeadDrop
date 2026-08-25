@@ -373,7 +373,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     /* getaddrinfo() rather than inet_pton(): inet_pton() only parses
      * numeric IP address text and does zero name resolution, so it would
      * reject a Tailscale MagicDNS hostname (e.g.
-     * "securelink-server.your-tailnet.ts.net") outright with no lookup
+     * "deaddrop-server.your-tailnet.ts.net") outright with no lookup
      * attempted at all. getaddrinfo() handles both a raw IP (Week 3 Day
      * 3's "hardcoded Tailscale IP" option) and a real hostname (the
      * MagicDNS option) through the same code path, so this doesn't need
@@ -443,7 +443,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     wolfSSL_set_fd(ssl, (int)sock);
 
     /* wolfSSL frees its handshake arrays once the handshake completes,
-     * to save memory - but sl_session_init() (message.c) needs them
+     * to save memory - but dd_session_init() (message.c) needs them
      * afterward to derive the per-session HMAC key via
      * wolfSSL_export_keying_material(). Must be called before
      * wolfSSL_connect(), not after - by the time the handshake finishes
@@ -464,7 +464,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     *connected_ok = 1;
     hw_expansion_set_status_color(hw_fd, HW_STATUS_CONNECTED);
     ui_set_link_state(1);
-    hw_oled_draw_text(oled_fd, 0, "SecureLink Bravo");
+    hw_oled_draw_text(oled_fd, 0, "DeadDrop Bravo");
     hw_oled_draw_text(oled_fd, 1, "Connected");
     hw_oled_display(oled_fd);
 
@@ -476,7 +476,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "Alpha");
     ui_start_idle_input();
 
-    hw_oled_draw_text(oled_fd, 0, "SecureLink Bravo");
+    hw_oled_draw_text(oled_fd, 0, "DeadDrop Bravo");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
@@ -523,7 +523,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
  * in charge of the screen, those stray writes land on top of ncurses'
  * own screen buffer and visibly corrupt the splash - this project found
  * and documented the exact same underlying cause once already (see
- * securelink-alpha.service's own header comment, "REAL BUG FOUND VIA
+ * deaddrop-alpha.service's own header comment, "REAL BUG FOUND VIA
  * LIVE TESTING" / cloud-init.target), but the fix attempted there
  * (After=cloud-init.target on the systemd unit) created a genuine
  * ordering cycle and had to be reverted - confirmed again here:
@@ -742,14 +742,14 @@ int main(int argc, char *argv[])
     ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
         can periodically refresh background network metrics below
         session.c/here's own role/status lines - see ui.h. */
-    hw_oled_draw_text(oled_fd, 0, "SecureLink Bravo");
+    hw_oled_draw_text(oled_fd, 0, "DeadDrop Bravo");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
     /* Reconnect loop. ctx (and the certs/keys/CA loaded into it) is
      * reused across attempts - only the TCP socket and WOLFSSL* are
      * per-connection. Every call into connect_and_run() creates a brand
-     * new sl_session_state (inside run_interactive_session), which is
+     * new dd_session_state (inside run_interactive_session), which is
      * what makes seq_num correctly start fresh at 0 on every reconnect:
      * the state simply doesn't exist until a new session is established,
      * so there's nothing to reset - it's correct by construction, not by

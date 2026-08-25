@@ -23,7 +23,7 @@
  * src/wifi.c directly (rather than linking its .o) since
  * parse_escaped_ssid_field() is deliberately static/file-local - this
  * is the one file in the whole fuzz suite that needs that, since every
- * other fuzzed function (sl_try_parse_message, etc.) is already public
+ * other fuzzed function (dd_try_parse_message, etc.) is already public
  * API.
  *
  * "Pass" means: every iteration, the parser writes a NUL-terminated

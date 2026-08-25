@@ -1,6 +1,6 @@
-# PROTOCOL.md — SecureLink Application Protocol
+# PROTOCOL.md — DeadDrop Application Protocol
 
-This document specifies the SecureLink application-layer message protocol
+This document specifies the DeadDrop application-layer message protocol
 carried inside an established mTLS (TLS 1.3) session. It is intended to be
 sufficient on its own for an independent implementer to build a compatible
 parser without reference to the source code.
@@ -107,7 +107,7 @@ the already-established TLS 1.3 session itself, via the RFC 5705/RFC 8446
 on the wolfSSL side), so no additional key-exchange step is needed beyond
 the mTLS handshake already completed in Week 2.
 
-- **Label:** `"EXPERIMENTAL-SecureLink-HMAC-Key"`. TLS exporter labels
+- **Label:** `"EXPERIMENTAL-DeadDrop-HMAC-Key"`. TLS exporter labels
   have an IANA registry; an ad-hoc, unregistered label like this one
   should be prefixed `EXPERIMENTAL-` per RFC 8446 §4.2.7's convention,
   specifically so it can never collide with a future officially
@@ -163,17 +163,17 @@ configured correctly.
 
 ## Network transport and addressing — Week 3 Day 3
 
-SecureLink runs over [Tailscale](https://tailscale.com/) (WireGuard-based mesh VPN) between the two devices, rather than requiring manual port forwarding or a public IP on either side. See [[WireGuard and Tailscale Concepts]] for the mechanics and the "double encryption" rationale for why an application-layer TLS session is still justified on top of WireGuard's own encryption.
+DeadDrop runs over [Tailscale](https://tailscale.com/) (WireGuard-based mesh VPN) between the two devices, rather than requiring manual port forwarding or a public IP on either side. See [[WireGuard and Tailscale Concepts]] for the mechanics and the "double encryption" rationale for why an application-layer TLS session is still justified on top of WireGuard's own encryption.
 
 ### Client addressing: hardcoded Tailscale IP vs. MagicDNS
 
-`client.c`'s `-h` argument is resolved via `getaddrinfo()`, which accepts either a raw IPv4 address (a Tailscale IP, e.g. `100.x.y.z`) or a hostname (a Tailscale MagicDNS name, e.g. `securelink-server.<tailnet>.ts.net`) through the same code path — this was previously `inet_pton()`, which only parses numeric addresses and would have silently rejected a MagicDNS hostname outright, so this had to change regardless of which addressing approach got picked. **The actual choice of which to use is still open**, deferred until a second device (a Pi, post-Week-4-Day-1 OS install) actually exists to test against — either is a one-line `-h` argument change now, not a code change.
+`client.c`'s `-h` argument is resolved via `getaddrinfo()`, which accepts either a raw IPv4 address (a Tailscale IP, e.g. `100.x.y.z`) or a hostname (a Tailscale MagicDNS name, e.g. `deaddrop-server.<tailnet>.ts.net`) through the same code path — this was previously `inet_pton()`, which only parses numeric addresses and would have silently rejected a MagicDNS hostname outright, so this had to change regardless of which addressing approach got picked. **The actual choice of which to use is still open**, deferred until a second device (a Pi, post-Week-4-Day-1 OS install) actually exists to test against — either is a one-line `-h` argument change now, not a code change.
 
 ### Tailscale ACL — restricting the two devices to reaching only each other
 
-By default every device on a tailnet can reach every other device on it. `docs/tailscale-acl.json` is the actual policy (tag-based, so it can be written and validated before the second device exists): `tag:securelink-client` is permitted to reach `tag:securelink-server` on port 4433 only, and — since Tailscale ACLs are default-deny once any custom rule exists — nothing else is permitted in either direction, including toward/from any other device later added to this tailnet for unrelated purposes.
+By default every device on a tailnet can reach every other device on it. `docs/tailscale-acl.json` is the actual policy (tag-based, so it can be written and validated before the second device exists): `tag:deaddrop-client` is permitted to reach `tag:deaddrop-server` on port 4433 only, and — since Tailscale ACLs are default-deny once any custom rule exists — nothing else is permitted in either direction, including toward/from any other device later added to this tailnet for unrelated purposes.
 
-Applied so far: this dev machine is tagged `tag:securelink-client`. `tag:securelink-server` remains to be applied to a Pi once it's actually running Tailscale.
+Applied so far: this dev machine is tagged `tag:deaddrop-client`. `tag:deaddrop-server` remains to be applied to a Pi once it's actually running Tailscale.
 
 ---
 

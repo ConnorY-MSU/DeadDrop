@@ -73,9 +73,9 @@ Pick a letter (or mix pieces of two, like last time) and I'll wire it into `show
 **52 cols x 8 rows** - fake boot-log lines leading into the wordmark, styled like a real Linux service startup.
 
 ```
-   root@securelink:~$ initializing mTLS session...
-   root@securelink:~$ tailscale mesh......... [ OK ]
-   root@securelink:~$ key-share reconstruct.. [ OK ]
+   root@deaddrop:~$ initializing mTLS session...
+   root@deaddrop:~$ tailscale mesh......... [ OK ]
+   root@deaddrop:~$ key-share reconstruct.. [ OK ]
 
             >> S E C U R E L I N K <<
              encrypted field terminal

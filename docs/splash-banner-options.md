@@ -84,7 +84,7 @@ Pick a letter (or mix pieces of two) and I'll wire it into `show_splash()`.
 +------------------------------------------------------------------------------+
 |                                                                              |
 |                                                                              |
-|                                  SECURELINK                                  |
+|                                  DEADDROP                                  |
 |                                                                              |
 |                         [ ENCRYPTED FIELD TERMINAL ]                         |
 |                                                                              |
@@ -104,7 +104,7 @@ Pick a letter (or mix pieces of two) and I'll wire it into `show_splash()`.
 
 ```
 
-SecureLink v1.0 -- encrypted field terminal
+DeadDrop v1.0 -- encrypted field terminal
 ----------------------------------------------
 
   [ tap screen to continue ]

@@ -1,6 +1,6 @@
 [Unit]
-Description=SecureLink encrypted communication terminal (client role - bravo)
-# See securelink-alpha.service's comments - identical reasoning,
+Description=DeadDrop encrypted communication terminal (client role - bravo)
+# See deaddrop-alpha.service's comments - identical reasoning,
 # mirrored role, including the clock-sync decision (no
 # After=time-sync.target - relying on client.c's own reconnect-with-
 # backoff loop to self-heal past a wrong-clock boot instead) and the
@@ -17,16 +17,16 @@ Wants=network-online.target
 Type=simple
 User=connor
 Group=connor
-WorkingDirectory=/home/connor/securelink
+WorkingDirectory=/home/connor/deaddrop
 
-ExecStart=/home/connor/securelink/build/client \
+ExecStart=/home/connor/deaddrop/build/client \
     -h 100.124.177.123 \
     -p 4433 \
     -c /home/connor/pki/client_cert.pem \
     -A /home/connor/pki/ca_cert.pem \
     -K /home/connor/keyshare \
     -P 100.124.177.123 \
-    -N securelink-alpha
+    -N deaddrop-alpha
 
 Environment=TERM=linux
 StandardInput=tty
@@ -74,12 +74,12 @@ RestartSec=5
 # W^X memory mappings; and the app's own on-disk writes (message log,
 # PIN hash, received files - see msglog.c/lock.c/session.c) are ALL
 # confirmed, by direct source-code check before writing this, to live
-# under exactly one directory: $HOME/.securelink - so ProtectHome can
+# under exactly one directory: $HOME/.deaddrop - so ProtectHome can
 # be read-only everywhere else in the home directory (~/pki, ~/keyshare,
-# ~/securelink itself all stay READABLE, just not writable, which is
+# ~/deaddrop itself all stay READABLE, just not writable, which is
 # all this process ever needs from them).
 ProtectHome=read-only
-ReadWritePaths=/home/connor/.securelink
+ReadWritePaths=/home/connor/.deaddrop
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

@@ -10,7 +10,7 @@
 *.dll
 *.so
 *.dylib
-securelink
+deaddrop
 !*.c
 !*.h
 

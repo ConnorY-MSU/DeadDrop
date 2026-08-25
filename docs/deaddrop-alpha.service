@@ -1,5 +1,5 @@
 [Unit]
-Description=SecureLink encrypted communication terminal (server role - alpha)
+Description=DeadDrop encrypted communication terminal (server role - alpha)
 # Real network matters before this starts (mTLS needs a genuinely
 # reachable peer over Tailscale). Also waits for the DSI console
 # framebuffer fix so ncurses draws on the actual touchscreen, not
@@ -34,7 +34,7 @@ Description=SecureLink encrypted communication terminal (server role - alpha)
 # SECOND AND THIRD REAL BUGS FOUND, both via live testing, both now
 # reverted: adding After=cloud-init.target alone left the unit NEVER
 # STARTING at all (systemd's own log: "Found ordering cycle on
-# securelink-alpha.service/start" / "Job ... deleted to break ordering
+# deaddrop-alpha.service/start" / "Job ... deleted to break ordering
 # cycle starting with multi-user.target/start" - cloud-init.target's
 # own chain has a Before=multi-user.target relationship that,
 # combined with our own WantedBy=multi-user.target, closes a real
@@ -54,7 +54,7 @@ Wants=network-online.target
 Type=simple
 User=connor
 Group=connor
-WorkingDirectory=/home/connor/securelink
+WorkingDirectory=/home/connor/deaddrop
 
 # Real key material lives under the persisted ~/pki (Day 5 overlay
 # work) via the mutual key-share flow (Day 4) rather than a plain -k
@@ -62,12 +62,12 @@ WorkingDirectory=/home/connor/securelink
 # was deliberately relocated into ~/pki so it rides along on the same
 # persisted, bind-mounted path (a cert rotation's revocation-list
 # update needs to survive a reboot too, not just the cert swap).
-ExecStart=/home/connor/securelink/build/server \
+ExecStart=/home/connor/deaddrop/build/server \
     -c /home/connor/pki/server_cert.pem \
     -A /home/connor/pki/ca_cert.pem \
     -K /home/connor/keyshare \
     -P 100.103.41.44 \
-    -N securelink-bravo \
+    -N deaddrop-bravo \
     -r /home/connor/pki/revoked_serials.txt
 
 # ncurses needs to own a real terminal, not systemd's default
@@ -92,7 +92,7 @@ TTYVTDisallocate=yes
 Restart=always
 RestartSec=5
 
-# SANDBOXING (2026-08-23 security audit) - see securelink-bravo.service's
+# SANDBOXING (2026-08-23 security audit) - see deaddrop-bravo.service's
 # matching block for the full reasoning on what's included/excluded and
 # why. Identical here: this device's real runtime needs (sudo-invoked
 # nmcli over D-Bus for WiFi setup, a real TTY, /dev/i2c-1, touch input,
@@ -104,9 +104,9 @@ RestartSec=5
 # of those needs and found to have no plausible interaction, and the
 # app's own on-disk writes (message log, PIN hash, received files) are
 # all confirmed, by direct source-code check, to live under exactly
-# $HOME/.securelink.
+# $HOME/.deaddrop.
 ProtectHome=read-only
-ReadWritePaths=/home/connor/.securelink
+ReadWritePaths=/home/connor/.deaddrop
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true

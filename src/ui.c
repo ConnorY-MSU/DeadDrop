@@ -210,7 +210,7 @@ static int g_self_is_alpha = 1;
                           opposed identities at a glance, more than
                           the original green/yellow pairing did. */
 
-/* Deliberately smaller than SL_MAX_BODY_LEN (message.h's 64 KiB
+/* Deliberately smaller than DD_MAX_BODY_LEN (message.h's 64 KiB
  * protocol cap) - this bounds one INTERACTIVELY TYPED line through a
  * physical keyboard, character by character, which is a fundamentally
  * different (and much smaller) realistic limit than the protocol's own
@@ -252,7 +252,7 @@ static size_t input_len = 0;
  *   via a physically attached keyboard.
  * - DECOUPLING: this state machine touches ONLY ncurses windows and the
  *   pure lock.c PIN-hash module - it never receives a socket, a
- *   WOLFSSL*, or a sl_session_state*, so there is no code path by which
+ *   WOLFSSL*, or a dd_session_state*, so there is no code path by which
  *   it COULD disrupt the network/crypto layer, rate-limiting included.
  *   Proven, not just asserted, via a real cross-device test - see
  *   TESTING.md.
@@ -1356,7 +1356,7 @@ void ui_set_status(const char *status_text)
      * mid-WiFi-setup, normal), so this is the actual "always-on"
      * identity/chrome of the whole neon look, not just a one-time
      * splash. */
-    mvwprintw(status_win, 0, 1, "SECURELINK :: %s",
+    mvwprintw(status_win, 0, 1, "DEADDROP :: %s",
               status_text != NULL ? status_text : "");
     wrefresh(status_win);
     /* Put the cursor back in the input line - otherwise it visibly jumps

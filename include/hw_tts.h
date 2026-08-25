@@ -37,7 +37,7 @@
  * a long-running session.
  *
  * text: a real NUL-terminated C string. A parsed message body
- *       (sl_parsed_message.body) is NOT NUL-terminated on its own -
+ *       (dd_parsed_message.body) is NOT NUL-terminated on its own -
  *       length-prefixed per PROTOCOL.md, not a C string - so callers
  *       must copy it into a real NUL-terminated buffer first; passing
  *       msg.body directly here is a bug, not something this function

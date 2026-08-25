@@ -36,7 +36,7 @@
     #define MKDIR(path) mkdir((path), 0700)
 #endif
 /* dirent.h - needed by wipe_directory_contents() (see the "/destroy
- * CONFIRM" emergency-wipe block below) to enumerate ~/.securelink/received/
+ * CONFIRM" emergency-wipe block below) to enumerate ~/.deaddrop/received/
  * for deletion. Available on both real targets: POSIX natively, and
  * MinGW-w64 (this project's Windows dev-machine toolchain, per
  * docs/BUILD.md's UCRT64 setup) ships a compatible shim - no #ifdef
@@ -176,7 +176,7 @@ typedef struct {
 } pending_ack_entry;
 
 typedef struct {
-    sl_session_state *state;
+    dd_session_state *state;
     WOLFSSL *ssl_read;   /* original object, read-only after write_dup -
                            * used only by the receiver thread */
     WOLFSSL *ssl_write;  /* write_dup()'d object - used by BOTH threads
@@ -280,7 +280,7 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
                          const uint8_t *body, uint32_t body_len,
                          uint32_t *out_seq_num)
 {
-    uint8_t out_buf[SL_MAX_MSG_SIZE];
+    uint8_t out_buf[DD_MAX_MSG_SIZE];
     int total;
     int rc;
     uint32_t used_seq_num;
@@ -290,7 +290,7 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
     used_seq_num = ctx->state->next_seq_num; /* captured BEFORE
         serialize consumes it, still under the lock - race-free */
 
-    total = sl_serialize_message(ctx->state, msg_type, body, body_len,
+    total = dd_serialize_message(ctx->state, msg_type, body, body_len,
                                   out_buf, sizeof(out_buf));
     if (total < 0) {
         pthread_mutex_unlock(&ctx->send_mutex);
@@ -307,7 +307,7 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
      * receipt) also takes this same lock, so there's no race even
      * though this is "extra" work tucked inside a function whose name
      * doesn't mention PING. */
-    if (msg_type == SL_MSG_PING && rc == total) {
+    if (msg_type == DD_MSG_PING && rc == total) {
         ctx->ping_outstanding = 1;
         ctx->ping_sent_at = monotonic_now();
     }
@@ -398,7 +398,7 @@ static int check_and_clear_ping(shared_session_ctx *ctx, double *out_rtt_ms)
 /* --- Received-file handling ---------------------------------------- */
 
 /* Same directory the PIN hash and message log already use
- * ($HOME/.securelink/) so it rides along on the exact same, already-
+ * ($HOME/.deaddrop/) so it rides along on the exact same, already-
  * persisted (Week 4 Day 5) bind mount with zero changes needed to
  * docs/setup-persist-overlay.sh - see msglog.c's matching comment. */
 static int received_files_dir(char *buf, size_t buf_size)
@@ -412,7 +412,7 @@ static int received_files_dir(char *buf, size_t buf_size)
     if (home == NULL) {
         return -1;
     }
-    if ((size_t)snprintf(buf, buf_size, "%s/.securelink/received", home)
+    if ((size_t)snprintf(buf, buf_size, "%s/.deaddrop/received", home)
             >= buf_size) {
         return -1;
     }
@@ -467,10 +467,10 @@ static void sanitize_basename(const char *raw, char *out, size_t out_size)
  * Flow: typing "/destroy CONFIRM" (exact, case-sensitive - see the
  * command handler below for why a plain "/destroy" alone only shows a
  * warning) immediately wipes THIS device's own state, then either sends
- * SL_MSG_DESTROY to the peer right now (if connected) or queues it for
+ * DD_MSG_DESTROY to the peer right now (if connected) or queues it for
  * automatic delivery the next time a session connects (if not) - see
- * OUTBOX_DESTROY_SENTINEL below. Receiving SL_MSG_DESTROY performs the
- * exact same local wipe - see receiver_thread_main()'s SL_MSG_DESTROY
+ * OUTBOX_DESTROY_SENTINEL below. Receiving DD_MSG_DESTROY performs the
+ * exact same local wipe - see receiver_thread_main()'s DD_MSG_DESTROY
  * case. Either direction ends up wiping both devices, which is the
  * actual point: a compromised or seized device shouldn't leave the
  * OTHER device's copy sitting there un-warned either, and the device
@@ -479,7 +479,7 @@ static void sanitize_basename(const char *raw, char *out, size_t out_size)
  */
 
 /* Deletes every regular file directly inside `dir` (no recursion into
- * subdirectories - ~/.securelink/received/ is expected flat, this
+ * subdirectories - ~/.deaddrop/received/ is expected flat, this
  * project's own code never creates subdirectories inside it). Silently
  * does nothing if `dir` doesn't exist - matches every other "best-
  * effort, missing state is fine" helper in this file. */
@@ -510,7 +510,7 @@ static void wipe_directory_contents(const char *dir)
  * like every other helper in this block: ui.c's idle-input thread needs
  * to call this too, for the offline case). Shared by three call sites
  * total: the local command handler in run_symmetric_session() below, the
- * SL_MSG_DESTROY case in receiver_thread_main(), and ui.c's offline
+ * DD_MSG_DESTROY case in receiver_thread_main(), and ui.c's offline
  * "/destroy" handling. Wipes the persisted message log (in full - see
  * msglog_destroy_all()), the live on-screen scrollback, and any locally-
  * saved received files, in that order. Deliberately does NOT show its
@@ -550,21 +550,21 @@ typedef enum {
 } rthread_recv_status;
 
 static rthread_recv_status receiver_recv_one(WOLFSSL *ssl_read,
-                                              sl_session_state *state,
+                                              dd_session_state *state,
                                               uint8_t *recv_buf, size_t *have,
-                                              sl_parsed_message *out_msg)
+                                              dd_parsed_message *out_msg)
 {
     for (;;) {
         size_t consumed = 0;
-        sl_parse_result pr = sl_try_parse_message(state, recv_buf, *have,
+        dd_parse_result pr = dd_try_parse_message(state, recv_buf, *have,
                                                    out_msg, &consumed);
 
-        if (pr == SL_PARSE_OK) {
+        if (pr == DD_PARSE_OK) {
             memmove(recv_buf, recv_buf + consumed, *have - consumed);
             *have -= consumed;
             return RTHREAD_RECV_OK;
         }
-        if (pr == SL_PARSE_REJECTED) {
+        if (pr == DD_PARSE_REJECTED) {
             if (consumed > 0) {
                 memmove(recv_buf, recv_buf + consumed, *have - consumed);
                 *have -= consumed;
@@ -572,13 +572,13 @@ static rthread_recv_status receiver_recv_one(WOLFSSL *ssl_read,
             return RTHREAD_RECV_REJECTED;
         }
 
-        if (*have >= SL_MAX_MSG_SIZE) {
+        if (*have >= DD_MAX_MSG_SIZE) {
             return RTHREAD_RECV_REJECTED;
         }
 
         {
             int n = wolfSSL_read(ssl_read, (char *)(recv_buf + *have),
-                                  (int)(SL_MAX_MSG_SIZE - *have));
+                                  (int)(DD_MAX_MSG_SIZE - *have));
             if (n <= 0) {
                 /* Covers both a real peer-side close/error AND the
                  * deliberate local shutdown(sock, SHUT_RD) used to
@@ -598,13 +598,13 @@ static rthread_recv_status receiver_recv_one(WOLFSSL *ssl_read,
 static void *receiver_thread_main(void *arg)
 {
     shared_session_ctx *ctx = (shared_session_ctx *)arg;
-    uint8_t *recv_buf = malloc(SL_MAX_MSG_SIZE);
+    uint8_t *recv_buf = malloc(DD_MAX_MSG_SIZE);
     /* Full-length NUL-terminated copy of a TEXT_MESSAGE body, for
      * ui_add_history()/ui_add_historyf() (which need a real C string) -
      * deliberately separate from the short OLED/TTS preview[] below:
      * the on-screen history should show the whole message, not a
      * 21-character-wide truncation. */
-    char *text_buf = malloc(SL_MAX_BODY_LEN + 1);
+    char *text_buf = malloc(DD_MAX_BODY_LEN + 1);
     size_t have = 0;
 
     if (recv_buf == NULL || text_buf == NULL) {
@@ -616,7 +616,7 @@ static void *receiver_thread_main(void *arg)
     }
 
     for (;;) {
-        sl_parsed_message msg;
+        dd_parsed_message msg;
         rthread_recv_status rs = receiver_recv_one(ctx->ssl_read, ctx->state,
                                                      recv_buf, &have, &msg);
 
@@ -638,11 +638,11 @@ static void *receiver_thread_main(void *arg)
          * matters: this is the ONLY place last_recv_epoch gets updated. */
         ctx->last_recv_epoch = (long)time(NULL);
 
-        if (msg.msg_type == SL_MSG_TEXT_MESSAGE) {
+        if (msg.msg_type == DD_MSG_TEXT_MESSAGE) {
             /* msg.body is length-prefixed per PROTOCOL.md, NOT a
              * NUL-terminated C string - every consumer below needs a
              * real C string, so a NUL-terminated copy is made first.
-             * text_buf is the full message (sized SL_MAX_BODY_LEN+1,
+             * text_buf is the full message (sized DD_MAX_BODY_LEN+1,
              * see its declaration above), for the on-screen history;
              * preview[] below is a SEPARATE, much shorter copy for the
              * 21-character-wide OLED and for speech, where a full 64KB
@@ -650,8 +650,8 @@ static void *receiver_thread_main(void *arg)
              * hw_tts_speak()'s own internal cap. */
             {
                 size_t n = msg.body_len;
-                if (n > SL_MAX_BODY_LEN) {
-                    n = SL_MAX_BODY_LEN; /* defensive; the protocol layer
+                if (n > DD_MAX_BODY_LEN) {
+                    n = DD_MAX_BODY_LEN; /* defensive; the protocol layer
                                            * already enforces this cap */
                 }
                 memcpy(text_buf, msg.body, n);
@@ -668,7 +668,7 @@ static void *receiver_thread_main(void *arg)
             {
                 uint8_t ack_body[4];
                 seq_num_to_be(msg.seq_num, ack_body);
-                if (session_send(ctx, SL_MSG_ACK, ack_body,
+                if (session_send(ctx, DD_MSG_ACK, ack_body,
                                   sizeof(ack_body), NULL) != 0) {
                     ctx->peer_ended = 1;
                     break;
@@ -694,7 +694,7 @@ static void *receiver_thread_main(void *arg)
                 }
                 hw_tts_speak(preview);
             }
-        } else if (msg.msg_type == SL_MSG_ACK) {
+        } else if (msg.msg_type == DD_MSG_ACK) {
             if (msg.body_len == 4) {
                 uint32_t acked_seq = be_to_seq_num(msg.body);
                 char preview[SESSION_ACK_PREVIEW_LEN];
@@ -707,10 +707,10 @@ static void *receiver_thread_main(void *arg)
                  * consume_pending_ack()'s comment. Silently ignored,
                  * not an error. */
             }
-        } else if (msg.msg_type == SL_MSG_FILE) {
-            if (msg.body_len < SL_FILE_NAME_LEN_SIZE) {
+        } else if (msg.msg_type == DD_MSG_FILE) {
+            if (msg.body_len < DD_FILE_NAME_LEN_SIZE) {
                 /* Malformed - too short to even hold the length prefix.
-                 * sl_try_parse_message() already validated the HMAC
+                 * dd_try_parse_message() already validated the HMAC
                  * over this body, so this isn't a tampering concern,
                  * just a peer (or a peer's bug) sending a nonsensical
                  * FILE message - ignore rather than tear down the
@@ -718,23 +718,23 @@ static void *receiver_thread_main(void *arg)
             } else {
                 uint16_t name_len = (uint16_t)((msg.body[0] << 8) |
                                                  msg.body[1]);
-                if (name_len > SL_FILE_NAME_MAX ||
-                    (size_t)(SL_FILE_NAME_LEN_SIZE + name_len) >
+                if (name_len > DD_FILE_NAME_MAX ||
+                    (size_t)(DD_FILE_NAME_LEN_SIZE + name_len) >
                         msg.body_len) {
                     /* Malformed - name_len claims more than the body
                      * actually holds. Same "ignore, don't tear down
                      * the session" handling as above. */
                 } else {
-                    char raw_name[SL_FILE_NAME_MAX + 1];
-                    char safe_name[SL_FILE_NAME_MAX + 1];
-                    const uint8_t *data = msg.body + SL_FILE_NAME_LEN_SIZE +
+                    char raw_name[DD_FILE_NAME_MAX + 1];
+                    char safe_name[DD_FILE_NAME_MAX + 1];
+                    const uint8_t *data = msg.body + DD_FILE_NAME_LEN_SIZE +
                                             name_len;
                     size_t data_len = msg.body_len -
-                        (SL_FILE_NAME_LEN_SIZE + name_len);
+                        (DD_FILE_NAME_LEN_SIZE + name_len);
                     char dir[512];
                     char path[768];
 
-                    memcpy(raw_name, msg.body + SL_FILE_NAME_LEN_SIZE,
+                    memcpy(raw_name, msg.body + DD_FILE_NAME_LEN_SIZE,
                             name_len);
                     raw_name[name_len] = '\0';
                     sanitize_basename(raw_name, safe_name,
@@ -772,11 +772,11 @@ static void *receiver_thread_main(void *arg)
                                 if (written == data_len) {
                                     ui_add_historyf(ctx->peer_label,
                                         "sent a file: %s (%u bytes) -> "
-                                        "saved to ~/.securelink/received/",
+                                        "saved to ~/.deaddrop/received/",
                                         safe_name, (unsigned)data_len);
                                     msglog_append(ctx->peer_label,
                                         "(sent a file - see "
-                                        "~/.securelink/received/)");
+                                        "~/.deaddrop/received/)");
                                     ui_notify_message_pending(ctx->hw_fd);
                                 } else {
                                     ui_add_errorf(
@@ -792,17 +792,17 @@ static void *receiver_thread_main(void *arg)
                     }
                 }
             }
-        } else if (msg.msg_type == SL_MSG_PING) {
+        } else if (msg.msg_type == DD_MSG_PING) {
             /* No history notice - see SESSION_PING_INTERVAL_SECONDS's
              * comment: PING is now a routine, automatic, ~10s
              * background event, not a rare occurrence worth chat-log
              * noise. Same "fatal on auto-reply failure" pattern as
              * ACK's send above. */
-            if (session_send(ctx, SL_MSG_PONG, NULL, 0, NULL) != 0) {
+            if (session_send(ctx, DD_MSG_PONG, NULL, 0, NULL) != 0) {
                 ctx->peer_ended = 1;
                 break;
             }
-        } else if (msg.msg_type == SL_MSG_PONG) {
+        } else if (msg.msg_type == DD_MSG_PONG) {
             /* Also no history notice, same reasoning - this is the
              * live RTT/link-quality reading, reported to the OLED
              * metrics section (ui_report_rtt()), not the chat log. */
@@ -810,11 +810,11 @@ static void *receiver_thread_main(void *arg)
             if (check_and_clear_ping(ctx, &rtt_ms)) {
                 ui_report_rtt((int)rtt_ms);
             }
-        } else if (msg.msg_type == SL_MSG_DISCONNECT) {
+        } else if (msg.msg_type == DD_MSG_DISCONNECT) {
             ui_add_historyf(NULL, "%s sent DISCONNECT.", ctx->peer_label);
             ctx->peer_ended = 1;
             break;
-        } else if (msg.msg_type == SL_MSG_DESTROY) {
+        } else if (msg.msg_type == DD_MSG_DESTROY) {
             /* The peer triggered "/destroy CONFIRM" remotely - see this
              * file's "/destroy CONFIRM" block comment above. No
              * additional authentication/confirmation needed here beyond
@@ -828,7 +828,7 @@ static void *receiver_thread_main(void *arg)
                           "chat data on this device.");
         }
         /* Any other well-formed-but-unrecognized msg_type: treated as
-         * forward-compat noise, not fatal - sl_try_parse_message() has
+         * forward-compat noise, not fatal - dd_try_parse_message() has
          * already validated version/HMAC/seq_num by this point. */
     }
 
@@ -842,20 +842,20 @@ static void *receiver_thread_main(void *arg)
 session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                                       int oled_fd, const char *peer_label)
 {
-    sl_session_state state;
+    dd_session_state state;
     shared_session_ctx ctx;
     pthread_t rtid;
     char *line;
     char *file_body; /* scratch buffer for building an outgoing
-        SL_MSG_FILE body ("/send <path>") - see below. Separate from
+        DD_MSG_FILE body ("/send <path>") - see below. Separate from
         `line` (which holds the typed "/send <path>" COMMAND text
         itself, not the file's own binary content). */
     struct timespec last_ping_sent;
     session_result result;
 
-    if (sl_session_init(ssl, &state) != 0) {
+    if (dd_session_init(ssl, &state) != 0) {
         ui_add_error(
-            "sl_session_init failed - wolfSSL_export_keying_material "
+            "dd_session_init failed - wolfSSL_export_keying_material "
             "unavailable? (needs HAVE_KEYING_MATERIAL / "
             "--enable-keying-material)");
         return SESSION_DISCONNECTED;
@@ -910,13 +910,13 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         return SESSION_DISCONNECTED;
     }
 
-    /* Same SL_MAX_BODY_LEN-sized stack buffer client.c's old
+    /* Same DD_MAX_BODY_LEN-sized stack buffer client.c's old
      * run_interactive_session() used for a typed line - heap-allocated
      * here instead since this function's stack frame now also holds
-     * shared_session_ctx and sl_session_state, and a 64KB fixed stack
+     * shared_session_ctx and dd_session_state, and a 64KB fixed stack
      * buffer on top of those is unnecessary pressure for no benefit. */
-    line = malloc(SL_MAX_BODY_LEN);
-    file_body = malloc(SL_MAX_BODY_LEN);
+    line = malloc(DD_MAX_BODY_LEN);
+    file_body = malloc(DD_MAX_BODY_LEN);
     if (line == NULL || file_body == NULL) {
         ui_add_error("run_symmetric_session: out of memory");
         free(line);
@@ -958,7 +958,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
              * go through the normal TEXT_MESSAGE send path below at
              * all. */
             if (strcmp(queued, OUTBOX_DESTROY_SENTINEL) == 0) {
-                if (session_send(&ctx, SL_MSG_DESTROY, NULL, 0, NULL) == 0) {
+                if (session_send(&ctx, DD_MSG_DESTROY, NULL, 0, NULL) == 0) {
                     ui_add_error("EMERGENCY DESTROY: queued wipe command "
                                   "delivered to peer.");
                 } else {
@@ -970,7 +970,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
 
             {
                 size_t qlen = strlen(queued);
-                if (session_send(&ctx, SL_MSG_TEXT_MESSAGE,
+                if (session_send(&ctx, DD_MSG_TEXT_MESSAGE,
                                   (const uint8_t *)queued, (uint32_t)qlen,
                                   &sent_seq) == 0) {
                     track_pending_ack(&ctx, sent_seq, queued);
@@ -1021,7 +1021,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                 outstanding = ctx.ping_outstanding;
                 pthread_mutex_unlock(&ctx.send_mutex);
                 if (!outstanding) {
-                    session_send(&ctx, SL_MSG_PING, NULL, 0, NULL);
+                    session_send(&ctx, DD_MSG_PING, NULL, 0, NULL);
                 }
                 last_ping_sent = now_ts;
             }
@@ -1044,7 +1044,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             SHUTDOWN_READ(sock);
         }
 
-        pr = ui_poll_line(line, SL_MAX_BODY_LEN, STDIN_POLL_MS);
+        pr = ui_poll_line(line, DD_MAX_BODY_LEN, STDIN_POLL_MS);
 
         if (pr == UI_POLL_TIMEOUT) {
             continue;
@@ -1054,7 +1054,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
              * returns this; see ui.h. Treat the same as an explicit
              * quit. */
             ui_add_history(NULL, "(you quit)");
-            session_send(&ctx, SL_MSG_DISCONNECT, NULL, 0, NULL);
+            session_send(&ctx, DD_MSG_DISCONNECT, NULL, 0, NULL);
             result = SESSION_USER_QUIT;
             break;
         }
@@ -1065,7 +1065,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
 
         if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
             ui_add_history(NULL, "(you quit)");
-            session_send(&ctx, SL_MSG_DISCONNECT, NULL, 0, NULL);
+            session_send(&ctx, DD_MSG_DISCONNECT, NULL, 0, NULL);
             result = SESSION_USER_QUIT;
             break;
         }
@@ -1126,7 +1126,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
              * than lose the intent if the peer isn't reachable right
              * now, exactly like a queued TEXT_MESSAGE already does. */
             if (ctx.peer_ended ||
-                    session_send(&ctx, SL_MSG_DESTROY, NULL, 0, NULL) != 0) {
+                    session_send(&ctx, DD_MSG_DESTROY, NULL, 0, NULL) != 0) {
                 if (outbox_enqueue(OUTBOX_DESTROY_SENTINEL) == 0) {
                     ui_add_error(
                         "EMERGENCY DESTROY: peer unreachable right now - "
@@ -1179,7 +1179,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             const char *text = line + 6;
             uint32_t sent_seq;
 
-            if (session_send(&ctx, SL_MSG_TEXT_MESSAGE,
+            if (session_send(&ctx, DD_MSG_TEXT_MESSAGE,
                               (const uint8_t *)text, (uint32_t)strlen(text),
                               &sent_seq) != 0) {
                 outbox_enqueue(text); /* the SAVED tag itself doesn't
@@ -1196,7 +1196,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         }
 
         /* "/send <path>" - a small local file, read from THIS device's
-         * own filesystem and transmitted as one SL_MSG_FILE. See
+         * own filesystem and transmitted as one DD_MSG_FILE. See
          * PROTOCOL.md's FILE entry for the hard size cap and why there
          * is no chunking - a file that doesn't fit is rejected here,
          * before anything is sent, not partway through. */
@@ -1216,7 +1216,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                  * receiving end for symmetry/consistency, even though
                  * this is our own trusted local path, not untrusted
                  * wire input, here. */
-                char name[SL_FILE_NAME_MAX + 1];
+                char name[DD_FILE_NAME_MAX + 1];
                 size_t name_len;
                 long file_size;
                 size_t max_data;
@@ -1228,7 +1228,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                 file_size = ftell(f);
                 fseek(f, 0, SEEK_SET);
 
-                max_data = SL_MAX_BODY_LEN - SL_FILE_NAME_LEN_SIZE -
+                max_data = DD_MAX_BODY_LEN - DD_FILE_NAME_LEN_SIZE -
                            name_len;
                 if (file_size < 0 || (size_t)file_size > max_data) {
                     fclose(f);
@@ -1241,10 +1241,10 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
 
                 file_body[0] = (uint8_t)(name_len >> 8);
                 file_body[1] = (uint8_t)(name_len);
-                memcpy(file_body + SL_FILE_NAME_LEN_SIZE, name, name_len);
+                memcpy(file_body + DD_FILE_NAME_LEN_SIZE, name, name_len);
                 {
                     size_t got = fread(
-                        file_body + SL_FILE_NAME_LEN_SIZE + name_len,
+                        file_body + DD_FILE_NAME_LEN_SIZE + name_len,
                         1, (size_t)file_size, f);
                     fclose(f);
                     if (got != (size_t)file_size) {
@@ -1255,8 +1255,8 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                     }
                 }
 
-                if (session_send(&ctx, SL_MSG_FILE, (uint8_t *)file_body,
-                                  (uint32_t)(SL_FILE_NAME_LEN_SIZE +
+                if (session_send(&ctx, DD_MSG_FILE, (uint8_t *)file_body,
+                                  (uint32_t)(DD_FILE_NAME_LEN_SIZE +
                                              name_len + (size_t)file_size),
                                   NULL) != 0) {
                     result = SESSION_DISCONNECTED;
@@ -1272,7 +1272,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
 
         {
             uint32_t sent_seq;
-            if (session_send(&ctx, SL_MSG_TEXT_MESSAGE,
+            if (session_send(&ctx, DD_MSG_TEXT_MESSAGE,
                               (const uint8_t *)line, (uint32_t)len,
                               &sent_seq) != 0) {
                 /* Queue it for automatic resend on the next successful

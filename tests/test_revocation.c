@@ -11,7 +11,7 @@ static void check(const char *name, int actual, int expected) {
 }
 
 int main(void) {
-    /* Real serials from securelink-pki, per PKI_SETUP.md */
+    /* Real serials from deaddrop-pki, per PKI_SETUP.md */
     const char *server_serial = "68A7E95F14813C60A047706956F72BA0CCCC83F8";
     const char *client_serial = "68A7E95F14813C60A047706956F72BA0CCCC83F9";
     const char *server_serial_lower = "68a7e95f14813c60a047706956f72ba0cccc83f8";
