@@ -522,6 +522,14 @@ void session_perform_local_destroy(void)
     msglog_destroy_all();
     ui_destroy_history();
 
+    /* Cuts off any in-progress or queued spoken message immediately -
+     * see hw_tts_stop_and_clear()'s own comment for why this function
+     * specifically is the only thing allowed to call it. Placed here
+     * rather than duplicated across all three "/destroy" call sites,
+     * same reasoning as everything else this function already
+     * consolidates. */
+    hw_tts_stop_and_clear();
+
     {
         char dir[512];
         if (received_files_dir(dir, sizeof(dir)) == 0) {

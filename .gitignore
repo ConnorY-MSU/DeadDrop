@@ -30,3 +30,9 @@ Thumbs.db
 
 # Valgrind / sanitizer output
 *.log
+
+# Piper TTS voice models - large binary assets, device-local only, never
+# committed. See include/hw_tts.h (HW_TTS_MODEL_PATH) for where the
+# actual deployed copy lives on each Pi.
+*.onnx
+*.onnx.json

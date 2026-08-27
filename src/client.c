@@ -38,6 +38,7 @@
 #include "message.h"
 #include "hw_expansion.h"
 #include "hw_oled.h"
+#include "hw_tts.h"
 #include "session.h"
 #include "ui.h"
 #include "keyshare.h"
@@ -746,6 +747,14 @@ int main(int argc, char *argv[])
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
+    /* Resident Piper TTS pipeline + speaker thread - same "own
+     * lifecycle, started once, kept for the process's whole life"
+     * reasoning as hw_fd/oled_fd above. Failure here (piper/aplay not
+     * installed, etc.) is silently non-fatal - hw_tts_speak() calls
+     * later just become no-ops, same as every other hw_* module's
+     * hardware-absence handling. */
+    hw_tts_init();
+
     /* Reconnect loop. ctx (and the certs/keys/CA loaded into it) is
      * reused across attempts - only the TCP socket and WOLFSSL* are
      * per-connection. Every call into connect_and_run() creates a brand
@@ -791,6 +800,7 @@ int main(int argc, char *argv[])
     ui_set_link_state(0);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
+    hw_tts_shutdown();
     ui_stop_idle_input();
     ui_shutdown();
 

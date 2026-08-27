@@ -634,6 +634,14 @@ int main(int argc, char *argv[])
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
+    /* Resident Piper TTS pipeline + speaker thread - same "own
+     * lifecycle, started once, kept for the process's whole life"
+     * reasoning as hw_fd/oled_fd above. Failure here (piper/aplay not
+     * installed, etc.) is silently non-fatal - hw_tts_speak() calls
+     * later just become no-ops, same as every other hw_* module's
+     * hardware-absence handling. */
+    hw_tts_init();
+
     /* ui_start_idle_input() already running (started much earlier, right
      * after ui_init() - see this function's own comment near
      * wolfSSL_CTX_new()) - it already covers accept()'s indefinite block
@@ -727,6 +735,7 @@ int main(int argc, char *argv[])
     CLOSE_SOCKET(listen_sock);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
+    hw_tts_shutdown();
     ui_stop_idle_input();
     ui_shutdown();
     wolfSSL_CTX_free(ctx);
