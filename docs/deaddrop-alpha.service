@@ -96,8 +96,9 @@ RestartSec=5
 # matching block for the full reasoning on what's included/excluded and
 # why. Identical here: this device's real runtime needs (sudo-invoked
 # nmcli over D-Bus for WiFi setup, a real TTY, /dev/i2c-1, touch input,
-# espeak-ng as a forked child) rule out several of the usual aggressive
-# directives (NoNewPrivileges, RestrictAddressFamilies,
+# a resident Piper (Python venv) + aplay pipeline as forked children for
+# TTS - updated 2026-08-27, was espeak-ng) rule out several of the usual
+# aggressive directives (NoNewPrivileges, RestrictAddressFamilies,
 # CapabilityBoundingSet, ProtectSystem=strict, PrivateDevices,
 # PrivateTmp, SystemCallFilter) - each excluded deliberately, not by
 # oversight. What's included below has been checked against every one

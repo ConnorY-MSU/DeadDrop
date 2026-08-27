@@ -435,6 +435,12 @@ static void *speaker_thread_main(void *arg)
 
 int hw_tts_init(void)
 {
+    { /* TEMP DEBUG marker - bypasses all stdio/journal/tty redirection
+         complexity by writing directly to a file. Remove once resolved. */
+        FILE *mf = fopen("/tmp/hw_tts_reached.marker", "w");
+        if (mf) { fprintf(mf, "hw_tts_init() reached\n"); fclose(mf); }
+    }
+
     if (speaker_running) {
         return 0; /* already running - idempotent */
     }

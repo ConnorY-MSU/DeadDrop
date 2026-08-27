@@ -619,7 +619,7 @@ static void show_splash_simple(void)
         attron(COLOR_PAIR(CP_BANNER));
     }
     ui_draw_hline(stdscr, row, col, box_width);
-    ui_draw_centered(stdscr, row + 1, col, box_width, "S E C U R E L I N K");
+    ui_draw_centered(stdscr, row + 1, col, box_width, "D E A D D R O P");
     ui_draw_hline(stdscr, row + 2, col, box_width);
     if (has_colors()) {
         attroff(COLOR_PAIR(CP_BANNER));
@@ -701,7 +701,7 @@ static void show_splash(void)
     const char *connector        = "========== L I N K E D ===========";
     const char *bravo_box_border = "+------------+";
     const char *bravo_box_mid    = "|   BRAVO    |";
-    const char *title            = "S E C U R E L I N K";
+    const char *title            = "D E A D D R O P";
     const char *subtitle         = "[ ENCRYPTED FIELD TERMINAL ]";
     const char *dismiss_hint     = "( tap screen to continue )";
     int bravo_col;

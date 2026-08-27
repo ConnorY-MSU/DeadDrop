@@ -44,9 +44,11 @@ RestartSec=5
 # not a blanket hardening template - this device's real runtime needs
 # (sudo-invoked nmcli for WiFi setup, which itself talks to
 # NetworkManager over D-Bus/AF_UNIX; a real TTY at /dev/tty1; /dev/i2c-1
-# for the OLED/RGB hardware; /dev/input/eventN for touch; espeak-ng as
-# a forked child for TTS) rule out several of the usual aggressive
-# directives, and each exclusion below is deliberate, not an oversight:
+# for the OLED/RGB hardware; /dev/input/eventN for touch; a resident
+# Piper (Python venv) + aplay pipeline as forked children for TTS -
+# updated 2026-08-27, was espeak-ng) rule out several of the usual
+# aggressive directives, and each exclusion below is deliberate, not
+# an oversight:
 #
 # - NoNewPrivileges: NOT set (would prevent execve() of any setuid
 #   binary, including /usr/bin/sudo itself - the WiFi setup screen's
@@ -62,8 +64,8 @@ RestartSec=5
 #   capabilities up to the PARENT's own bounding set at exec time).
 # - ProtectSystem=strict, PrivateDevices, PrivateTmp, SystemCallFilter:
 #   NOT set - each has plausible interaction with the hardware access
-#   (I2C/touch/TTY) or the espeak-ng subprocess this device needs, and
-#   verifying every one safely needs more time than a single pass
+#   (I2C/touch/TTY) or the piper/aplay subprocesses this device needs,
+#   and verifying every one safely needs more time than a single pass
 #   allows without real risk of silently bricking a field device with
 #   no easy remote recovery path. Worth a dedicated future pass.
 #
@@ -76,8 +78,8 @@ RestartSec=5
 # confirmed, by direct source-code check before writing this, to live
 # under exactly one directory: $HOME/.deaddrop - so ProtectHome can
 # be read-only everywhere else in the home directory (~/pki, ~/keyshare,
-# ~/deaddrop itself all stay READABLE, just not writable, which is
-# all this process ever needs from them).
+# ~/deaddrop, ~/piper-venv, ~/piper-voices all stay READABLE, just not
+# writable, which is all this process ever needs from them).
 ProtectHome=read-only
 ReadWritePaths=/home/connor/.deaddrop
 ProtectKernelTunables=true
