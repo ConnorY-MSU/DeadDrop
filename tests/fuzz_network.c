@@ -33,37 +33,7 @@
 
 #include "message.h"
 
-/*
- * Network-level fuzz test - Week 3 Day 5, added on top of the in-process
- * fuzz_message.c harness after an explicit request to make testing more
- * intensive. This is a genuinely different test class, not just more of
- * the same: fuzz_message.c calls dd_try_parse_message() directly with a
- * pre-assembled buffer, which can never exercise how the REAL server
- * process behaves when malformed bytes arrive over an actual socket -
- * TCP fragmentation, wolfSSL_read()'s own buffering, the accept loop,
- * and receive_one_message()'s accumulate-until-complete logic are all
- * structurally untested by an in-process call. This harness connects to
- * an already-running server.exe for real, completes a genuine mTLS
- * handshake (so the fuzzing targets the post-handshake application
- * protocol layer specifically, not wolfSSL's own handshake parser, which
- * is out of this project's scope to fuzz), then sends malformed
- * post-handshake payloads and confirms the server never crashes.
- *
- * Must be run against a server.exe built with -fsanitize=address
- * -fsanitize=undefined for this to mean anything - a crash in the SERVER
- * process shows up as the server's own stderr/log output getting an ASan
- * report and the server process disappearing; this client process
- * itself is not expected to crash (a real server correctly rejecting
- * garbage should just close the connection cleanly on this end).
- *
- * Cost note: unlike fuzz_message.c's million-plus in-process iterations,
- * each iteration here costs a full fresh TCP+mTLS handshake (per Week 3
- * Day 4's benchmark, ~12-14ms each on this dev machine) - so this uses a
- * much smaller iteration count (thousands, not millions), which is the
- * right tradeoff for what this test class is actually for: proving the
- * real deployed path is robust, not exhaustively searching the input
- * space the way the cheap in-process fuzzer already does.
- */
+/* Network-level fuzz test: real mTLS handshake to a running server.exe, then malformed post-handshake payloads; server must survive. See COMMENT_ARCHIVE.md. */
 
 #define ITERATIONS 3000
 #define MAX_PAYLOAD 4096
@@ -103,22 +73,8 @@ static void parse_args(int argc, char *argv[])
     }
 }
 
-/* Same getaddrinfo()-based connect as client.c/benchmark.c - see
- * client.c's own comment (commit ba6ab0d) for why this isn't inet_pton(). */
-/* Short client-side timeout, deliberately much shorter than server.c's
- * own 30-second SO_RCVTIMEO. Without this, a fuzz payload that happens
- * to be shorter than a complete message (quite likely across thousands
- * of random-length payloads) makes the server correctly block in
- * wolfSSL_read() waiting for the rest of a message that this harness
- * never sends (it only writes once per iteration) - and this client
- * then blocks right back waiting for a reply, so the pair only resolves
- * once the SERVER's 30-second timeout eventually fires. Hit this for
- * real: 3000 iterations was still only 219 connections deep after
- * roughly 15-20 minutes before this fix, not a crash or a hang, just a
- * harness that could cost up to 30 real seconds per "incomplete-shaped"
- * payload. This isn't testing anything a shorter timeout wouldn't also
- * catch - the thing being proven (server doesn't crash) doesn't need
- * this harness to wait as long as a real, patient peer would. */
+/* Same getaddrinfo()-based connect as client.c/benchmark.c. */
+/* Short client-side timeout (much shorter than server.c's 30s SO_RCVTIMEO) so incomplete payloads don't wait 30s. See COMMENT_ARCHIVE.md. */
 #define FUZZ_CLIENT_TIMEOUT_SECONDS 2
 
 static void set_socket_timeout(socket_t s)
@@ -185,13 +141,7 @@ static socket_t open_tcp_connection(void)
     return sock;
 }
 
-/* One iteration: connect, real mTLS handshake, send ONE malformed
- * post-handshake payload, see what happens, clean up. One malformed
- * payload per connection is deliberate, not a limitation worked around -
- * server.c's own policy is that any single rejected message is fatal to
- * the whole connection (see TESTING.md's Week 3 Day 2 section), so a
- * second payload on the same connection would never actually reach the
- * parser again after the first one closes it. */
+/* One iteration: connect, mTLS handshake, send ONE malformed payload, clean up (one per connection since server.c treats rejection as fatal - see TESTING.md). */
 static int run_one_iteration(WOLFSSL_CTX *ctx, int iteration,
                               long *handshake_failures,
                               long *server_closed_cleanly,
@@ -219,19 +169,14 @@ static int run_one_iteration(WOLFSSL_CTX *ctx, int iteration,
 
     rc = wolfSSL_connect(ssl);
     if (rc != WOLFSSL_SUCCESS) {
-        /* Not itself a finding - a real network could always fail a
-         * handshake for mundane reasons. Counted, not treated as fatal. */
+        /* Not itself a finding - a real network could always fail a handshake for mundane reasons; counted, not fatal. */
         (*handshake_failures)++;
         wolfSSL_free(ssl);
         CLOSE_SOCKET(sock);
         return 0;
     }
 
-    /* Build one malformed post-handshake payload. Several strategies,
-     * chosen randomly each iteration - deliberately bypasses
-     * dd_serialize_message() entirely, since the whole point is sending
-     * bytes the real protocol layer never would, exactly what an actual
-     * malicious or buggy peer might do on the wire. */
+    /* Build one malformed post-handshake payload, chosen randomly; bypasses dd_serialize_message() on purpose. */
     strategy = rand() % 6;
     switch (strategy) {
         case 0: /* pure random, random length */
@@ -246,8 +191,7 @@ static int run_one_iteration(WOLFSSL_CTX *ctx, int iteration,
         case 1: /* empty write (zero-length payload) */
             payload_len = 0;
             break;
-        case 2: /* a well-formed-looking header claiming an absurd body_length,
-                  * with no actual body/tag bytes following at all */
+        case 2: /* a well-formed-looking header claiming an absurd body_length, with no body/tag bytes following */
             memset(payload, 0, DD_HEADER_SIZE);
             payload[0] = DD_VERSION;
             payload[1] = DD_MSG_TEXT_MESSAGE;
@@ -290,12 +234,7 @@ static int run_one_iteration(WOLFSSL_CTX *ctx, int iteration,
         }
     }
 
-    /* See what the server does - a clean rejection should show up as
-     * the connection closing (a read here returns <= 0). This process
-     * (the fuzzer) is not expected to crash either way; the thing being
-     * proven is that the SERVER process survives, which is confirmed
-     * separately by the orchestrating script checking the server is
-     * still running after all iterations complete. */
+    /* A clean rejection shows up as the connection closing (read <= 0); the SERVER surviving is confirmed separately by the orchestrating script. */
     {
         char reply_buf[16];
         rc = wolfSSL_read(ssl, reply_buf, sizeof(reply_buf));

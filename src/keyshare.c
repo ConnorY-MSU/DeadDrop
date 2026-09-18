@@ -5,14 +5,7 @@
 #include "keyshare.h"
 #include "aes128.h"
 
-/* keyshare_decrypt_private_key - deliberately defined here, OUTSIDE
- * the #ifdef __linux__ split below, since it's pure AES-128-CTR
- * decryption with zero platform-specific dependency (unlike
- * keyshare_reconstruct()/keyshare_stop_listener(), which genuinely
- * need fork()/sockets/pthread and stay Linux-only). Keeping this one
- * function portable is what let this exact round-trip get verified
- * on the dev machine before ever touching real Pi hardware - see
- * TESTING.md. */
+/* keyshare_decrypt_private_key - outside the __linux__ split since it's platform-independent, unlike the rest of this file. See COMMENT_ARCHIVE.md. */
 long keyshare_decrypt_private_key(const char *encrypted_key_path,
                                    const uint8_t key[KEYSHARE_LEN],
                                    uint8_t *out_buf, size_t out_buf_size)
@@ -43,10 +36,7 @@ long keyshare_decrypt_private_key(const char *encrypted_key_path,
         return -1;
     }
 
-    /* Fixed all-zero counter is safe here specifically because K is
-     * single-use: it exists to encrypt exactly this one file, exactly
-     * once, ever - see keyshare.h's decrypt doc comment and the setup
-     * tool for the same reasoning stated at the point K is generated. */
+    /* Fixed all-zero counter is safe because K is single-use - see keyshare.h. */
     memset(zero_counter, 0, sizeof(zero_counter));
     aes128_key_expansion(key, round_key);
     aes128_ctr_xcrypt(round_key, zero_counter, out_buf, out_buf, (size_t)file_size);
@@ -67,13 +57,9 @@ long keyshare_decrypt_private_key(const char *encrypted_key_path,
 
 #define BACKOFF_INITIAL_SECONDS 1
 #define BACKOFF_MAX_SECONDS     30
-#define LISTENER_POLL_MS        500 /* how often accept() re-checks
-                                        should_stop between connections */
+#define LISTENER_POLL_MS        500 /* how often accept() re-checks should_stop */
 
-/* --- run_tailscale(): fork()+execvp() the tailscale CLI, never a
- * shell - same discipline as wifi.c's run_nmcli(), for the same
- * reason (an SSID/password there, a Tailscale hostname/IP here, are
- * both untrusted-ish input worth not handing to a shell). --- */
+/* --- run_tailscale(): fork()+execvp() the tailscale CLI, never a shell (same as wifi.c's run_nmcli()) --- */
 static int run_tailscale(char *const argv[], char *out_buf, size_t out_buf_size)
 {
     int pipefd[2];
@@ -125,12 +111,7 @@ static int run_tailscale(char *const argv[], char *out_buf, size_t out_buf_size)
     return WEXITSTATUS(status);
 }
 
-/* get_own_tailscale_ip - `tailscale ip -4`, trimmed. This is what the
- * share-listener binds to, deliberately never INADDR_ANY - a socket
- * bound only to the Tailscale IP is unreachable from anywhere except
- * the tailnet, regardless of what firewall rules do or don't exist,
- * matching the design note's "bound to the Tailscale interface only,
- * not the public internet" requirement structurally, not by policy. */
+/* get_own_tailscale_ip - `tailscale ip -4`, trimmed; listener binds to this (never INADDR_ANY) so it's unreachable outside the tailnet. */
 static int get_own_tailscale_ip(char *out_ip, size_t out_ip_size)
 {
     char buf[128];
@@ -152,14 +133,7 @@ static int get_own_tailscale_ip(char *out_ip, size_t out_ip_size)
     return 0;
 }
 
-/* verify_peer_identity - `tailscale whois <ip>`, checked against a
- * confirmed-real output format (see TESTING.md): a line
- * "  Name:          <hostname>.<tailnet-suffix>" - matched against
- * expected_hostname as either an exact match or the short-name
- * portion before the first '.', so this doesn't need to know this
- * tailnet's own MagicDNS suffix. Returns 1 if it matches, 0 if it
- * doesn't (including "peer not found", ip's own exit-1 case), -1 on
- * a local error running the CLI itself. */
+/* verify_peer_identity - `tailscale whois <ip>` matched against expected_hostname (exact or short-name). Returns 1 match, 0 no match, -1 local CLI error. */
 static int verify_peer_identity(const char *ip, const char *expected_hostname)
 {
     char buf[1024];
@@ -173,8 +147,7 @@ static int verify_peer_identity(const char *ip, const char *expected_hostname)
         return -1;
     }
     if (rc != 0) {
-        return 0; /* "peer not found" or similar - not a match, not a
-                      local error either */
+        return 0; /* "peer not found" or similar - not a match, not a local error either */
     }
 
     line = strtok_r(buf, "\n", &saveptr);
@@ -223,8 +196,7 @@ static void xor_bytes(uint8_t *out, const uint8_t *a, const uint8_t *b, size_t l
     }
 }
 
-/* --- Listener: serves this device's custody-share for the peer,
- * once the connecting peer's Tailscale identity is verified. --- */
+/* --- Listener: serves this device's custody-share once the peer's Tailscale identity is verified --- */
 
 typedef struct {
     char my_custody_share_path[512];
@@ -257,8 +229,7 @@ static void *listener_thread_main(void *arg)
         pfd.events = POLLIN;
         pr = poll(&pfd, 1, LISTENER_POLL_MS);
         if (pr <= 0) {
-            continue; /* timeout or transient error - loop back to the
-                          should_stop check */
+            continue; /* timeout or transient error - loop back to the should_stop check */
         }
 
         client_sock = accept(st->listen_sock, (struct sockaddr *)&peer_addr,
@@ -273,22 +244,14 @@ static void *listener_thread_main(void *arg)
 
             inet_ntop(AF_INET, &peer_addr.sin_addr, ip_str, sizeof(ip_str));
 
-            /* Only ever serve the share to a connection whose source
-             * IP's Tailscale identity is confirmed to be the specific
-             * expected peer - never "anyone who can reach this port",
-             * which a listener bound to the Tailscale interface alone
-             * doesn't structurally guarantee (other tailnet members
-             * could still reach it). */
+            /* Only serve the share once the connecting IP's Tailscale identity is confirmed (binding alone isn't enough). */
             if (verify_peer_identity(ip_str, st->peer_expected_hostname) == 1 &&
                 read_file_exact(st->my_custody_share_path, share,
                                  sizeof(share)) == 0) {
                 write(client_sock, share, sizeof(share));
                 memset(share, 0, sizeof(share));
             }
-            /* Anything else (identity mismatch, missing local file):
-             * close without sending anything - the requester's own
-             * retry-with-backoff loop handles a silently-refused
-             * attempt the same as a transient network failure. */
+            /* Anything else: close without sending anything - the requester's retry-with-backoff loop handles this. */
         }
         close(client_sock);
     }
@@ -421,28 +384,7 @@ int keyshare_reconstruct(const char *local_share_path,
         return -1; /* missing local file - retrying won't fix this */
     }
 
-    /* REAL BUG FOUND AND FIXED (2026-08-24): this used to call
-     * start_listener() exactly once, with no retry at all - a single
-     * hard failure here (most commonly get_own_tailscale_ip() failing
-     * because this device's own Tailscale connection isn't up yet at
-     * this exact instant, e.g. genuinely no known WiFi network in
-     * range yet, or the tailscaled/network-online.target boot-ordering
-     * window closing before Tailscale actually finished establishing a
-     * connection) propagated straight out of keyshare_reconstruct(),
-     * failing load_private_key(), and exiting the whole process - the
-     * fetch-from-peer loop below has always retried forever "by
-     * design" for exactly this class of problem, but that resilience
-     * never covered this earlier, mandatory prerequisite step at all.
-     * Confirmed live: alpha hit exactly this - "keyshare_reconstruct
-     * failed" on screen, then a full process restart back to the
-     * splash banner, repeating for as long as its network stayed
-     * unready, which on a real field device with an unpredictable WiFi
-     * environment can be many restart cycles rather than a one-off.
-     * Fixed by giving this step the identical retry-with-backoff
-     * treatment the fetch-from-peer loop already has (same constants,
-     * same shape) instead of a second, different resilience mechanism
-     * - a transient "not ready yet" here is exactly as recoverable as
-     * a transient "peer not reachable yet" already was. */
+    /* Retries start_listener() with backoff instead of failing straight to the caller - real bug fixed here, see COMMENT_ARCHIVE.md. */
     {
         int listener_backoff = BACKOFF_INITIAL_SECONDS;
         while (start_listener(my_custody_share_path, peer_expected_hostname,
@@ -478,13 +420,7 @@ int keyshare_reconstruct(const char *local_share_path,
 
 #else /* !__linux__ */
 
-/* No Tailscale CLI plumbing on this project's Windows dev machine in
- * the way this module needs it (fork()+execvp(), raw sockets bound
- * to a specific interface) - the mutual key-share flow is a Linux/
- * real-hardware-only feature. These stubs exist so callers can link
- * on either platform without #ifdef guards at every call site,
- * matching wifi.h/touch.h's established precedent. Dev-machine
- * testing continues to use a plain -k PEM file path instead. */
+/* Stubs for non-Linux builds - mutual key-share flow is Linux-only; lets callers link on either platform without #ifdef guards. */
 
 int keyshare_reconstruct(const char *local_share_path,
                           const char *peer_tailscale_ip,

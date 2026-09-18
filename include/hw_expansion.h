@@ -3,37 +3,9 @@
 
 #include <stdint.h>
 
-/*
- * hw_expansion - I2C control for the Freenove FNK0100 case's onboard
- * expansion board (RGB LEDs + case fans), Week 4 physical-build addition.
- *
- * Hardware: a Nuvoton MS51FB9AE microcontroller on the case's own PCB,
- * exposed to the Raspberry Pi as an I2C slave at address 0x21 on bus 1
- * (/dev/i2c-1). The register map below was NOT guessed or reverse
- * engineered - it's taken directly from Freenove's own published
- * reference implementation (api_expansion.py, in
- * github.com/Freenove/Freenove_Computer_Case_Kit_for_Raspberry_Pi),
- * confirmed against their source rather than assumed from a product
- * description.
- *
- * IMPORTANT STATUS NOTE: this module is Linux-only by nature (Linux's
- * i2c-dev ioctl interface has no Windows equivalent at all - unlike the
- * portable socket code elsewhere in this project, there's no dev-machine
- * loopback-style test available here). It has been written carefully
- * against the real, verified register protocol, but it has NOT been
- * compiled or run against real hardware - the Pi doesn't have an OS
- * installed yet (Week 4 Day 1 hasn't happened). Treat this as a
- * reviewed-on-paper prototype, not a tested component, until it's
- * actually been run on the real Pi with the real board attached. Do not
- * report this as "working" anywhere (TESTING.md, README, etc.) until
- * that real verification has happened - the same discipline this
- * project has applied to every other claim so far.
- */
+/* hw_expansion - I2C control for the FNK0100 case's expansion board (RGB LEDs + fans). Linux-only, not yet verified on real hardware. See COMMENT_ARCHIVE.md. */
 
-/* RGB LED "mode" register (0x03) values, per the board's own firmware -
- * mode must be MANUAL_RGB for hw_expansion_set_status_color() to take
- * visible effect; the board's default/other modes (breathing, rainbow,
- * temperature-following) would override or ignore a static color write. */
+/* REG_LED_MODE (0x03) values. Must be MANUAL_RGB for hw_expansion_set_status_color() to have visible effect. */
 typedef enum {
     HW_LED_MODE_OFF          = 0,
     HW_LED_MODE_MANUAL_RGB   = 1,
@@ -42,73 +14,22 @@ typedef enum {
     HW_LED_MODE_RAINBOW      = 4
 } hw_led_mode;
 
-/* Connection status this project cares about - the actual RGB values
- * for each meaning live in one place (hw_expansion.c), not scattered
- * across every call site that wants to report a status change.
- *
- * 2026-08-22 redesign: the message-pending indicator used to be a
- * single magenta color, flashed against LED-off regardless of
- * connection state - genuinely ambiguous (a flashing LED told you
- * "message," but not whether the link was still up). Replaced with two
- * connection-aware alert colors instead: ui.c's flash loop now
- * alternates between the appropriate alert color and the current base
- * connection color (green or red) - see ui_set_link_state() in ui.h -
- * so "is there a message" and "is the link up" are both always readable
- * from the same LED, never one at the expense of the other. */
+/* Connection status colors (RGB values in hw_expansion.c); MSG_* flash alternating with the base color. See COMMENT_ARCHIVE.md for the 2026-08-22 redesign. */
 typedef enum {
     HW_STATUS_DISCONNECTED,       /* red    - no active session */
-    HW_STATUS_CONNECTING,         /* amber  - TCP/TLS handshake in
-                                    * progress, or a reconnect-with-
-                                    * backoff retry pending */
-    HW_STATUS_CONNECTED,          /* green  - live mTLS session
-                                    * established, no unread message */
-    HW_STATUS_MSG_CONNECTED,      /* blue   - flash color: an
-                                    * unacknowledged incoming message is
-                                    * pending AND the link is currently
-                                    * up (see ui_notify_message_pending()/
-                                    * ui_set_link_state() in ui.h) -
-                                    * alternated with HW_STATUS_CONNECTED
-                                    * (green), never LED-off, so the link
-                                    * being up stays visible throughout
-                                    * the flash. */
-    HW_STATUS_MSG_DISCONNECTED    /* orange - flash color: an
-                                    * unacknowledged incoming message is
-                                    * pending AND the link is currently
-                                    * DOWN - alternated with
-                                    * HW_STATUS_DISCONNECTED (red) for the
-                                    * same reason. */
+    HW_STATUS_CONNECTING,         /* amber  - handshake or reconnect pending */
+    HW_STATUS_CONNECTED,          /* green  - live session, no unread message */
+    HW_STATUS_MSG_CONNECTED,      /* blue   - message pending, link up (flashes w/ green) */
+    HW_STATUS_MSG_DISCONNECTED    /* orange - message pending, link down (flashes w/ red) */
 } hw_connection_status;
 
-/*
- * hw_expansion_open - open /dev/i2c-1 and address the expansion board.
- *
- * Returns a file descriptor to pass into the other hw_expansion_*
- * calls, or -1 on any failure (bus not present, board not responding,
- * permission denied, etc.). Hardware absence must be treated as
- * non-fatal by every caller - this project's core protocol
- * functionality does not, and must never, depend on this hardware being
- * present or working. A dev/test machine or a Pi without this specific
- * case attached should keep working identically with this returning -1.
- */
+/* hw_expansion_open - open /dev/i2c-1 and address the expansion board. Returns an fd, or -1 (must be treated as non-fatal by callers). */
 
-/*
- * hw_expansion_set_led_mode - write REG_LED_MODE (0x03).
- *
- * Call once at startup with HW_LED_MODE_MANUAL_RGB before using
- * hw_expansion_set_status_color() - see the mode note above. fd < 0 is
- * silently a no-op (see hw_expansion_open()'s contract).
- */
+/* hw_expansion_set_led_mode - write REG_LED_MODE; call once at startup with HW_LED_MODE_MANUAL_RGB. fd < 0 is a no-op. */
 
-/*
- * hw_expansion_set_status_color - set every case LED to the color
- * associated with the given connection status (REG_LED_ALL, 0x02).
- * fd < 0 is silently a no-op.
- */
+/* hw_expansion_set_status_color - set every case LED per connection status (REG_LED_ALL, 0x02). fd < 0 is a no-op. */
 
-/*
- * hw_expansion_close - release the I2C file descriptor. Safe to call
- * with fd < 0 (no-op).
- */
+/* hw_expansion_close - release the I2C file descriptor. Safe with fd < 0 (no-op). */
 
 #ifdef __linux__
 
@@ -119,17 +40,7 @@ void hw_expansion_close(int fd);
 
 #else
 
-/* Non-Linux build (this project's Windows dev machine, until Week 4
- * hardware exists): harmless no-op stubs, defined right here rather
- * than in a separate .c file, so client.c/server.c can call
- * hw_expansion_*() unconditionally without every call site needing its
- * own #ifdef __linux__ guard - the platform branch lives in exactly one
- * place (this header) instead of being scattered through the files that
- * use it. static inline: each including .c file gets its own definition,
- * no separate compilation unit or linking step needed, and an unused one
- * (e.g. in a file that includes this header but never calls a given
- * function) won't produce an unused-function warning the way a plain
- * `static` function would. */
+/* Non-Linux build: no-op stubs so client.c/server.c can call hw_expansion_*() unconditionally without their own #ifdef guard. */
 static inline int hw_expansion_open(void) { return -1; }
 static inline void hw_expansion_set_led_mode(int fd, hw_led_mode mode)
     { (void)fd; (void)mode; }

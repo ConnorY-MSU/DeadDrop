@@ -4,12 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Portability shim: this code has to run both here (Windows, dev machine)
- * and, unchanged, on the Raspberry Pi (Linux) in Week 4 - Winsock and
- * POSIX sockets differ in header, init/cleanup, socket type, error
- * sentinels, close call, and how a socket-option timeout is expressed.
- * Everything below this block is the only place that knowledge lives;
- * the rest of the file uses the portable names on the right. */
+/* Portability shim: Winsock vs POSIX socket differences live only here; rest of the file uses the portable names on the right. */
 #ifdef _WIN32
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -44,63 +39,13 @@
 #include "keyshare.h"
 
 #define SERVER_PORT 4433
-#define KEYSHARE_PORT 4434 /* mutual key-share protocol - see
-                               keyshare.h. Distinct from SERVER_PORT:
-                               this is a separate, minimal bootstrap
-                               protocol, not part of PROTOCOL.md. */
-/* REAL BUG FOUND VIA LIVE TESTING (2026-08-23, security audit - TLS
- * negative-path re-verification): this was 1. This server handles
- * exactly one connection at a time in a permanent for(;;) accept()
- * loop (see main()'s own comment) - accept() is only called again
- * after the CURRENT session fully ends, which for this app's normal
- * operating mode (two paired devices holding one long-lived session,
- * potentially for hours or days) can be an arbitrarily long time.
- * CONN_TIMEOUT_SECONDS below only starts counting once accept()
- * actually returns a socket - it does nothing for a connection still
- * sitting in the OS-level accept queue, waiting for accept() to be
- * called at all. With backlog=1, that queue overflowed after just two
- * concurrent connection attempts during this exact test session
- * (confirmed directly: `ss -tn` showed `Recv-Q 2` against `Send-Q 1`
- * on the listening socket) - any THIRD attempt during that window,
- * including the legitimate peer's own reconnect after a network blip,
- * would have been silently dropped at the TCP level rather than
- * queued, with no application-level log line at all (the app never
- * even sees a connection it never accept()s). Raised to a small,
- * still-deliberately-bounded value - enough to absorb a genuine
- * reconnect race or a burst of a few probing/failed connections
- * without ever accepting more than one real session at once (mTLS
- * still rejects every additional connection's handshake as soon as
- * it IS accept()ed, in the same way it always has - this only affects
- * how many can wait in line before that rejection happens, not
- * whether a bad cert is ever accepted). */
+#define KEYSHARE_PORT 4434 /* mutual key-share protocol (see keyshare.h); separate minimal bootstrap protocol, not part of PROTOCOL.md */
+/* OS accept-queue backlog. Raised from 1 after real bug (silent drop under concurrent connects). See COMMENT_ARCHIVE.md. */
 #define LISTEN_BACKLOG 8
 
 #define SERIAL_BUF_SIZE 32
 
-/* How long a single connection is allowed to sit idle mid-handshake before
- * we give up on it. Without this, a stalled or malicious peer that opens a
- * TCP connection and never completes the handshake blocks this server -
- * which handles exactly one connection at a time - from accepting anyone
- * else, including the legitimate peer's own reconnect attempt. 30s is
- * generous for a real handshake on a slow mobile network, short enough
- * that a stalled connection doesn't lock everyone else out for long.
- *
- * CORRECTION (2026-08-22, found via a live silent-disconnect test - see
- * session.c's SESSION_WATCHDOG_TIMEOUT_SECONDS): this does NOT also catch
- * a peer whose network silently vanished post-handshake, despite an
- * earlier version of this comment claiming it did. session.c's
- * clear_recv_timeout() deliberately resets SO_RCVTIMEO to 0 (block
- * indefinitely) right after the handshake completes, specifically so a
- * normal idle chat session doesn't spuriously disconnect - which means
- * there is no OS-level read timeout left during the actual conversation
- * at all. Confirmed live: with a real silent packet-loss test (iptables
- * DROP, simulating a real power-loss unplug - no FIN/RST ever arrives),
- * the receiver thread's wolfSSL_read() call was confirmed via gdb to
- * still be blocked in the kernel's recv() syscall itself, over 80 seconds
- * later - getsockopt() confirmed SO_RCVTIMEO genuinely was 30s at handshake
- * time, so the value itself was never the problem; it just doesn't apply
- * post-handshake. Detecting THAT failure mode is now session.c's
- * PING-based watchdog's job, not this timeout's. */
+/* Idle mid-handshake timeout; does NOT cover post-handshake silence (see session.c's PING watchdog). See COMMENT_ARCHIVE.md. */
 #define CONN_TIMEOUT_SECONDS 30
 
 static void set_socket_timeout(socket_t s)
@@ -120,15 +65,7 @@ static void set_socket_timeout(socket_t s)
 #endif
 }
 
-/* ASSUMPTION: this project's PKI is single-level - the CA signs each
- * device's leaf certificate directly, with no intermediate CAs (see
- * docs/PKI_SETUP.md). wolfSSL_X509_STORE_CTX_get_current_cert() returns
- * whichever certificate is currently being verified, which is only
- * guaranteed to be the leaf when the chain has exactly one certificate
- * in it. If an intermediate CA is ever introduced, this callback would
- * need to explicitly walk to the leaf (e.g. via depth 0) rather than
- * trusting "current cert" to mean "the peer's own cert" - untested,
- * revisit before adding any intermediate CA to this project's PKI. */
+/* ASSUMPTION: single-level PKI, no intermediate CAs (see docs/PKI_SETUP.md) - revisit if one is ever added. */
 static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
 {
     WOLFSSL_X509 *cert;
@@ -167,19 +104,7 @@ static int my_verify_callback(int preverify_ok, WOLFSSL_X509_STORE_CTX *store)
     }
     serial_hex[serial_len * 2] = '\0';
 
-    /* 2026-08-22: the routine "checking serial.../not revoked, proceeding"
-     * notices used to print on EVERY connection - not a security risk in
-     * themselves (a certificate serial number is public by design, sent
-     * in the clear as part of the cert during any TLS handshake - showing
-     * it here doesn't hand an attacker anything they couldn't already
-     * read straight off the certificate or a packet capture), but pure
-     * noise for an end user: revocation checking still happens on every
-     * connection either way, this only ever changed whether the routine
-     * "yes, fine" case got printed. Silenced per direct request, alongside
-     * the same "stop repeating routine detail on every reconnect" ask
-     * applied to session.c's connection-instructions hint. The actual
-     * REJECTED-cert case below stays visible - that's a real security
-     * event a user should see, not routine confirmation noise. */
+    /* Routine "not revoked" notices silenced (pure noise); the REJECTED case below stays visible as a real security event. */
     if (revocation_is_revoked(serial_hex)) {
         ui_add_errorf(
             "Verify callback: serial %s is REVOKED - rejecting.", serial_hex);
@@ -237,12 +162,7 @@ static void parse_args(int argc, char *argv[],
     }
 }
 
-/* load_private_key - either a plain PEM file (-k, dev-machine testing
- * or a device without mutual key-share protection set up) or the
- * mutual key-share flow (-K/-P/-N, see keyshare.h) - decrypted into a
- * stack buffer, loaded via wolfSSL_CTX_use_PrivateKey_buffer(), and
- * zeroed immediately after, rather than ever touching disk in
- * plaintext. Returns 0 on success. */
+/* load_private_key - loads via -k (plain PEM) or -K/-P/-N (mutual key-share flow, see keyshare.h); decrypts into a stack buffer zeroed right after use. Returns 0 on success. */
 static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
                              const char *keyshare_dir, const char *peer_ip,
                              const char *peer_hostname)
@@ -264,14 +184,7 @@ static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
             snprintf(key_enc_path, sizeof(key_enc_path), "%s/key.enc",
                       keyshare_dir);
 
-            /* Runs after ui_init()/ui_start_idle_input() now - see
-             * main()'s own comment on why that moved earlier (2026-08-23
-             * real bug fix). ui_add_history()/ui_add_error(), not
-             * printf/fprintf, so a real, possibly very long wait here
-             * (keyshare_reconstruct()'s retry loop has no timeout)
-             * doesn't corrupt the ncurses screen, and the idle-input
-             * thread stays free to service a Ctrl+W WiFi-setup detour
-             * the whole time this blocks the main thread. */
+            /* Runs after ui_init()/ui_start_idle_input() so this unbounded wait doesn't corrupt ncurses and Ctrl+W WiFi setup stays available. */
             ui_add_history(NULL,
                 "Fetching this device's key-share from its paired "
                 "device over Tailscale (retrying until it's "
@@ -317,24 +230,10 @@ static int load_private_key(WOLFSSL_CTX *ctx, const char *key_path,
     return 0;
 }
 
-/* Message framing glue (receive_one_message/send_message), the
- * msg_type_name() logger helper, and the per-connection message loop
- * that used to live here (handle_connection() - which auto-echoed every
- * TEXT_MESSAGE as "ack: <text>") have moved to session.h/session.c.
- * That auto-ack behavior is gone entirely now, not just relocated: real
- * two-way chat means a human's own typed reply is the acknowledgment,
- * the same way client.c never needed one either. See session.h's design
- * comment for why this piece became a genuinely shared module instead of
- * staying duplicated between client.c and server.c the way the small
- * portability shim above does. */
+/* Message framing, msg_type_name(), and the per-connection message loop moved to session.h/session.c (shared with client.c); old auto-ack behavior is gone, not just relocated. */
 
 #ifndef _WIN32
-/* Identical to client.c's own copy of this helper, including the
- * timing/bound reasoning - see there for the full "boot sequence
- * overlapped onto the banner" story. Duplicated rather than shared,
- * matching this file's existing convention for small per-file helpers
- * (parse_args, print_usage, load_private_key) rather than adding a
- * third module just for this. */
+/* Identical to client.c's copy of this helper (duplicated per this file's small-helper convention) - see there for the timing/bound reasoning. */
 #define CLOUD_INIT_WAIT_MAX_MS 15000
 #define CLOUD_INIT_WAIT_POLL_MS 250
 
@@ -387,14 +286,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* SECURITY: nothing printed from here through ui_init() below
-     * includes a filesystem path, deliberately - confirmed via real
-     * physical-console testing that this output is genuinely visible
-     * on the touchscreen (this project's whole point), not just a
-     * development-time convenience. A device meant to sit somewhere
-     * semi-public shouldn't hand a casual observer the exact on-disk
-     * layout of its own private key material - real info found and
-     * fixed the same day it was noticed, not a hypothetical concern. */
+    /* SECURITY: nothing printed here through ui_init() includes a filesystem path, so a semi-public device doesn't leak its key layout. */
     rc = revocation_load(revoked_path);
     if (rc != 0) {
         fprintf(stderr,
@@ -432,27 +324,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* REAL BUG FOUND AND FIXED (2026-08-23): see client.c's matching
-     * comment for the full story - ui_init()/ui_start_idle_input() used
-     * to run only after certificate/key/CA loading fully succeeded,
-     * including load_private_key() below, which can block indefinitely
-     * in keyshare_reconstruct()'s retry loop (no timeout by design) if
-     * this device has no network path to its peer at all. Moved up here
-     * so the idle-input thread (Ctrl+W/WiFi setup) is already running
-     * while that blocks the main thread - a real "only an unrecognized
-     * WiFi network in range" scenario is now actually recoverable from
-     * the touchscreen/keyboard instead of hanging the boot forever.
-     * Everything from here on goes through ui_add_error()/ui_add_history()
-     * instead of fprintf/printf for the same reason already documented
-     * below - it just starts earlier now. */
+    /* ui_init()/ui_start_idle_input() moved up here (before cert/key/CA loading) so Ctrl+W WiFi setup works even if load_private_key() blocks. See client.c's matching comment; see COMMENT_ARCHIVE.md. */
 #ifndef _WIN32
     wait_for_cloud_init_boot_finished();
 #endif
-    /* 2026-08-23 (direct request): see client.c's matching comment -
-     * this capitalized literal is the single source of truth for every
-     * other "Alpha"/"Bravo" display site (banner, message history,
-     * status bar), and ui_init() infers THIS device's own identity
-     * from it too. */
+    /* This literal is the single source of truth for every "Alpha"/"Bravo" display site; ui_init() infers this device's identity from it too. */
     ui_init("Bravo");
     ui_start_idle_input();
     ui_set_status("Loading credentials...");
@@ -479,12 +355,7 @@ int main(int argc, char *argv[])
 #endif
         return 1;
     }
-    /* Deliberately NOT calling keyshare_stop_listener() here - see its
-     * doc comment in keyshare.h for the real deadlock this caused the
-     * first time around. The listener stays up for this process's
-     * whole lifetime, so the peer can fetch its own share from THIS
-     * device at any later point too, including after its own
-     * independent reboot. */
+    /* Deliberately NOT calling keyshare_stop_listener() here (caused a deadlock before, see keyshare.h) - listener stays up for the process's lifetime. */
 
     rc = wolfSSL_CTX_load_verify_locations(ctx, ca_path, NULL);
     if (rc != WOLFSSL_SUCCESS) {
@@ -505,13 +376,7 @@ int main(int argc, char *argv[])
         WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
         my_verify_callback);
 
-    /* ui_init() already ran, much earlier now (see this function's own
-     * comment right after wolfSSL_CTX_new()) - everything from here on
-     * (real ncurses on Linux; unchanged plain console on the dev
-     * machine - see ui.h) already goes through ui_set_status()/
-     * ui_add_history() rather than fprintf/printf, same "don't corrupt
-     * the ncurses screen" reasoning, just starting earlier than it used
-     * to. */
+    /* ui_init() already ran - from here on use ui_set_status()/ui_add_history(), not fprintf/printf, to avoid corrupting the ncurses screen. */
     listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_sock == SOCKET_INVALID) {
         ui_add_errorf("socket() failed: %d", SOCK_LAST_ERROR());
@@ -533,34 +398,7 @@ int main(int argc, char *argv[])
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(SERVER_PORT);
 
-    /* REAL SECURITY FINDING, FIXED (2026-08-23 security audit): this
-     * used to be a flat INADDR_ANY bind - the mTLS listener was
-     * reachable from ANY network this device happened to be
-     * connected to (the local WiFi AP, a shared/managed property-wide
-     * network with dozens of other tenants, etc.), not just the
-     * tailnet docs/tailscale-acl.json's own ACL was written to scope
-     * traffic to. mTLS still rejected an unauthenticated peer, but the
-     * ACL's actual job - restricting which network paths can even
-     * ATTEMPT a handshake - was silently bypassed for anyone who could
-     * reach the device's LAN IP directly, which on a shared/managed
-     * network can be a lot of people. Fixed by binding to the
-     * Tailscale IP specifically (keyshare.c's own listener already
-     * does exactly this, for the same reason - see
-     * keyshare_get_own_tailscale_ip()'s comment). Deliberately
-     * fail-closed, not fail-open: if the Tailscale IP can't be
-     * determined, refuse to start rather than silently falling back
-     * to an unscoped INADDR_ANY bind - by this point
-     * keyshare_reconstruct() has already succeeded, which itself
-     * required a working Tailscale connection moments earlier in this
-     * same startup, so this realistically never fails; on the rare
-     * chance it does, a loud refusal-to-start is the correct response
-     * for a security-relevant network binding, not a silent, less-
-     * secure fallback. Windows dev-machine builds keep INADDR_ANY
-     * unconditionally - keyshare_get_own_tailscale_ip() always
-     * returns -1 there (no Tailscale plumbing - see keyshare.c's own
-     * non-Linux stub comment), and dev-machine testing already uses
-     * a plain -k PEM file over loopback instead of this whole scheme,
-     * so there's nothing to scope to. */
+    /* Bind to the Tailscale IP, not INADDR_ANY, so the tailnet ACL actually scopes who can attempt a handshake; fail-closed if it can't be determined. Windows dev builds keep INADDR_ANY. See COMMENT_ARCHIVE.md. */
 #ifdef __linux__
     {
         char ts_ip[64];
@@ -612,42 +450,23 @@ int main(int argc, char *argv[])
 
     ui_set_statusf("Listening on port %d...", SERVER_PORT);
 
-    /* Case RGB status light (no-op on non-Linux / hardware-absent - see
-     * hw_expansion.h). See client.c's matching comment for why this is
-     * opened once here rather than per-connection, and why MANUAL_RGB
-     * mode has to be set before a color write has any visible effect. */
+    /* Case RGB status light (no-op without hardware, see hw_expansion.h); opened once here, not per-connection - see client.c's matching comment. */
     hw_fd = hw_expansion_open();
     hw_expansion_set_led_mode(hw_fd, HW_LED_MODE_MANUAL_RGB);
     hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
     ui_set_link_state(0);
 
-    /* Case OLED (no-op on non-Linux / hardware-absent - see hw_oled.h),
-     * same "opened once, lives for the whole process" reasoning as the
-     * RGB light above. Shows a simple idle message rather than a blank
-     * screen, so it's obvious at a glance the service is actually
-     * running, not just that the screen happens to be off. */
+    /* Case OLED (no-op without hardware - see hw_oled.h), opened once like the RGB light above; shows an idle message while waiting. */
     oled_fd = hw_oled_open();
-    ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c's touch thread
-        can periodically refresh background network metrics below
-        this file's own role/status lines - see ui.h. */
+    ui_set_oled_fd(oled_fd); /* one-time wiring so ui.c can refresh background network metrics below this file's own role/status lines - see ui.h */
     hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
     hw_oled_draw_text(oled_fd, 1, "Waiting...");
     hw_oled_display(oled_fd);
 
-    /* Resident Piper TTS pipeline + speaker thread - same "own
-     * lifecycle, started once, kept for the process's whole life"
-     * reasoning as hw_fd/oled_fd above. Failure here (piper/aplay not
-     * installed, etc.) is silently non-fatal - hw_tts_speak() calls
-     * later just become no-ops, same as every other hw_* module's
-     * hardware-absence handling. */
+    /* Resident Piper TTS pipeline + speaker thread, started once for the process's life; failure here is silently non-fatal (hw_tts_speak() becomes a no-op). */
     hw_tts_init();
 
-    /* ui_start_idle_input() already running (started much earlier, right
-     * after ui_init() - see this function's own comment near
-     * wolfSSL_CTX_new()) - it already covers accept()'s indefinite block
-     * below, exactly the same as it always covered every gap between
-     * connections; each run_symmetric_session() call below still
-     * brackets its own stop/start pair around itself. */
+    /* ui_start_idle_input() is already running (started earlier); covers accept()'s block below. Each run_symmetric_session() call still brackets its own stop/start. */
 
     for (;;) {
         socket_t client_sock = accept(listen_sock, NULL, NULL);
@@ -657,9 +476,7 @@ int main(int argc, char *argv[])
         }
         ui_set_status("bravo connected - starting TLS handshake...");
 
-        /* See CONN_TIMEOUT_SECONDS above: bounds how long a single stalled
-         * or malicious connection can block every other connection,
-         * including the legitimate peer's own reconnect attempt. */
+        /* See CONN_TIMEOUT_SECONDS above: bounds how long one stalled/malicious connection can block every other connection. */
         set_socket_timeout(client_sock);
 
         WOLFSSL *ssl = wolfSSL_new(ctx);
@@ -671,11 +488,7 @@ int main(int argc, char *argv[])
 
         wolfSSL_set_fd(ssl, (int)client_sock);
 
-        /* See client.c's matching comment: wolfSSL frees its handshake
-         * arrays once the handshake completes, but handle_connection()
-         * needs them afterward (via dd_session_init() in message.c) to
-         * derive the per-session HMAC key. Must be called before
-         * wolfSSL_accept(). */
+        /* See client.c's matching comment: session.c needs wolfSSL's handshake arrays afterward for the per-session HMAC key; must be called before wolfSSL_accept(). */
         wolfSSL_KeepArrays(ssl);
 
         rc = wolfSSL_accept(ssl);
@@ -691,11 +504,7 @@ int main(int argc, char *argv[])
             hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
-            /* Stop the idle-input thread before run_symmetric_session()
-             * starts its own reader on the same input_win, and resume
-             * it immediately after - see ui.h's "IDLE INPUT" comment.
-             * These two calls must bracket every run_symmetric_session()
-             * call exactly like this. */
+            /* Stop the idle-input thread before run_symmetric_session() reads the same input_win, resume right after - see ui.h's "IDLE INPUT" comment. */
             ui_stop_idle_input();
             run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "Bravo");
             ui_start_idle_input();
@@ -705,13 +514,7 @@ int main(int argc, char *argv[])
             hw_oled_draw_text(oled_fd, 1, "Waiting...");
             hw_oled_display(oled_fd);
 
-            /* See client.c's matching comment: a graceful close_notify
-             * here (rather than abruptly freeing/closing) avoids Winsock
-             * sending a hard RST when there's unread data still sitting
-             * in this socket's receive buffer, which could otherwise
-             * abort delivery of whatever this server just sent (e.g. an
-             * ack) before the client ever sees it. Best-effort, doesn't
-             * block waiting for the client's own close_notify in return. */
+            /* See client.c's matching comment: graceful close_notify avoids a hard RST that could abort delivery of unread buffered data; best-effort, non-blocking. */
             wolfSSL_shutdown(ssl);
             ui_set_statusf("Listening on port %d...", SERVER_PORT);
         }
@@ -720,18 +523,7 @@ int main(int argc, char *argv[])
         CLOSE_SOCKET(client_sock);
     }
 
-    /* KNOWN GAP, not yet fixed: the loop above never breaks, so
-     * everything from here down is currently unreachable. Neither this
-     * process nor systemd's default `systemctl stop` (which sends
-     * SIGTERM) installs a signal handler, so today a stop/restart is an
-     * abrupt kill, not a graceful shutdown through this cleanup path.
-     * Fixing this properly needs a signal handler whose exact shape
-     * differs by platform (POSIX signal()/sigaction() vs Windows
-     * SetConsoleCtrlHandler(), and a blocking accept() needs to actually
-     * be interrupted, not just have a flag checked around it) - left
-     * unimplemented here rather than guessed at and left unverified on
-     * a platform this can't currently be tested on. Revisit in Week 4
-     * once this is building and running natively on the Pi. */
+    /* KNOWN GAP: the loop above never breaks, so this cleanup is unreachable today (no signal handler; abrupt kill). Revisit in Week 4. See COMMENT_ARCHIVE.md. */
     CLOSE_SOCKET(listen_sock);
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);

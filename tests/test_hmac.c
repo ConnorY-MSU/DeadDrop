@@ -5,10 +5,7 @@
 #include "hmac.h"
 #include "debug.h"
 
-/* Test vectors from RFC 4231 ("Identifiers and Test Vectors for HMAC-SHA-224,
- * HMAC-SHA-256, HMAC-SHA-384, and HMAC-SHA-512"), the standard reference
- * vectors for HMAC-SHA-256 - same "known-good external standard, not just
- * internal self-consistency" discipline as Week 1's SHA-256/AES-128 vectors. */
+/* Test vectors from RFC 4231, the standard reference for HMAC-SHA-256. */
 
 static size_t hex_to_bytes(const char *hex_str, uint8_t *out) {
     size_t len = strlen(hex_str) / 2;
@@ -52,8 +49,7 @@ int main(void) {
         "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
     );
 
-    /* RFC 4231 Test Case 2: "Jefe" / "what do ya want for nothing?" -
-     * the most commonly cited HMAC-SHA-256 vector, key shorter than a block. */
+    /* RFC 4231 Test Case 2: "Jefe" - the most commonly cited HMAC-SHA-256 vector, key shorter than a block. */
     all_pass &= run_vector(
         "RFC 4231 Test Case 2 (short key, \"Jefe\")",
         "4a656665",
@@ -73,10 +69,7 @@ int main(void) {
         );
     }
 
-    /* RFC 4231 Test Case 6: key LONGER than SHA-256's 64-byte block size
-     * (131 bytes) - specifically exercises the "hash the key down to 32
-     * bytes first" branch in hmac_sha256()'s own key-padding logic (RFC
-     * 2104 step 1/5.a), which none of the vectors above touch at all. */
+    /* RFC 4231 Test Case 6: key > block size (131 bytes) - exercises the key-hashing branch the other vectors don't. */
     {
         char key_hex[263];
         char data[] = "Test Using Larger Than Block-Size Key - Hash Key First";

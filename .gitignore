@@ -36,3 +36,9 @@ Thumbs.db
 # actual deployed copy lives on each Pi.
 *.onnx
 *.onnx.json
+
+# Local-only comment archive - the full narrative context (bug-fix
+# history, design rationale) trimmed out of source comments. Kept for
+# local reference only; never committed or pushed, so the public GitHub
+# copy shows only clean, minimal source comments.
+docs/COMMENT_ARCHIVE.md

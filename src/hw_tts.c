@@ -1,40 +1,4 @@
-/*
- * hw_tts.c - see include/hw_tts.h for the full contract. Linux-only,
- * same "reviewed, not yet run against real hardware" status as
- * hw_expansion.c/hw_oled.c - the part most worth real verification once
- * hardware exists is "is piper/aplay actually installed, does the
- * voice model load correctly, is audio actually audible, does a
- * killed-and-respawned pipeline genuinely cut off in-progress audio
- * within an acceptable delay, and does the crash-recovery path below
- * actually recover from a real piper crash", not "did this code
- * correctly implement some external spec".
- *
- * Architecture (2026-08-25 - resident pipeline + queue; crash recovery
- * added same day):
- *
- *   [queue: bounded array, mutex+condvar, mirrors outbox.c's style]
- *          |
- *          v
- *   [speaker thread: dequeues one text at a time, writes to piper's
- *    persistent stdin. Also owns piper_pid/aplay_pid, handles
- *    stop_requested (destroy) by killing+respawning immediately, and
- *    periodically health-checks the pipeline even while idle so an
- *    unexpected crash gets noticed and healed without needing a new
- *    message to reveal it.]
- *          |
- *          v
- *   [piper process, resident, stdin=pipe we keep open, stdout=pipe to aplay]
- *          |
- *          v
- *   [aplay process, resident, stdin=pipe from piper]
- *
- * Both piper and aplay are direct (not orphaned/double-forked) children
- * of this process - deliberate, since both hw_tts_stop_and_clear() and
- * the crash-recovery path need to kill()/waitpid() them by a PID this
- * code still owns and trusts, which the double-fork-and-orphan trick
- * (correct for the original fire-and-forget one-shot design) would make
- * needlessly awkward.
- */
+/* hw_tts.c - see include/hw_tts.h for the contract. Linux-only, resident piper+aplay pipeline fed by a bounded queue, speaker thread also handles crash recovery. See COMMENT_ARCHIVE.md. */
 
 #ifdef __linux__
 
@@ -44,56 +8,29 @@
 #include <sys/wait.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <pthread.h>
 #include <time.h>
 #include <errno.h>
 
-/* A sane spoken-aloud length cap - this project's messages can be up to
- * DD_MAX_BODY_LEN (64KB) per PROTOCOL.md, and nobody wants that read
- * aloud in full. Deliberately not tied to DD_MAX_BODY_LEN (message.h
- * isn't even included here) - this is a UX choice about what's
- * reasonable to speak, unrelated to the protocol's own length limit. */
-#define HW_TTS_MAX_CHARS 200
+/* Spoken-aloud length cap, independent of DD_MAX_BODY_LEN (a UX choice, not a protocol limit); raised from 200 to 4096 (2026-08-27). */
+#define HW_TTS_MAX_CHARS 4096
 
-/* Bounded queue - mirrors outbox.c's exact style (fixed array, no
- * malloc, no linked-list bookkeeping) rather than inventing a different
- * pattern for what's structurally the same kind of problem: a
- * thread-safe FIFO between one producer (whichever thread calls
- * hw_tts_speak() - currently session.c's receiver thread) and one
- * consumer (the speaker thread below). 20 is generous for actual chat
- * pace, matching OUTBOX_MAX_MESSAGES's own reasoning - this is not
- * meant to be a long-term store-and-forward buffer. */
+/* Bounded queue (fixed array, no malloc), mirrors outbox.c's style; one producer (hw_tts_speak()), one consumer (speaker thread). */
 #define HW_TTS_QUEUE_MAX 20
 #define HW_TTS_QUEUE_MSG_LEN (HW_TTS_MAX_CHARS + 2) /* text + '\n' + '\0' */
 
-/* Crash-recovery backoff - same doubling pattern and same exact values
- * as RECONNECT_INITIAL_DELAY_SECONDS/RECONNECT_MAX_DELAY_SECONDS
- * (client.c) and BACKOFF_INITIAL_SECONDS/BACKOFF_MAX_SECONDS
- * (keyshare.c), reused deliberately rather than inventing new numbers -
- * this project already has an established, reasoned convention for
- * "something died unexpectedly, retry with growing backoff rather than
- * either busy-looping or giving up permanently." */
+/* Crash-recovery backoff - same doubling pattern/values as client.c's RECONNECT_* and keyshare.c's BACKOFF_* constants. */
 #define HW_TTS_RESTART_BACKOFF_INITIAL_S 1
 #define HW_TTS_RESTART_BACKOFF_MAX_S     30
 
-/* If the pipeline that just died had been alive at least this long
- * first, treat the next restart as a fresh, isolated incident (reset
- * backoff to initial) rather than punishing it with backoff grown from
- * a possibly-unrelated earlier crash - mirrors client.c's
- * reconnect_delay reset-on-actual-success logic. Reusing the max
- * backoff value here too: "survived at least as long as we'd ever wait
- * between retries" is a reasonable, simple bar for "this looks healthy
- * now." */
+/* If the pipeline survived at least this long before dying, treat the next restart as a fresh incident and reset backoff. */
 #define HW_TTS_RESTART_HEALTHY_UPTIME_S HW_TTS_RESTART_BACKOFF_MAX_S
 
-/* How often the speaker thread wakes up on its own (even with an empty
- * queue) specifically to check the pipeline is still alive. Without
- * this, an unexpected piper/aplay death while no messages are arriving
- * would go undetected indefinitely - the whole point of "just in case
- * it dies" healing is not depending on the next message to reveal the
- * problem. */
+/* How often the speaker thread wakes up on its own to check the pipeline is still alive, so a death during idle periods still gets healed. */
 #define HW_TTS_HEALTH_CHECK_INTERVAL_S 2
 
 static char queue[HW_TTS_QUEUE_MAX][HW_TTS_QUEUE_MSG_LEN];
@@ -106,34 +43,123 @@ static int stop_requested;      /* hw_tts_stop_and_clear() sets this */
 static int shutdown_requested;  /* hw_tts_shutdown() sets this */
 
 static pthread_t speaker_tid;
-static int speaker_running; /* 0 until hw_tts_init() successfully starts
-                                the thread - every public entry point
-                                checks this and no-ops if unset, same
-                                "absence is always non-fatal" contract */
+static int speaker_running; /* 0 until hw_tts_init() succeeds; every public entry point checks this and no-ops if unset */
 
 static pid_t piper_pid = -1;
 static pid_t aplay_pid = -1;
-static int   piper_stdin_fd = -1; /* held open across many messages -
-                                      THIS is what keeps piper resident
-                                      rather than seeing EOF and exiting
-                                      after one line */
+static int   piper_stdin_fd = -1; /* held open across messages - keeps piper resident instead of exiting on EOF after one line */
+static int   piper_out_fd = -1;   /* piper's raw-PCM stdout, read by the relay thread (not connected directly to aplay's stdin) */
+static int   aplay_in_fd = -1;    /* aplay's stdin, written by the relay thread with gain-scaled samples */
+static pthread_t relay_tid;
 
-/* Only ever touched from the speaker thread itself (both the initial
- * spawn from hw_tts_init(), which runs before the thread starts, and
- * every respawn thereafter, which runs ON the thread) - see this file's
- * top comment. No mutex needed for these three + the two below. */
+/* Real software-applied output gain (hw_tts.h's hw_tts_set_volume() - the hardware/ALSA mixer path has zero effect on loudness). */
+static int g_volume_percent = 100;
+static pthread_mutex_t gain_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void hw_tts_set_volume(int percent)
+{
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    pthread_mutex_lock(&gain_mutex);
+    g_volume_percent = percent;
+    pthread_mutex_unlock(&gain_mutex);
+}
+
+int hw_tts_get_volume(void)
+{
+    int v;
+    pthread_mutex_lock(&gain_mutex);
+    v = g_volume_percent;
+    pthread_mutex_unlock(&gain_mutex);
+    return v;
+}
+
+/* volume_relay_thread_main - sits between piper's raw PCM stdout and aplay's stdin, scaling every 16-bit sample by the current gain; exits on EOF/error, carries an odd leftover byte across read() calls. */
+/* Argument block for volume_relay_thread_main() - heap-allocated per spawn so the thread has its own stable copy of the fds; thread frees this itself. */
+struct relay_args {
+    int in_fd;
+    int out_fd;
+};
+
+static void *volume_relay_thread_main(void *arg)
+{
+    int in_fd = ((struct relay_args *)arg)->in_fd;
+    int out_fd = ((struct relay_args *)arg)->out_fd;
+    unsigned char buf[4096];
+    free(arg);
+    unsigned char carry_byte = 0;
+    int have_carry = 0;
+
+    for (;;) {
+        ssize_t n;
+        unsigned char *p = buf;
+        size_t len = 0;
+        float gain;
+        size_t i;
+
+        if (have_carry) {
+            buf[0] = carry_byte;
+            n = read(in_fd, buf + 1, sizeof(buf) - 1);
+            if (n <= 0) {
+                break;
+            }
+            len = (size_t)n + 1;
+            have_carry = 0;
+        } else {
+            n = read(in_fd, buf, sizeof(buf));
+            if (n <= 0) {
+                break;
+            }
+            len = (size_t)n;
+        }
+
+        if (len % 2 != 0) {
+            carry_byte = p[len - 1];
+            have_carry = 1;
+            len--;
+        }
+
+        pthread_mutex_lock(&gain_mutex);
+        gain = (float)g_volume_percent / 100.0f;
+        pthread_mutex_unlock(&gain_mutex);
+
+        for (i = 0; i + 1 < len; i += 2) {
+            int16_t sample;
+            int32_t scaled;
+            memcpy(&sample, p + i, sizeof(sample));
+            scaled = (int32_t)((float)sample * gain);
+            if (scaled > 32767) {
+                scaled = 32767;
+            } else if (scaled < -32768) {
+                scaled = -32768;
+            }
+            sample = (int16_t)scaled;
+            memcpy(p + i, &sample, sizeof(sample));
+        }
+
+        {
+            size_t written = 0;
+            while (written < len) {
+                ssize_t w = write(out_fd, p + written, len - written);
+                if (w <= 0) {
+                    goto done;
+                }
+                written += (size_t)w;
+            }
+        }
+    }
+done:
+    return NULL;
+}
+
+/* Only ever touched from the speaker thread itself (initial spawn runs before the thread starts, every respawn runs on it) - no mutex needed. */
 static time_t pipeline_started_at;
 static int    restart_backoff_s = HW_TTS_RESTART_BACKOFF_INITIAL_S;
 
-/* Redirect the calling process's own stdout/stderr to /dev/null. Used
- * for aplay's child specifically - same fix as the original espeak-ng
- * bug (2026-08-24, see git history): under this project's systemd
- * hardening (ProtectHome=read-only), audio libraries that try to touch
- * a config directory under $HOME print a failure straight to whatever
- * stdio they inherited, which on the real deployed service is the live
- * console (StandardError=tty), corrupting the ncurses UI. Silencing
- * stdio here, not loosening the sandbox, is the correct fix - aplay
- * doesn't need that directory to actually work. */
+/* Redirect the calling process's stdout/stderr to /dev/null - used for aplay's child, whose stray output would corrupt the ncurses UI. See COMMENT_ARCHIVE.md. */
 static void silence_stdio(void)
 {
     int devnull = open("/dev/null", O_WRONLY);
@@ -146,9 +172,7 @@ static void silence_stdio(void)
     }
 }
 
-/* Same as silence_stdio() but leaves STDOUT_FILENO untouched - for
- * piper's child specifically, whose stdout is the audio pipe to aplay
- * and must stay that way. Only stderr gets silenced here. */
+/* Same as silence_stdio() but leaves STDOUT_FILENO untouched - piper's stdout is the audio pipe to aplay and must stay that way. */
 static void silence_stderr_only(void)
 {
     int devnull = open("/dev/null", O_WRONLY);
@@ -160,14 +184,7 @@ static void silence_stderr_only(void)
     }
 }
 
-/* Kill (if running) and forget the current piper/aplay pids - used by
- * spawn_pipeline()'s own error cleanup, hw_tts_stop_and_clear()'s
- * handling, and the crash-recovery path below. SIGKILL, not SIGTERM:
- * for the destroy path this project wants in-progress audio to stop as
- * close to immediately as possible (see hw_tts_stop_and_clear()'s
- * header comment); for the crash-recovery path a process already
- * misbehaving badly enough to need forced recovery doesn't get the
- * benefit of the doubt either. */
+/* Kill (if running) and forget the current piper/aplay pids - used by spawn_pipeline()'s error cleanup, hw_tts_stop_and_clear(), and crash recovery. SIGKILL, not SIGTERM: gone immediately, no benefit of the doubt. */
 static void kill_pipeline(void)
 {
     if (piper_pid > 0) {
@@ -184,59 +201,62 @@ static void kill_pipeline(void)
         close(piper_stdin_fd);
         piper_stdin_fd = -1;
     }
+    /* Closing these unblocks volume_relay_thread_main()'s blocking read()/write(), letting it notice and exit on its own. */
+    if (piper_out_fd >= 0) {
+        close(piper_out_fd);
+        piper_out_fd = -1;
+    }
+    if (aplay_in_fd >= 0) {
+        close(aplay_in_fd);
+        aplay_in_fd = -1;
+    }
 }
 
-/* Spawn a fresh piper+aplay pair, wired stdin->stdout->stdin as a real
- * pipeline (piper --output-raw | aplay), and leave piper_stdin_fd open
- * as our persistent handle for feeding future messages. Returns 0 on
- * success, -1 on any failure (piper_pid/aplay_pid/piper_stdin_fd are
- * left in a clean -1 state either way - callers don't need their own
- * cleanup on failure). On success, records pipeline_started_at for the
- * crash-recovery backoff-reset logic below. Called from hw_tts_init(),
- * from hw_tts_stop_and_clear()'s handling, and from the crash-recovery
- * path. */
+/* Spawn a fresh piper+aplay pipeline (piper --output-raw | aplay), leaving piper_stdin_fd open as our persistent handle. Returns 0/-1; records pipeline_started_at. */
 static int spawn_pipeline(void)
 {
-    int text_pipe[2];  /* [0] read = piper's stdin, [1] write = ours (persistent) */
-    int audio_pipe[2]; /* [0] read = aplay's stdin, [1] write = piper's stdout */
+    int text_pipe[2];      /* [0] read = piper's stdin, [1] write = ours (persistent) */
+    int piper_out_pipe[2]; /* [0] read = ours (relay thread), [1] write = piper's stdout */
+    int aplay_in_pipe[2];  /* [0] read = aplay's stdin, [1] write = ours (relay thread) */
     char rate_str[16];
 
     if (pipe(text_pipe) != 0) {
         return -1;
     }
-    if (pipe(audio_pipe) != 0) {
+    if (pipe(piper_out_pipe) != 0) {
         close(text_pipe[0]);
         close(text_pipe[1]);
+        return -1;
+    }
+    if (pipe(aplay_in_pipe) != 0) {
+        close(text_pipe[0]);
+        close(text_pipe[1]);
+        close(piper_out_pipe[0]);
+        close(piper_out_pipe[1]);
         return -1;
     }
 
     piper_pid = fork();
     if (piper_pid < 0) {
         close(text_pipe[0]); close(text_pipe[1]);
-        close(audio_pipe[0]); close(audio_pipe[1]);
+        close(piper_out_pipe[0]); close(piper_out_pipe[1]);
+        close(aplay_in_pipe[0]); close(aplay_in_pipe[1]);
         piper_pid = -1;
         return -1;
     }
     if (piper_pid == 0) {
-        /* Child: becomes piper, resident - reads lines from stdin for
-         * as long as the write end (held by the parent below) stays
-         * open, synthesizing and writing raw PCM to stdout per line,
-         * never exiting on its own between messages. Must close every
-         * fd this process doesn't need - an unused inherited copy of a
-         * pipe end left open can silently prevent EOF from ever being
-         * seen by the correct reader. */
+        /* Child: becomes piper, resident; stdout goes to piper_out_pipe (relay thread, software volume) not straight to aplay - see hw_tts.h's hw_tts_set_volume(). */
         dup2(text_pipe[0], STDIN_FILENO);
-        dup2(audio_pipe[1], STDOUT_FILENO);
+        dup2(piper_out_pipe[1], STDOUT_FILENO);
         silence_stderr_only();
         close(text_pipe[0]);
         close(text_pipe[1]);
-        close(audio_pipe[0]);
-        close(audio_pipe[1]);
+        close(piper_out_pipe[0]);
+        close(piper_out_pipe[1]);
+        close(aplay_in_pipe[0]);
+        close(aplay_in_pipe[1]);
 
-        /* execl(), not execlp() - piper is deliberately looked up by
-         * absolute path, not via PATH search. See HW_TTS_PIPER_PATH's
-         * comment in hw_tts.h for why (venv install, PATH not to be
-         * trusted under the hardened systemd service). */
+        /* execl(), not execlp() - piper is deliberately looked up by absolute path, not via PATH search. See HW_TTS_PIPER_PATH in hw_tts.h. */
         execl(HW_TTS_PIPER_PATH, "piper",
               "--model", HW_TTS_MODEL_PATH,
               "--output-raw",
@@ -249,7 +269,8 @@ static int spawn_pipeline(void)
     aplay_pid = fork();
     if (aplay_pid < 0) {
         close(text_pipe[0]); close(text_pipe[1]);
-        close(audio_pipe[0]); close(audio_pipe[1]);
+        close(piper_out_pipe[0]); close(piper_out_pipe[1]);
+        close(aplay_in_pipe[0]); close(aplay_in_pipe[1]);
         kill(piper_pid, SIGKILL);
         waitpid(piper_pid, NULL, 0);
         piper_pid = -1;
@@ -257,16 +278,19 @@ static int spawn_pipeline(void)
         return -1;
     }
     if (aplay_pid == 0) {
-        /* Child: becomes aplay, resident for as long as piper (its
-         * upstream) stays alive and audio keeps arriving. */
-        dup2(audio_pipe[0], STDIN_FILENO);
+        /* Child: becomes aplay, resident while piper stays alive; stdin comes from aplay_in_pipe (relay thread's gain-scaled output), not directly from piper. */
+        dup2(aplay_in_pipe[0], STDIN_FILENO);
         silence_stdio();
         close(text_pipe[0]);
         close(text_pipe[1]);
-        close(audio_pipe[0]);
-        close(audio_pipe[1]);
+        close(piper_out_pipe[0]);
+        close(piper_out_pipe[1]);
+        close(aplay_in_pipe[0]);
+        close(aplay_in_pipe[1]);
 
+        /* -D plughw:vc4hdmi0,0 - target the hardware device by name (card index isn't stable across hotplug), bypassing dmix. Two real bugs found fixing this - see COMMENT_ARCHIVE.md. */
         execlp("aplay", "aplay",
+               "-D", "plughw:vc4hdmi0,0",
                "-r", rate_str,
                "-f", "S16_LE",
                "-t", "raw",
@@ -275,28 +299,42 @@ static int spawn_pipeline(void)
         _exit(127);
     }
 
-    /* This process (the speaker thread): keep text_pipe[1] open as our
-     * persistent write handle - THIS is what makes piper stay resident
-     * rather than seeing EOF and exiting after one line, since piper's
-     * stdin (text_pipe[0]) only sees EOF once every write-end reference
-     * is closed, and this is now the only one left. Close everything
-     * else - we have no further use for the raw fd numbers, only the
-     * dup'd copies each child now holds as its own stdin/stdout. */
+    /* Keep text_pipe[1] open as our persistent write handle - keeps piper resident rather than seeing EOF after one line; same idea for the audio pipes below. */
     piper_stdin_fd = text_pipe[1];
+    piper_out_fd = piper_out_pipe[0];
+    aplay_in_fd = aplay_in_pipe[1];
     close(text_pipe[0]);
-    close(audio_pipe[0]);
-    close(audio_pipe[1]);
+    close(piper_out_pipe[1]);
+    close(aplay_in_pipe[0]);
+
+    {
+        struct relay_args *ra = malloc(sizeof(*ra));
+        if (ra == NULL) {
+            close(piper_out_fd);
+            close(aplay_in_fd);
+            piper_out_fd = -1;
+            aplay_in_fd = -1;
+            return -1;
+        }
+        ra->in_fd = piper_out_fd;
+        ra->out_fd = aplay_in_fd;
+        if (pthread_create(&relay_tid, NULL, volume_relay_thread_main, ra) != 0) {
+            free(ra);
+            close(piper_out_fd);
+            close(aplay_in_fd);
+            piper_out_fd = -1;
+            aplay_in_fd = -1;
+            return -1;
+        }
+        /* Detached - nothing needs to join it; it exits and cleans itself up when kill_pipeline() closes these same fds out from under it. */
+        pthread_detach(relay_tid);
+    }
+
     pipeline_started_at = time(NULL);
     return 0;
 }
 
-/* Non-blocking check: are both piper and aplay still actually running?
- * waitpid(..., WNOHANG) returns 0 if the child is still alive, or a
- * positive pid / -1 if it has already exited (and reaps it, avoiding a
- * zombie either way) - either non-zero result means "gone." Called on
- * every speaker-thread loop iteration, whether idle or about to speak,
- * so an unexpected death is noticed regardless of whether new messages
- * are actively arriving. */
+/* Non-blocking check: are both piper and aplay still running? waitpid(..., WNOHANG) reaps and reports "gone" the moment either has exited. */
 static int pipeline_is_alive(void)
 {
     if (piper_pid <= 0 || aplay_pid <= 0) {
@@ -311,27 +349,16 @@ static int pipeline_is_alive(void)
     return 1;
 }
 
-/* The actual crash-recovery step: apply/grow backoff as appropriate,
- * wait, then respawn. Called from the speaker thread whenever
- * pipeline_is_alive() reports the pipeline is gone AND this wasn't a
- * deliberate stop_requested (destroy) kill - that path already does
- * its own immediate kill+respawn with backoff reset, since a destroy is
- * not a crash and shouldn't be throttled by unrelated crash-loop
- * history. */
+/* Crash-recovery step: grow/reset backoff, wait, then respawn. Called when pipeline_is_alive() reports the pipeline gone (not a deliberate stop_requested kill). */
 static void attempt_restart(void)
 {
     time_t now = time(NULL);
 
     if (now - pipeline_started_at >= HW_TTS_RESTART_HEALTHY_UPTIME_S) {
-        /* Ran fine for a good while before dying - treat this as an
-         * isolated incident, not evidence of a persistently broken
-         * install. */
+        /* Ran fine for a good while before dying - treat as an isolated incident, not a persistently broken install. */
         restart_backoff_s = HW_TTS_RESTART_BACKOFF_INITIAL_S;
     } else {
-        /* Died fast (or never started at all) - this looks like a real
-         * crash loop (missing binary, bad model file, etc). Grow the
-         * wait before trying again rather than hammering fork()/exec()
-         * in a tight loop. */
+        /* Died fast (or never started) - looks like a real crash loop; grow the wait rather than hammering fork()/exec() in a tight loop. */
         restart_backoff_s *= 2;
         if (restart_backoff_s > HW_TTS_RESTART_BACKOFF_MAX_S) {
             restart_backoff_s = HW_TTS_RESTART_BACKOFF_MAX_S;
@@ -340,14 +367,7 @@ static void attempt_restart(void)
 
     kill_pipeline(); /* clean up whatever's left, if anything */
     sleep((unsigned int)restart_backoff_s);
-    spawn_pipeline(); /* best-effort - on failure piper_pid/aplay_pid
-                          stay -1, pipeline_is_alive() will report dead
-                          again on the very next check, and this
-                          function runs again at the now-grown backoff.
-                          No separate "give up" state: this retries
-                          indefinitely, matching keyshare.c's
-                          retry-forever-with-backoff philosophy rather
-                          than failing permanently. */
+    spawn_pipeline(); /* best-effort - failure just means the next health check retries at the grown backoff; retries indefinitely */
 }
 
 static void *speaker_thread_main(void *arg)
@@ -370,9 +390,7 @@ static void *speaker_thread_main(void *arg)
             wait_rc = pthread_cond_timedwait(&queue_cond, &queue_mutex,
                                               &deadline);
             if (wait_rc == ETIMEDOUT) {
-                /* Periodic wakeup, nothing queued - break out to run
-                 * the health check below, then loop back into this
-                 * wait if there's still nothing to speak. */
+                /* Periodic wakeup, nothing queued - break out to run the health check below. */
                 break;
             }
         }
@@ -390,9 +408,7 @@ static void *speaker_thread_main(void *arg)
 
             kill_pipeline();
             spawn_pipeline();
-            /* An explicit destroy is not a crash - don't let backoff
-             * grown from some earlier, unrelated crash-loop carry over
-             * and needlessly delay the destroy's own respawn. */
+            /* An explicit destroy is not a crash - don't let backoff from some earlier crash-loop delay the destroy's own respawn. */
             restart_backoff_s = HW_TTS_RESTART_BACKOFF_INITIAL_S;
             continue;
         }
@@ -406,10 +422,7 @@ static void *speaker_thread_main(void *arg)
         }
         pthread_mutex_unlock(&queue_mutex);
 
-        /* Health check - runs every iteration, whether this was an
-         * idle periodic wakeup or we just dequeued a real message.
-         * Catches an unexpected piper/aplay death regardless of
-         * whether new messages happen to be arriving at the time. */
+        /* Health check - runs every iteration (idle wakeup or real message), catches an unexpected piper/aplay death either way. */
         if (!pipeline_is_alive()) {
             attempt_restart();
         }
@@ -418,12 +431,7 @@ static void *speaker_thread_main(void *arg)
             text_len = strlen(text);
             if (piper_stdin_fd >= 0 && text_len > 0) {
                 if (write(piper_stdin_fd, text, text_len) < 0) {
-                    /* Pipeline died in the narrow window between the
-                     * health check above and this write - recover now.
-                     * This one utterance is still lost (piper never
-                     * received it), but the pipeline itself heals for
-                     * the next one rather than staying silently broken
-                     * until the next periodic health check. */
+                    /* Pipeline died between the health check above and this write - recover now; this one utterance is lost but the pipeline heals. */
                     attempt_restart();
                 }
             }
@@ -435,8 +443,7 @@ static void *speaker_thread_main(void *arg)
 
 int hw_tts_init(void)
 {
-    { /* TEMP DEBUG marker - bypasses all stdio/journal/tty redirection
-         complexity by writing directly to a file. Remove once resolved. */
+    { /* TEMP DEBUG marker - writes directly to a file, bypassing stdio/journal/tty redirection; remove once resolved. */
         FILE *mf = fopen("/tmp/hw_tts_reached.marker", "w");
         if (mf) { fprintf(mf, "hw_tts_init() reached\n"); fclose(mf); }
     }
@@ -482,8 +489,7 @@ void hw_tts_speak(const char *text)
 
     pthread_mutex_lock(&queue_mutex);
     if (queue_count >= HW_TTS_QUEUE_MAX) {
-        /* Full - silently drop (see hw_tts.h's contract on why this is
-         * fine for TTS specifically, unlike outbox.c's queue). */
+        /* Full - silently drop (fine for TTS specifically, unlike outbox.c's queue - see hw_tts.h's contract). */
         pthread_mutex_unlock(&queue_mutex);
         return;
     }
@@ -505,9 +511,7 @@ void hw_tts_stop_and_clear(void)
     stop_requested = 1;
     pthread_cond_signal(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
-    /* Deliberately NOT waiting here for the speaker thread to finish
-     * the kill+respawn - see hw_tts.h's contract: this call must stay
-     * fast and never block the destroy path itself. */
+    /* Deliberately NOT waiting for the speaker thread to finish the kill+respawn - this call must stay fast and never block the destroy path. */
 }
 
 void hw_tts_shutdown(void)

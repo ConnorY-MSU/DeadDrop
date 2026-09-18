@@ -149,9 +149,7 @@ int main(void) {
     printf("[%s] CTR round-trip on non-block-aligned length (37 bytes)\n", odd_ok ? "PASS" : "FAIL");
     all_pass &= odd_ok;
 
-    /* ECB demonstration: two identical plaintext blocks, raw block cipher, no mode.
-       This is deliberately NOT how you'd ever actually use the cipher -- it's here
-       to prove, not just assert, why raw ECB leaks structure. */
+    /* ECB demonstration: two identical plaintext blocks, raw block cipher, no mode - proves why raw ECB leaks structure. */
     uint8_t ecb_block_a[16], ecb_block_b[16];
     hex_to_bytes("11111111111111111111111111111111", ecb_block_a); /* identical plaintext on purpose */
     hex_to_bytes("11111111111111111111111111111111", ecb_block_b);

@@ -9,20 +9,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-/*
- * run_nmcli - fork()+execvp() argv[0] (almost always "nmcli" - see
- * wifi_connect()'s own comment for the one exception, "sudo", which
- * then execs nmcli itself as ITS argv[1]) with the given NULL-
- * terminated argv, capturing combined stdout+stderr into out_buf
- * (NUL-terminated, truncated if it doesn't fit - pass NULL/0 to
- * discard output entirely, e.g. for wifi_has_connectivity()
- * piggy-backing on this same helper isn't needed there, but
- * scan/connect both want it).
- * Deliberately no shell involved at all - see wifi.h's SECURITY NOTE.
- *
- * Returns nmcli's exit status (0 = success) on a normal exit, or -1 if
- * the fork/pipe itself failed or the child didn't exit normally.
- */
+/* run_nmcli - fork()+execvp() argv (no shell, see wifi.h SECURITY NOTE), capturing stdout+stderr into out_buf; returns nmcli's exit status or -1. See COMMENT_ARCHIVE.md for a real bug this fixed. */
 static int run_nmcli(char *const argv[], char *out_buf, size_t out_buf_size)
 {
     int pipefd[2];
@@ -51,15 +38,7 @@ static int run_nmcli(char *const argv[], char *out_buf, size_t out_buf_size)
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
-        execvp(argv[0], argv); /* argv[0] IS the executable to run -
-            almost always "nmcli", but wifi_connect() also passes
-            "sudo" (nmcli as ITS argv[1]) for the one operation that
-            genuinely needs elevated NetworkManager permissions - see
-            its own comment. Previously hardcoded to "nmcli" here
-            regardless of argv[0]'s actual value, which would have
-            silently made a "sudo" prefix a no-op (execvp'd "nmcli"
-            directly anyway, ignoring argv[0] entirely, still running
-            unprivileged) rather than genuinely elevating anything. */
+        execvp(argv[0], argv); /* argv[0] is the executable - see COMMENT_ARCHIVE.md for a real bug where this was hardcoded instead */
         _exit(127); /* execvp only returns on failure */
     }
 
@@ -92,36 +71,10 @@ static int run_nmcli(char *const argv[], char *out_buf, size_t out_buf_size)
     return WEXITSTATUS(status);
 }
 
-/* A real 802.11 scan has to dwell on every channel it probes - both
- * bands, ~11+ channels on 2.4GHz alone plus a much longer 5GHz channel
- * list (see this project's own real scan results: 11 distinct
- * frequencies just for two SSIDs at one property) - which genuinely
- * takes multiple seconds to cover, not a single instant read. `nmcli
- * device wifi rescan` itself only REQUESTS a scan and returns
- * immediately, asynchronously, well before it's actually finished -
- * see wifi_scan()'s own comment for the real-world consequence found
- * this same night (a network genuinely in range not showing up in the
- * results) and why this wait exists at all instead of being
- * "obviously" pointless. */
+/* `nmcli device wifi rescan` only requests a scan; this is how long we wait for it to settle. See COMMENT_ARCHIVE.md. */
 #define WIFI_SCAN_SETTLE_SECONDS 4
 
-/* parse_escaped_ssid_field - shared by wifi_scan() and
- * wifi_get_link_info(), extracted during the 2026-08-23 security audit
- * (previously duplicated inline in both, byte-for-byte identical logic
- * in two places - a real risk that a future fix to one copy wouldn't
- * get applied to the other, the same silent-divergence bug class this
- * project has hit before). Parses one colon-delimited, colon-escaped
- * ("\:" for a literal ':') SSID field starting at *cursor, writes up
- * to out_size-1 bytes (always NUL-terminated, silently truncating a
- * pathologically long SSID rather than overflowing - real 802.11 SSIDs
- * are capped at 32 bytes by the standard itself, but this is parsing
- * text from an external CLI tool's output, not trusting that cap
- * structurally). Advances *cursor past the field's trailing colon (to
- * the start of whatever field follows) - if the line ends before an
- * unescaped colon is found, *cursor is left at the terminating NUL.
- * Genuinely fuzz-tested (build/wifi_fuzz.c, throwaway, ASan+UBSan,
- * random+mutated inputs) after this extraction specifically so both
- * call sites get that coverage instead of neither. */
+/* parse_escaped_ssid_field - parses one colon-delimited, "\:"-escaped SSID field at *cursor into out_ssid, advancing *cursor past it. Fuzz-tested (build/wifi_fuzz.c). See COMMENT_ARCHIVE.md. */
 static void parse_escaped_ssid_field(const char **cursor, char *out_ssid,
                                        size_t out_size)
 {
@@ -129,12 +82,7 @@ static void parse_escaped_ssid_field(const char **cursor, char *out_ssid,
     size_t si = 0;
 
     if (out_size == 0) {
-        /* Defensive only - every real call site passes a fixed,
-         * non-zero stack/struct buffer size, never a caller-supplied
-         * variable, so this never actually triggers. Guards against
-         * out_size - 1 underflowing to SIZE_MAX below if that ever
-         * changes, rather than relying on "no caller would ever do
-         * that" being true forever. */
+        /* Defensive only - no real call site passes 0. */
         *cursor = p;
         return;
     }
@@ -170,43 +118,7 @@ int wifi_scan(wifi_network *out_networks, int max_results)
         return -1;
     }
 
-    /* REAL BUG FOUND AND FIXED (2026-08-23): this used to go straight
-     * to `nmcli device wifi list` with no rescan of its own - just
-     * reading whatever NetworkManager already had cached, which can be
-     * stale or incomplete (a scan that happened a while ago, was
-     * throttled, or never covered every channel yet) rather than a
-     * genuine, current picture of every network actually in range.
-     * Confirmed directly on real hardware: a network confirmed
-     * physically in range didn't always show up in a single
-     * uncoerced `list` call. Forcing a real rescan and giving it a
-     * few real seconds to actually finish (see
-     * WIFI_SCAN_SETTLE_SECONDS's own comment) before reading results
-     * makes every Ctrl+W scan genuinely current instead of trusting
-     * however fresh nmcli's last cache happened to be. Best-effort -
-     * if the rescan request itself fails (e.g. NetworkManager
-     * throttling an immediately-repeated one), fall straight through
-     * to reading whatever's cached anyway, exactly as this always
-     * did, rather than aborting the whole scan over it.
-     *
-     * SECOND REAL BUG, found immediately after deploying the above:
-     * `nmcli device wifi rescan` ALSO requires the same elevated
-     * NetworkManager privilege `wifi_connect()` needed fixed earlier
-     * tonight - confirmed directly, unprivileged, on real hardware:
-     * `Error: org.freedesktop.NetworkManager.wifi.scan request failed:
-     * not authorized.` Without `sudo` here too, this call was silently
-     * failing on every single invocation (best-effort design silently
-     * swallowed the error, exactly as intended for THROTTLING, but
-     * this wasn't throttling - it never worked at all as this
-     * unprivileged user) - meaning every Ctrl+W scan was actually
-     * still just reading whatever NetworkManager happened to have
-     * cached already, the exact bug this rescan was supposed to fix,
-     * completely undetected until live testing showed only the
-     * currently-associated SSID appearing in the results (real
-     * networks confirmed in range never showed up until something
-     * ELSE - a successful sudo'd connect() call, which happens to
-     * refresh NetworkManager's scan state as a side effect - forced a
-     * cache refresh). `wifi_connect()`'s own equivalent rescan call
-     * below has the identical fix for the identical reason. */
+    /* Force a fresh rescan (sudo, best-effort) before reading results so every Ctrl+W scan is current. See COMMENT_ARCHIVE.md for two real bugs fixed here. */
     run_nmcli(rescan_argv, NULL, 0);
     sleep(WIFI_SCAN_SETTLE_SECONDS);
 
@@ -216,10 +128,7 @@ int wifi_scan(wifi_network *out_networks, int max_results)
 
     line = strtok_r(buf, "\n", &saveptr);
     while (line != NULL && count < max_results) {
-        /* nmcli's terse (-t) output is colon-delimited, with a
-         * literal ':' inside a field escaped as '\:' - the only
-         * escape this format uses. Split on the first UNESCAPED
-         * colon to separate SSID from SECURITY. */
+        /* nmcli's terse (-t) output is colon-delimited; split on the first unescaped colon to separate SSID from SECURITY. */
         char ssid[WIFI_SSID_MAX];
         const char *p = line;
         int secured;
@@ -228,23 +137,7 @@ int wifi_scan(wifi_network *out_networks, int max_results)
         parse_escaped_ssid_field(&p, ssid, sizeof(ssid));
         si = strlen(ssid);
 
-        /* REAL BUG FOUND AND FIXED (2026-08-23): nmcli's *human-
-         * readable* SECURITY column prints "--" for an open network,
-         * but this is TERSE (-t) output, which uses a genuinely
-         * different convention - an open network's SECURITY field is
-         * simply EMPTY (confirmed byte-for-byte on real hardware:
-         * "The Arrow:" with literally nothing after the colon, not
-         * "The Arrow:--"). The old `strstr(p, "--") == NULL` check
-         * treated an empty string as "no '--' found" -> secured=1,
-         * meaning every genuinely open network was silently
-         * misreported as needing a password - the Ctrl+W flow would
-         * prompt for one it should never have asked for, and
-         * wifi_connect() would then pass that unnecessary password to
-         * an open network's connect call. Fixed to check for a
-         * genuinely non-empty security string instead - open (empty)
-         * -> unsecured, anything else (WPA1/2/3, WEP, 802.1X, ...) ->
-         * secured, matching terse mode's actual convention rather
-         * than the human-readable one this was written against. */
+        /* Terse mode's open-network convention differs from human-readable mode. See COMMENT_ARCHIVE.md for the bug this fixed. */
         secured = (p[0] != '\0');
 
         if (si > 0) {
@@ -280,62 +173,12 @@ int wifi_connect(const char *ssid, const char *password,
         return -1;
     }
 
-    /* REAL BUG FOUND AND FIXED (2026-08-23): this service runs as an
-     * unprivileged user (see deaddrop-alpha.service/-bravo.service's
-     * User=connor), and plain `nmcli device wifi connect` for an SSID
-     * with no existing saved connection profile requires NetworkManager
-     * to ADD a brand new system-wide profile, not just activate one
-     * that's already there - a genuinely different, more privileged
-     * polkit action than scanning or activating an already-known
-     * connection (which is why wifi_scan()/wifi_has_connectivity()
-     * above and the already-known BDH-public profile's own automatic
-     * boot-time activation both work fine unprivileged, while this one
-     * call never did). Confirmed directly via journalctl -u
-     * NetworkManager: every real Ctrl+W connect attempt failed with
-     * `op="connection-add-activate" ... uid=1000 result="fail"
-     * reason="Not authorized to control networking."` - meaning this
-     * whole feature silently failed on every genuinely new network,
-     * every time, in the real deployed service - not a timeout, not
-     * specific to any one SSID. `sudo` (already relies on this
-     * project's own established NOPASSWD sudoers entry, same as every
-     * other elevated call this project makes - never an interactive
-     * password prompt) resolves it: confirmed live, the identical
-     * command succeeded immediately (well under 10 seconds, full
-     * association + DHCP) the moment it ran as uid=0 instead of 1000.
-     *
-     * SECOND REAL BUG FOUND THE SAME NIGHT, once the first one stopped
-     * masking it: a quick retry (Ctrl+W again shortly after a failed
-     * attempt - a real, expected user reaction, not an edge case) can
-     * fail with `reason="Failed to determine AP security information"`
-     * even for an SSID that scanned fine moments earlier - confirmed
-     * live via journalctl -u NetworkManager. NetworkManager throttles
-     * how often `nmcli device wifi list` actually re-scans the radio
-     * (an implicit scan on every call would be wasteful/slow), so a
-     * retry soon enough after a failed association can hit a stale or
-     * momentarily-invalidated cache entry for that specific SSID -
-     * nmcli then can't determine what security type to build the new
-     * connection profile with at all, and fails outright rather than
-     * guessing. An explicit, forced rescan immediately before
-     * connecting (best-effort - if it fails or nmcli throttles it
-     * anyway, fall straight through to the connect attempt exactly as
-     * before rather than aborting early) makes the immediately-prior
-     * scan genuinely fresh right when it matters most, rather than
-     * trusting whatever nmcli happened to have cached from the
-     * original Ctrl+W scan a failed attempt (and possibly a real
-     * pause while the user typed a password) ago.
-     *
-     * Needs `sudo` too - `nmcli device wifi rescan` requires the same
-     * elevated NetworkManager privilege as the connect call below;
-     * confirmed live (`... not authorized.` unprivileged) the same
-     * night this was first written without it - see wifi_scan()'s own
-     * matching rescan call for the full story of how that got missed
-     * here originally. */
+    /* Connecting needs sudo and a fresh rescan first to avoid a stale-cache failure. See COMMENT_ARCHIVE.md for three real bugs fixed here. */
     {
         char *rescan_argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
                                   (char *)"wifi", (char *)"rescan", NULL };
         run_nmcli(rescan_argv, NULL, 0); /* best-effort - ignore rc */
-        sleep(2); /* give the radio a moment to actually complete the
-                     scan before the connect attempt below reads it */
+        sleep(2); /* let the radio finish the scan before connecting */
     }
 
     if (password != NULL && password[0] != '\0') {
@@ -391,13 +234,8 @@ int wifi_get_link_info(wifi_link_info *out_info)
 
     line = strtok_r(buf, "\n", &saveptr);
     while (line != NULL) {
-        /* Only the "active:...(yes)" row (there's at most one) is the
-         * one we want - every other row is a different visible AP for
-         * the same or a different SSID, not this device's own link. */
+        /* Only the "active:...(yes)" row (at most one) is this device's own link. */
         if (strncmp(line, "yes:", 4) == 0) {
-            /* Same escaped-colon-aware SSID parsing as wifi_scan() -
-             * an SSID can legitimately contain a literal ':', escaped
-             * as '\:' in nmcli's terse output. */
             const char *p = line + 4;
 
             parse_escaped_ssid_field(&p, out_info->ssid,
@@ -422,11 +260,7 @@ int wifi_get_link_info(wifi_link_info *out_info)
 
 #else /* !__linux__ */
 
-/* This project's Windows dev machine has no NetworkManager/nmcli, and
- * the WiFi setup screen is a Linux/ncurses-only UI feature (see
- * ui.c) - these stubs exist only so callers can link on either
- * platform without #ifdef guards at every call site, matching
- * hw_expansion.h's established precedent. */
+/* No nmcli on non-Linux (WiFi setup screen is Linux/ncurses-only, see ui.c); these stubs let callers link unconditionally. */
 
 int wifi_scan(wifi_network *out_networks, int max_results)
 {
@@ -448,8 +282,7 @@ int wifi_connect(const char *ssid, const char *password,
 
 int wifi_has_connectivity(void)
 {
-    return 1; /* assume yes - this path is never actually exercised
-               * (no WiFi setup screen exists on non-Linux, see ui.c) */
+    return 1; /* assume yes - never exercised on non-Linux */
 }
 
 int wifi_get_link_info(wifi_link_info *out_info)

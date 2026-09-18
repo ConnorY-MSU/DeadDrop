@@ -12,17 +12,14 @@
 
 #define DD_VERSION          1
 
-#define DD_HEADER_SIZE      12   /* version(1) + msg_type(1) + reserved(2)
-                                   * + seq_num(4) + body_length(4) */
+#define DD_HEADER_SIZE      12   /* version(1) + msg_type(1) + reserved(2) + seq_num(4) + body_length(4) */
 #define DD_HMAC_SIZE         32
 #define DD_MAX_BODY_LEN   65536  /* PROTOCOL.md: 64 KiB cap */
 #define DD_MAX_MSG_SIZE     (DD_HEADER_SIZE + DD_MAX_BODY_LEN + DD_HMAC_SIZE)
 
 #define DD_HMAC_KEY_SIZE     32
 
-/* TLS exporter label used to derive the per-session HMAC key. Prefixed
- * EXPERIMENTAL- per RFC 8446 4.2.7 since it's not an IANA-registered
- * label. See docs/PROTOCOL.md "HMAC key derivation". */
+/* TLS exporter label used to derive the per-session HMAC key; EXPERIMENTAL- prefix per RFC 8446 4.2.7 (not IANA-registered). */
 #define DD_HMAC_KEY_LABEL "EXPERIMENTAL-DeadDrop-HMAC-Key"
 
 typedef enum {
@@ -30,40 +27,15 @@ typedef enum {
     DD_MSG_PING         = 0x02,
     DD_MSG_PONG         = 0x03,
     DD_MSG_DISCONNECT   = 0x04,
-    DD_MSG_ACK          = 0x05, /* body: 4 bytes BE, the seq_num of the
-                                    TEXT_MESSAGE being acknowledged - see
-                                    docs/PROTOCOL.md */
-    DD_MSG_FILE         = 0x06, /* body: [2-byte filename_len BE]
-                                    [filename bytes][file data] - see
-                                    docs/PROTOCOL.md for the size cap */
-    DD_MSG_DESTROY      = 0x07  /* body: none. The "/destroy CONFIRM"
-                                    emergency-wipe command - see
-                                    docs/PROTOCOL.md and session.c's
-                                    perform_local_destroy(). No body/nonce
-                                    needed: this arrives over an already
-                                    mutually-authenticated, replay-protected
-                                    session (see seq_num handling below),
-                                    so its mere authenticated arrival is
-                                    the only confirmation that matters -
-                                    the peer's own identity already proved
-                                    itself during the mTLS handshake. */
+    DD_MSG_ACK          = 0x05, /* body: 4 bytes BE, the seq_num of the TEXT_MESSAGE being acknowledged */
+    DD_MSG_FILE         = 0x06, /* body: [2-byte filename_len BE][filename bytes][file data] */
+    DD_MSG_DESTROY      = 0x07  /* body: none; the "/destroy CONFIRM" emergency-wipe command, no nonce needed (already authenticated/replay-protected) */
 } dd_msg_type;
 
-#define DD_FILE_NAME_LEN_SIZE 2 /* the 2-byte length prefix within a
-    DD_MSG_FILE body - kept as its own constant since both the sender
-    (building the body) and receiver (parsing it back apart) need to
-    agree on this exact offset */
-#define DD_FILE_NAME_MAX 255   /* generous for a real filename, small
-    enough that even a maximally-long name still leaves the overwhelming
-    majority of DD_MAX_BODY_LEN for actual file content */
+#define DD_FILE_NAME_LEN_SIZE 2 /* 2-byte length prefix within a DD_MSG_FILE body */
+#define DD_FILE_NAME_MAX 255   /* generous for a real filename, leaves most of DD_MAX_BODY_LEN for actual file content */
 
-/*
- * Per-TLS-session framing/replay state. Create one fresh instance per
- * connection (client: per connect; server: per accepted connection) via
- * dd_session_init() -- this is what makes seq_num reset to 0 on every new
- * session, as docs/PROTOCOL.md requires: the state simply doesn't exist
- * yet for a session until dd_session_init() creates it.
- */
+/* Per-TLS-session framing/replay state; create one fresh instance per connection via dd_session_init(). */
 typedef struct {
     uint8_t  hmac_key[DD_HMAC_KEY_SIZE]; /* derived via TLS exporter */
     uint32_t next_seq_num;               /* next seq_num WE will send */
@@ -71,31 +43,10 @@ typedef struct {
     int      have_seen_any;              /* 0 until first peer msg accepted */
 } dd_session_state;
 
-/*
- * dd_session_init - derive the per-session HMAC key from the already-
- * completed TLS 1.3 handshake (via wolfSSL_export_keying_material(), RFC
- * 5705/RFC 8446 7.5) and reset seq_num state for a brand new session.
- *
- * ssl: a WOLFSSL* whose handshake (wolfSSL_connect/wolfSSL_accept) has
- *      already completed successfully.
- * state: caller-owned state to initialize.
- * Returns 0 on success, -1 if the exporter call fails (e.g. this
- * wolfSSL build lacks HAVE_KEYING_MATERIAL -- see docs/BUILD.md).
- */
+/* dd_session_init - derive the per-session HMAC key from the completed TLS 1.3 handshake and reset seq_num state. Returns 0, or -1 on failure. */
 int dd_session_init(WOLFSSL *ssl, dd_session_state *state);
 
-/*
- * dd_serialize_message - build one complete wire message (header + body +
- * HMAC tag) into out_buf, and consume the next outgoing seq_num.
- *
- * state: session state; state->next_seq_num is used and then incremented.
- * msg_type: one of the dd_msg_type values.
- * body/body_len: message payload. body may be NULL iff body_len == 0.
- * out_buf/out_buf_size: caller-owned destination buffer.
- *
- * Returns the total number of bytes written (>0) on success, or -1 if
- * body_len exceeds DD_MAX_BODY_LEN or out_buf_size is too small.
- */
+/* dd_serialize_message - build one complete wire message (header + body + HMAC tag) into out_buf, consuming the next seq_num. Returns bytes written, or -1. */
 int dd_serialize_message(dd_session_state *state, uint8_t msg_type,
                           const uint8_t *body, uint32_t body_len,
                           uint8_t *out_buf, size_t out_buf_size);
@@ -103,8 +54,7 @@ int dd_serialize_message(dd_session_state *state, uint8_t msg_type,
 typedef enum {
     DD_PARSE_INCOMPLETE = 0, /* not enough bytes buffered yet - read more */
     DD_PARSE_OK         = 1, /* one full, valid message parsed */
-    DD_PARSE_REJECTED   = 2  /* a full message was present but failed
-                               * validation (bad version/type/seq/hmac) */
+    DD_PARSE_REJECTED   = 2  /* a full message was present but failed validation (bad version/type/seq/hmac) */
 } dd_parse_result;
 
 typedef struct {
@@ -115,29 +65,7 @@ typedef struct {
     const uint8_t *body; /* points into caller's buffer; not owned/copied */
 } dd_parsed_message;
 
-/*
- * dd_try_parse_message - attempt to parse exactly one message from the
- * front of buf[0..have). Designed to be called in a loop: after consuming
- * one message, call again on the remainder to pick up a second message
- * that arrived in the same read() (see docs -- this is the "single
- * wolfSSL_read() returning two messages at once" case).
- *
- * state: session state; on DD_PARSE_OK, last_seen_seq_num/have_seen_any
- *        are updated. Not modified on DD_PARSE_INCOMPLETE or REJECTED.
- * buf/have: the receive buffer and how many valid bytes are in it.
- * out_msg: filled in on DD_PARSE_OK (body points into buf - copy it out
- *          before the caller memmove()s the buffer if you need to keep it).
- * consumed: on DD_PARSE_OK or DD_PARSE_REJECTED with a full message
- *           present, set to the number of bytes that message occupied --
- *           caller must memmove/advance past exactly this many bytes.
- *           On DD_PARSE_INCOMPLETE, or on the "implausible body_length"
- *           rejection case, *consumed is set to 0: the receiver cannot
- *           determine a message boundary at all in that situation, and
- *           the connection should be treated as desynchronized and closed
- *           rather than resynchronized speculatively.
- *
- * Returns DD_PARSE_INCOMPLETE if buf doesn't yet hold a full message.
- */
+/* dd_try_parse_message - parse one message from buf[0..have); call in a loop for multiple messages. out_msg->body points into buf - copy before memmove(). */
 dd_parse_result dd_try_parse_message(dd_session_state *state,
                                       const uint8_t *buf, size_t have,
                                       dd_parsed_message *out_msg,

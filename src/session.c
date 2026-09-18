@@ -14,15 +14,12 @@
 #include "hw_expansion.h"
 #include "hw_oled.h"
 #include "hw_tts.h"
+#include "hw_volume.h"
 #include "ui.h"
 #include "outbox.h"
 #include "msglog.h"
 
-/* Platform bits this file needs beyond what session.h already brought in
- * (socket_t, winsock2.h on Windows). Kept local rather than folded into
- * session.h - session.h's callers don't need to know shutdown()
- * semantics, only this implementation does, same "platform knowledge
- * lives only where it's used" precedent client.c/server.c already set. */
+/* Platform bits beyond what session.h brought in (socket_t, winsock2.h) - shutdown() semantics are local to this .c. */
 #ifdef _WIN32
     #define SHUTDOWN_READ(s) shutdown((s), SD_RECEIVE)
     #include <direct.h>
@@ -35,91 +32,19 @@
     #define SHUTDOWN_READ(s) shutdown((s), SHUT_RD)
     #define MKDIR(path) mkdir((path), 0700)
 #endif
-/* dirent.h - needed by wipe_directory_contents() (see the "/destroy
- * CONFIRM" emergency-wipe block below) to enumerate ~/.deaddrop/received/
- * for deletion. Available on both real targets: POSIX natively, and
- * MinGW-w64 (this project's Windows dev-machine toolchain, per
- * docs/BUILD.md's UCRT64 setup) ships a compatible shim - no #ifdef
- * split needed, unlike the raw socket/directory-creation APIs above. */
+/* dirent.h - used by wipe_directory_contents() ("/destroy CONFIRM" below); available on both real targets, no #ifdef split needed. */
 #include <dirent.h>
 
-/* How often the sender loop wakes up (if nothing's been typed) to
- * re-check whether the receiver thread has ended the session. Bounds the
- * worst-case delay between "peer disconnected" and this side noticing
- * and returning, when the local user hasn't typed anything. Also bounds
- * (on the real ncurses UI path) how long an incoming message's display
- * can be delayed by a concurrent ui_poll_line() wait - see ui.c's
- * ui_mutex comment. 200ms: responsive enough that neither delay is
- * perceptible, without busy-looping. Also the granularity at which the
- * periodic PING/RTT check below re-checks whether it's due. */
+/* How often the sender loop wakes to re-check for a peer disconnect; also the PING/watchdog check granularity. 200ms: responsive without busy-looping. */
 #define STDIN_POLL_MS 200
 
-/* How often the sender loop sends a PING purely for a live RTT/link-
- * quality reading (see ui_report_rtt(), which feeds the OLED metrics
- * section). ALSO now doubles as the watchdog's own heartbeat interval -
- * see SESSION_WATCHDOG_TIMEOUT_SECONDS below - since the comment this
- * replaced ("session.c already detects a dead connection via
- * wolfSSL_read() returning <= 0, independent of this") turned out to be
- * WRONG for a genuinely silent peer loss (see that #define's own
- * comment for the real story, found via a live test). */
+/* How often the sender loop sends a PING for RTT/link-quality (ui_report_rtt()); also the watchdog heartbeat interval. */
 #define SESSION_PING_INTERVAL_SECONDS 10
 
-/* REAL BUG FOUND AND FIXED (2026-08-22): a genuinely silent peer loss
- * (network cable pulled, power lost - no FIN/RST ever arrives, unlike a
- * graceful close/quit, which this project's code already detects
- * instantly via wolfSSL_read() returning <= 0) went undetected
- * INDEFINITELY - not just slowly, literally forever - despite
- * CONN_TIMEOUT_SECONDS (client.c/server.c, 30s) being set via
- * SO_RCVTIMEO on the raw socket. Root-caused via a live test (an
- * iptables DROP rule silently discarding all traffic to/from the peer,
- * simulating a real unplug) plus gdb (confirmed the receiver thread
- * genuinely blocked inside the kernel's own recv() syscall, 80+ seconds
- * in) plus a direct getsockopt() check (confirmed SO_RCVTIMEO really
- * was 30s at handshake time - the value itself was never wrong). The
- * actual cause: clear_recv_timeout() (below) deliberately RESETS
- * SO_RCVTIMEO to 0 (block indefinitely) the moment a session goes live,
- * specifically so a normal idle chat session doesn't spuriously
- * disconnect every 30s of real silence - a genuinely correct design
- * choice for the "peer is fine, just not talking right now" case, which
- * simply has no read timeout left at all for the "peer's network
- * silently died" case. An earlier attempt at fixing this by calling
- * wolfSSL_set_using_nonblock() (based on a wolfSSL WANT_READ/blocking-
- * socket quirk that seemed plausible at the time) did NOT help, because
- * it was solving for the wrong layer - there was no timeout event to
- * surface in the first place.
- *
- * Fixed with an explicit application-level watchdog instead of relying
- * on the OS socket timeout for this: the sender loop already wakes up
- * regularly to send a periodic PING (SESSION_PING_INTERVAL_SECONDS)
- * purely for RTT reporting - it now ALSO checks how long it's been
- * since ANY data was actually received from the peer
- * (ctx.last_recv_epoch, updated by the receiver thread on every
- * successfully parsed message - see receiver_thread_main()). If that
- * exceeds this timeout, the sender loop forcibly calls SHUTDOWN_READ()
- * on the raw socket - the EXACT SAME mechanism this file already uses
- * to unblock a receiver thread stuck in a blocking read when the LOCAL
- * user quits (see this function's other SHUTDOWN_READ() call) - which
- * guarantees the blocked recv() returns immediately, REGARDLESS of
- * wolfSSL's internal retry behavior, since a shutdown() on the read
- * side of a socket is a hard, unconditional OS-level guarantee, not
- * something that depends on getting wolfSSL's blocking/non-blocking
- * semantics exactly right. Set to less than 3 PING intervals - long
- * enough that a single lost PING or a slow link doesn't cause a false
- * disconnect, short enough that a real loss is caught in well under a
- * minute rather than never. */
+/* Application-level watchdog for a silent peer loss (no FIN/RST) since clear_recv_timeout() disables the OS read timeout once live. Real bug found and fixed here - see COMMENT_ARCHIVE.md. */
 #define SESSION_WATCHDOG_TIMEOUT_SECONDS 25
 
-/*
- * clear_recv_timeout - undo client.c/server.c's pre-handshake SO_RCVTIMEO
- * (CONN_TIMEOUT_SECONDS) on the raw socket. See session.h's "IMPORTANT
- * for callers" comment above run_symmetric_session() for the full
- * reasoning: that timeout exists to bound a stalled connect/handshake,
- * but a receiver thread legitimately blocking in wolfSSL_read() for a
- * long time during an idle chat is normal, not a failure - leaving the
- * old timeout in place would silently disconnect and reconnect roughly
- * every CONN_TIMEOUT_SECONDS of real idle time. A value of 0 means "no
- * timeout, block indefinitely" on both Windows and POSIX. SO_SNDTIMEO is
- * deliberately left alone - see the header comment. */
+/* clear_recv_timeout - undo client.c/server.c's pre-handshake SO_RCVTIMEO once a session is live so an idle chat doesn't spuriously disconnect; 0 = block indefinitely. */
 static void clear_recv_timeout(socket_t s)
 {
 #ifdef _WIN32
@@ -134,12 +59,7 @@ static void clear_recv_timeout(socket_t s)
 #endif
 }
 
-/* monotonic_now - clock_gettime(CLOCK_MONOTONIC), returned as a plain
- * struct timespec. Used for both the periodic-PING interval check and
- * RTT measurement. Confirmed working on both this project's real
- * targets (native Linux, and this project's Windows/UCRT64 dev machine)
- * during Week 3 Day 4's benchmark.c work - not a new, unverified
- * assumption. */
+/* monotonic_now - clock_gettime(CLOCK_MONOTONIC) as a struct timespec, used for PING interval checks and RTT measurement. */
 static struct timespec monotonic_now(void)
 {
     struct timespec ts;
@@ -153,20 +73,9 @@ static double ms_between(struct timespec a, struct timespec b)
            (b.tv_nsec - a.tv_nsec) / 1.0e6;
 }
 
-/* --- Shared state between the two threads ----------------------------
- *
- * See session.h's design comment for the full reasoning on why sends
- * need a mutex around the whole serialize+write pair while parses need
- * none at all.
- */
-#define SESSION_PENDING_ACK_MAX 8      /* how many of OUR OWN recently-
-    sent TEXT_MESSAGEs we track waiting for their ACK - bounded, not
-    unbounded: a circular buffer, oldest untracked entries are simply no
-    longer confirmable by name once evicted (an ACK for one of those
-    still arrives and is harmlessly ignored - see consume_pending_ack()),
-    which is an acceptable, honestly-scoped limit for what is fundamentally
-    a nice-to-have delivery indicator, not a guaranteed-exactly-once
-    tracking system. */
+/* --- Shared state between the two threads --- */
+/* See session.h: sends need a mutex around the whole serialize+write pair; parses need none. */
+#define SESSION_PENDING_ACK_MAX 8      /* how many recently-sent TEXT_MESSAGEs we track for ACKs - bounded circular buffer, eviction just drops delivery-indicator tracking */
 #define SESSION_ACK_PREVIEW_LEN 48
 
 typedef struct {
@@ -177,73 +86,24 @@ typedef struct {
 
 typedef struct {
     dd_session_state *state;
-    WOLFSSL *ssl_read;   /* original object, read-only after write_dup -
-                           * used only by the receiver thread */
-    WOLFSSL *ssl_write;  /* write_dup()'d object - used by BOTH threads
-                           * (local user sends, receiver's PONG/ACK auto-
-                           * replies), protected by send_mutex */
+    WOLFSSL *ssl_read;   /* original object, read-only after write_dup - used only by the receiver thread */
+    WOLFSSL *ssl_write;  /* write_dup()'d object - used by BOTH threads, protected by send_mutex */
     pthread_mutex_t send_mutex;
 
-    /* Also protected by send_mutex (reused rather than adding a second
-     * lock for two small pieces of state that are only ever touched
-     * from inside/around the same critical sections session_send()
-     * already takes) - see session_send()'s and the two helper
-     * functions' comments below. */
+    /* Also protected by send_mutex (reused rather than a second lock) - see session_send() and the helpers below. */
     pending_ack_entry pending_acks[SESSION_PENDING_ACK_MAX];
     int pending_ack_next_slot;
     int ping_outstanding;
     struct timespec ping_sent_at;
 
-    volatile int peer_ended;  /* set by the receiver thread once IT
-                                * decides the session is over (peer
-                                * DISCONNECT, read error/close, or an
-                                * invalid message) */
-    volatile long last_recv_epoch; /* time(NULL) as of the last message
-                                * successfully received from the peer -
-                                * see SESSION_WATCHDOG_TIMEOUT_SECONDS'
-                                * comment for why this exists: written by
-                                * the receiver thread, read by the sender
-                                * loop, a single word so a lockless
-                                * read/write pair is fine for a liveness
-                                * heuristic (not a correctness-critical
-                                * value) */
-    volatile int should_stop; /* set by the main thread once IT decides
-                                * the session is over (user quit/EOF) -
-                                * documentation of intent; shutdown() on
-                                * the raw socket is the actual mechanism
-                                * that unblocks a receiver thread sitting
-                                * in a blocking read */
+    volatile int peer_ended;  /* set by the receiver thread once the session is over (DISCONNECT, read error/close, or invalid message) */
+    volatile long last_recv_epoch; /* time(NULL) of last message received - see SESSION_WATCHDOG_TIMEOUT_SECONDS; lockless liveness heuristic */
+    volatile int should_stop; /* set once the main thread decides the session is over; unblock mechanism is shutdown() on the raw socket */
 
-    int hw_fd;   /* connection-level RGB status is still owned by the
-                  * caller (client.c/server.c's connect loop) - this is
-                  * used only for the message-pending flash (see
-                  * ui_notify_message_pending()), below. */
+    int hw_fd;   /* RGB status owned by the caller (client.c/server.c) - used here only for the message-pending flash */
     int oled_fd;
     const char *peer_label;
-    const char *self_label; /* 2026-08-23 (direct request): the OTHER
-        device's capitalized name is already carried above as
-        peer_label (client.c passes "Bravo", server.c passes "Alpha" -
-        see run_symmetric_session()'s own comment); this is THIS
-        device's own capitalized name, inferred the same way ui.c's
-        g_self_is_alpha is (peer_label != "Bravo" implies self is
-        "Alpha", given this project's fixed two-device architecture -
-        see g_self_is_alpha's declaration comment in ui.c for the full
-        reasoning). Set once in run_symmetric_session() below and used
-        everywhere this file used to hardcode the literal sentinel
-        "you" for a locally-sent message's prefix - both for
-        msglog_append()/msglog_append_saved() (so a PERSISTED message,
-        replayed on a future boot via replay_msglog_into_pad_locked(),
-        shows the real device name directly rather than "you" - that
-        replay path writes msglog's raw stored text straight into the
-        history pane and does NOT go through ui_add_history_ex()'s own
-        "you"-substitution logic, so relying on that substitution alone
-        would leave replayed history permanently inconsistent with live
-        messages) and for ui_add_history()/ui_add_historyf() (where it's
-        redundant with ui_add_history_ex()'s own substitution today, but
-        keeping both paths passing the same real name rather than one
-        passing "you" and relying on a second layer to translate it is
-        simpler to reason about and keeps this file's own persisted and
-        on-screen text identical, not just the on-screen text alone). */
+    const char *self_label; /* this device's own capitalized name (inferred from peer_label); used instead of a "you" sentinel so persisted history shows the real name */
 } shared_session_ctx;
 
 static void seq_num_to_be(uint32_t seq, uint8_t out[4])
@@ -260,22 +120,8 @@ static uint32_t be_to_seq_num(const uint8_t in[4])
            ((uint32_t)in[2] << 8) | (uint32_t)in[3];
 }
 
-/* --- Shared send helper: used by BOTH threads -------------------------
- *
- * Holds send_mutex across the ENTIRE serialize+write pair - see
- * session.h's design comment for why splitting those into two separate
- * critical sections would be a real ordering/corruption bug, not just a
- * style choice.
- *
- * out_seq_num (may be NULL): if non-NULL, filled with the seq_num this
- * specific send actually used - the caller cannot safely read
- * ctx->state->next_seq_num itself before/after this call (another
- * thread could send concurrently in between, e.g. the receiver thread
- * auto-replying with PONG/ACK while the main thread is mid-send), so
- * this is the only race-free way to know which seq_num a given send
- * consumed. Used for ACK-tracking a TEXT_MESSAGE - see
- * track_pending_ack() below.
- */
+/* --- Shared send helper: used by BOTH threads --- */
+/* Holds send_mutex across the ENTIRE serialize+write pair - splitting into two critical sections would be a real ordering bug, see session.h. out_seq_num (may be NULL): filled with the seq_num actually used - race-free, used by track_pending_ack(). */
 static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
                          const uint8_t *body, uint32_t body_len,
                          uint32_t *out_seq_num)
@@ -287,8 +133,7 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
 
     pthread_mutex_lock(&ctx->send_mutex);
 
-    used_seq_num = ctx->state->next_seq_num; /* captured BEFORE
-        serialize consumes it, still under the lock - race-free */
+    used_seq_num = ctx->state->next_seq_num; /* captured BEFORE serialize consumes it, still under the lock - race-free */
 
     total = dd_serialize_message(ctx->state, msg_type, body, body_len,
                                   out_buf, sizeof(out_buf));
@@ -301,12 +146,7 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
 
     rc = wolfSSL_write(ctx->ssl_write, out_buf, total);
 
-    /* Record the outstanding PING's send time while still holding the
-     * lock - the only other writer/reader of these two fields
-     * (check_and_clear_ping(), called from the receiver thread on PONG
-     * receipt) also takes this same lock, so there's no race even
-     * though this is "extra" work tucked inside a function whose name
-     * doesn't mention PING. */
+    /* Record the outstanding PING's send time while still holding the lock - check_and_clear_ping() takes the same lock, no race. */
     if (msg_type == DD_MSG_PING && rc == total) {
         ctx->ping_outstanding = 1;
         ctx->ping_sent_at = monotonic_now();
@@ -327,10 +167,7 @@ static int session_send(shared_session_ctx *ctx, uint8_t msg_type,
     return 0;
 }
 
-/* track_pending_ack - remember that we just sent a TEXT_MESSAGE with
- * this seq_num/preview, so a later ACK referencing it can show a
- * meaningful "(delivered: "...")" confirmation. Circular buffer -
- * see SESSION_PENDING_ACK_MAX's comment. */
+/* track_pending_ack - remember a just-sent TEXT_MESSAGE's seq_num/preview so a later ACK can show "(delivered: "...")" - circular buffer, see SESSION_PENDING_ACK_MAX. */
 static void track_pending_ack(shared_session_ctx *ctx, uint32_t seq_num,
                                const char *text)
 {
@@ -346,12 +183,7 @@ static void track_pending_ack(shared_session_ctx *ctx, uint32_t seq_num,
     pthread_mutex_unlock(&ctx->send_mutex);
 }
 
-/* consume_pending_ack - look up and consume (mark inactive) a pending
- * entry for the given seq_num. Returns 1 and fills out_preview if
- * found, 0 otherwise (a perfectly normal outcome - see
- * SESSION_PENDING_ACK_MAX's comment on eviction; also normal for an ACK
- * that doesn't correspond to a TEXT_MESSAGE we're actively tracking for
- * any other reason). */
+/* consume_pending_ack - look up and consume a pending entry for seq_num; returns 1 and fills out_preview if found, 0 otherwise (eviction or untracked ACK). */
 static int consume_pending_ack(shared_session_ctx *ctx, uint32_t seq_num,
                                 char *out_preview, size_t out_preview_size)
 {
@@ -372,15 +204,7 @@ static int consume_pending_ack(shared_session_ctx *ctx, uint32_t seq_num,
     return found;
 }
 
-/* check_and_clear_ping - if a PING is currently outstanding, compute the
- * elapsed time since it was sent, clear the outstanding flag, and
- * return 1 with *out_rtt_ms filled in. Returns 0 (no-op) if no PING was
- * outstanding - a PONG can legitimately arrive with none outstanding
- * (e.g. this is a reply to the PEER's own periodic PING, which our
- * receiver auto-replied to, and the peer's PONG-back-to-us case doesn't
- * apply here since PONG is never itself PONG-replied-to - this really
- * only guards against an unexpected/duplicate PONG, not a normal
- * scenario). */
+/* check_and_clear_ping - if a PING is outstanding, compute elapsed time, clear the flag, and return 1 with *out_rtt_ms filled in; 0 if none outstanding. */
 static int check_and_clear_ping(shared_session_ctx *ctx, double *out_rtt_ms)
 {
     int had_one;
@@ -397,10 +221,7 @@ static int check_and_clear_ping(shared_session_ctx *ctx, double *out_rtt_ms)
 
 /* --- Received-file handling ---------------------------------------- */
 
-/* Same directory the PIN hash and message log already use
- * ($HOME/.deaddrop/) so it rides along on the exact same, already-
- * persisted (Week 4 Day 5) bind mount with zero changes needed to
- * docs/setup-persist-overlay.sh - see msglog.c's matching comment. */
+/* Same directory the PIN hash and message log use ($HOME/.deaddrop/) - rides the same persisted bind mount, see msglog.c. */
 static int received_files_dir(char *buf, size_t buf_size)
 {
     const char *home = getenv("HOME");
@@ -421,20 +242,11 @@ static int received_files_dir(char *buf, size_t buf_size)
 
 static void ensure_dir_exists(const char *dir)
 {
-    /* MKDIR on an already-existing directory failing is fine and
-     * expected on every call after the first - not checked, matching
-     * lock.c's/msglog.c's own precedent for this exact situation. */
+    /* MKDIR failing on an already-existing directory is fine/expected - not checked, matching lock.c/msglog.c precedent. */
     MKDIR(dir);
 }
 
-/* sanitize_basename - strip any directory components (both '/' and
- * '\\' - the peer's OS isn't assumed) from an attacker-influenceable
- * (it arrived over the wire) filename, and refuse "." or ".." outright,
- * so it can never be used to escape received_files_dir() via path
- * traversal. Falls back to a generic name if nothing usable remains -
- * same "validate untrusted input, never trust it as-is" discipline
- * already established elsewhere in this project (wifi.c's execvp-not-
- * shell reasoning, the revocation module's fail-closed default). */
+/* sanitize_basename - strip directory components from a wire-received filename and refuse "."/".." to prevent path traversal; falls back to a generic name. */
 static void sanitize_basename(const char *raw, char *out, size_t out_size)
 {
     const char *p = raw;
@@ -456,33 +268,10 @@ static void sanitize_basename(const char *raw, char *out, size_t out_size)
     snprintf(out, out_size, "%s", raw);
 }
 
-/* --- "/destroy CONFIRM" emergency-wipe protocol -------------------------
- *
- * A deliberately more drastic sibling to "/clear" (see msglog.h's
- * msglog_destroy_all() for exactly how it differs): triggerable from
- * EITHER paired device, wipes ALL local chat state on BOTH devices, no
- * exceptions (not even /save'd messages). Intended for a genuine
- * device-compromise/seizure scenario, not routine tidying.
- *
- * Flow: typing "/destroy CONFIRM" (exact, case-sensitive - see the
- * command handler below for why a plain "/destroy" alone only shows a
- * warning) immediately wipes THIS device's own state, then either sends
- * DD_MSG_DESTROY to the peer right now (if connected) or queues it for
- * automatic delivery the next time a session connects (if not) - see
- * OUTBOX_DESTROY_SENTINEL below. Receiving DD_MSG_DESTROY performs the
- * exact same local wipe - see receiver_thread_main()'s DD_MSG_DESTROY
- * case. Either direction ends up wiping both devices, which is the
- * actual point: a compromised or seized device shouldn't leave the
- * OTHER device's copy sitting there un-warned either, and the device
- * that's still safely in the legitimate owner's hands should be able to
- * trigger both sides from wherever it is.
- */
+/* --- "/destroy CONFIRM" emergency-wipe protocol --- */
+/* Wipes ALL local chat state on BOTH devices (even /save'd messages), for device compromise/seizure; wipes locally then sends/queues DD_MSG_DESTROY - see OUTBOX_DESTROY_SENTINEL and receiver_thread_main()'s DD_MSG_DESTROY case. */
 
-/* Deletes every regular file directly inside `dir` (no recursion into
- * subdirectories - ~/.deaddrop/received/ is expected flat, this
- * project's own code never creates subdirectories inside it). Silently
- * does nothing if `dir` doesn't exist - matches every other "best-
- * effort, missing state is fine" helper in this file. */
+/* Deletes every regular file directly inside `dir` (no recursion); silently no-ops if `dir` doesn't exist. */
 static void wipe_directory_contents(const char *dir)
 {
     DIR *d = opendir(dir);
@@ -505,29 +294,13 @@ static void wipe_directory_contents(const char *dir)
     closedir(d);
 }
 
-/* The actual "/destroy CONFIRM" effect - declared in session.h (see its
- * own comment there for why this is exported rather than staying static
- * like every other helper in this block: ui.c's idle-input thread needs
- * to call this too, for the offline case). Shared by three call sites
- * total: the local command handler in run_symmetric_session() below, the
- * DD_MSG_DESTROY case in receiver_thread_main(), and ui.c's offline
- * "/destroy" handling. Wipes the persisted message log (in full - see
- * msglog_destroy_all()), the live on-screen scrollback, and any locally-
- * saved received files, in that order. Deliberately does NOT show its
- * own confirmation notice - each call site's wording needs to differ
- * ("you triggered this" vs. "the peer did"), so that stays with the
- * caller. */
+/* The actual "/destroy CONFIRM" effect - declared in session.h so ui.c's idle-input thread can also use it offline; shared by 3 call sites, no confirmation shown itself (wording differs per caller). */
 void session_perform_local_destroy(void)
 {
     msglog_destroy_all();
     ui_destroy_history();
 
-    /* Cuts off any in-progress or queued spoken message immediately -
-     * see hw_tts_stop_and_clear()'s own comment for why this function
-     * specifically is the only thing allowed to call it. Placed here
-     * rather than duplicated across all three "/destroy" call sites,
-     * same reasoning as everything else this function already
-     * consolidates. */
+    /* Cuts off any in-progress/queued spoken message immediately - kept here rather than duplicated across all "/destroy" call sites. */
     hw_tts_stop_and_clear();
 
     {
@@ -538,19 +311,10 @@ void session_perform_local_destroy(void)
     }
 }
 
-/* OUTBOX_DESTROY_SENTINEL itself now lives in session.h - both this
- * file's outbox-drain loop AND ui.c's offline "/destroy" handling need
- * to agree on the EXACT same string, so it can't be a private #define
- * in just one of them. See session.h's copy for the full comment. */
+/* OUTBOX_DESTROY_SENTINEL lives in session.h - this file's outbox-drain loop and ui.c's offline "/destroy" handling must agree on the exact same string. */
 
-/* --- Receiver thread ---------------------------------------------------
- *
- * Runs for the whole session: always reads, parses, displays, and (for
- * PING/TEXT_MESSAGE only) auto-replies, regardless of whether the local
- * user is actively typing right now - "receiving always works, replying
- * is optional". Never blocks the sender: its wolfSSL_read() call runs on
- * ssl_read, entirely separate from the ssl_write object the sender uses.
- */
+/* --- Receiver thread --- */
+/* Runs for the whole session: reads/parses/displays and auto-replies (PING/TEXT_MESSAGE) regardless of local typing; never blocks the sender - reads on ssl_read, separate from ssl_write. */
 typedef enum {
     RTHREAD_RECV_OK,
     RTHREAD_RECV_REJECTED,
@@ -588,14 +352,7 @@ static rthread_recv_status receiver_recv_one(WOLFSSL *ssl_read,
             int n = wolfSSL_read(ssl_read, (char *)(recv_buf + *have),
                                   (int)(DD_MAX_MSG_SIZE - *have));
             if (n <= 0) {
-                /* Covers both a real peer-side close/error AND the
-                 * deliberate local shutdown(sock, SHUT_RD) used to
-                 * unblock this thread when the LOCAL user quit - either
-                 * way this thread's job is done. run_symmetric_session
-                 * already knows independently which of those two
-                 * reasons applies (it initiated the local-quit case
-                 * itself) and decides its own return value accordingly,
-                 * so this function doesn't need to distinguish them. */
+                /* Covers both a real peer-side close/error and the deliberate local shutdown(sock, SHUT_RD) on local quit. */
                 return RTHREAD_RECV_CLOSED;
             }
             *have += (size_t)n;
@@ -607,11 +364,7 @@ static void *receiver_thread_main(void *arg)
 {
     shared_session_ctx *ctx = (shared_session_ctx *)arg;
     uint8_t *recv_buf = malloc(DD_MAX_MSG_SIZE);
-    /* Full-length NUL-terminated copy of a TEXT_MESSAGE body, for
-     * ui_add_history()/ui_add_historyf() (which need a real C string) -
-     * deliberately separate from the short OLED/TTS preview[] below:
-     * the on-screen history should show the whole message, not a
-     * 21-character-wide truncation. */
+    /* Full-length NUL-terminated copy of a TEXT_MESSAGE body for ui_add_history()/ui_add_historyf() - separate from the short OLED/TTS preview[] below. */
     char *text_buf = malloc(DD_MAX_BODY_LEN + 1);
     size_t have = 0;
 
@@ -639,28 +392,15 @@ static void *receiver_thread_main(void *arg)
             break;
         }
 
-        /* rs == RTHREAD_RECV_OK - the peer is demonstrably alive, having
-         * just sent something real (a TEXT_MESSAGE, ACK, PING, PONG,
-         * FILE, or DISCONNECT - any recognized message type at all).
-         * See SESSION_WATCHDOG_TIMEOUT_SECONDS' comment for why this
-         * matters: this is the ONLY place last_recv_epoch gets updated. */
+        /* rs == RTHREAD_RECV_OK - the only place last_recv_epoch gets updated, see SESSION_WATCHDOG_TIMEOUT_SECONDS. */
         ctx->last_recv_epoch = (long)time(NULL);
 
         if (msg.msg_type == DD_MSG_TEXT_MESSAGE) {
-            /* msg.body is length-prefixed per PROTOCOL.md, NOT a
-             * NUL-terminated C string - every consumer below needs a
-             * real C string, so a NUL-terminated copy is made first.
-             * text_buf is the full message (sized DD_MAX_BODY_LEN+1,
-             * see its declaration above), for the on-screen history;
-             * preview[] below is a SEPARATE, much shorter copy for the
-             * 21-character-wide OLED and for speech, where a full 64KB
-             * message would be its own bad idea regardless of
-             * hw_tts_speak()'s own internal cap. */
+            /* msg.body is length-prefixed per PROTOCOL.md, not NUL-terminated, so a NUL-terminated copy is made first; text_buf is the full message, preview[] below is shorter for OLED/speech. */
             {
                 size_t n = msg.body_len;
                 if (n > DD_MAX_BODY_LEN) {
-                    n = DD_MAX_BODY_LEN; /* defensive; the protocol layer
-                                           * already enforces this cap */
+                    n = DD_MAX_BODY_LEN; /* defensive; the protocol layer already enforces this cap */
                 }
                 memcpy(text_buf, msg.body, n);
                 text_buf[n] = '\0';
@@ -669,10 +409,7 @@ static void *receiver_thread_main(void *arg)
             ui_notify_message_pending(ctx->hw_fd);
             msglog_append(ctx->peer_label, text_buf);
 
-            /* Automatic delivery acknowledgment - see PROTOCOL.md's
-             * ACK entry. Same "auto-reply is fatal on failure" pattern
-             * as the existing PING->PONG reply below - a failure here
-             * means the connection is almost certainly already dead. */
+            /* Automatic delivery acknowledgment - see PROTOCOL.md's ACK entry; fatal on failure, like the PING->PONG reply below. */
             {
                 uint8_t ack_body[4];
                 seq_num_to_be(msg.seq_num, ack_body);
@@ -697,10 +434,12 @@ static void *receiver_thread_main(void *arg)
                     snprintf(oled_line0, sizeof(oled_line0), "From %s:",
                               ctx->peer_label);
                     hw_oled_draw_text(ctx->oled_fd, 0, oled_line0);
+                    /* OLED only has room for ~21 chars/line - preview[] stays scoped to that use. */
                     hw_oled_draw_text(ctx->oled_fd, 1, preview);
                     hw_oled_display(ctx->oled_fd);
                 }
-                hw_tts_speak(preview);
+                /* Speak the FULL message (text_buf), not the OLED-sized preview[] - hw_tts_speak() does its own truncation for speech. */
+                hw_tts_speak(text_buf);
             }
         } else if (msg.msg_type == DD_MSG_ACK) {
             if (msg.body_len == 4) {
@@ -710,28 +449,18 @@ static void *receiver_thread_main(void *arg)
                                          sizeof(preview))) {
                     ui_add_historyf(NULL, "(delivered: \"%s\")", preview);
                 }
-                /* Not found: a perfectly normal outcome (eviction, or
-                 * an ACK for something we weren't tracking) - see
-                 * consume_pending_ack()'s comment. Silently ignored,
-                 * not an error. */
+                /* Not found: normal (eviction or untracked ACK) - silently ignored, not an error. */
             }
         } else if (msg.msg_type == DD_MSG_FILE) {
             if (msg.body_len < DD_FILE_NAME_LEN_SIZE) {
-                /* Malformed - too short to even hold the length prefix.
-                 * dd_try_parse_message() already validated the HMAC
-                 * over this body, so this isn't a tampering concern,
-                 * just a peer (or a peer's bug) sending a nonsensical
-                 * FILE message - ignore rather than tear down the
-                 * whole session over it. */
+                /* Malformed - too short for the length prefix (HMAC already validated, so a peer bug, not tampering); ignore, don't tear down the session. */
             } else {
                 uint16_t name_len = (uint16_t)((msg.body[0] << 8) |
                                                  msg.body[1]);
                 if (name_len > DD_FILE_NAME_MAX ||
                     (size_t)(DD_FILE_NAME_LEN_SIZE + name_len) >
                         msg.body_len) {
-                    /* Malformed - name_len claims more than the body
-                     * actually holds. Same "ignore, don't tear down
-                     * the session" handling as above. */
+                    /* Malformed - name_len claims more than the body holds; same "ignore" handling as above. */
                 } else {
                     char raw_name[DD_FILE_NAME_MAX + 1];
                     char safe_name[DD_FILE_NAME_MAX + 1];
@@ -759,22 +488,7 @@ static void *receiver_thread_main(void *arg)
                                 size_t written = fwrite(data, 1, data_len, f);
                                 fclose(f);
 #ifndef _WIN32
-                                /* Security audit, 2026-08-23: this file's
-                                 * content is attacker-influenceable (it
-                                 * arrived over the wire from the peer) and
-                                 * was falling back to fopen()'s default
-                                 * mode + whatever umask the process
-                                 * happens to run under - inconsistent
-                                 * with lock.c's pin_hash and msglog.c's
-                                 * message_log.txt, which both explicitly
-                                 * chmod(path, 0600) right after creation
-                                 * rather than trust ambient umask. Matched
-                                 * that precedent here instead of relying
-                                 * on umask (the systemd unit sets none,
-                                 * so it would otherwise inherit whatever
-                                 * PID1's default is - not something this
-                                 * file's confidentiality should depend
-                                 * on). */
+                                /* Attacker-influenceable content shouldn't rely on ambient umask - explicit chmod(0600), matching lock.c/msglog.c precedent. See COMMENT_ARCHIVE.md. */
                                 chmod(path, 0600);
 #endif
                                 if (written == data_len) {
@@ -801,19 +515,13 @@ static void *receiver_thread_main(void *arg)
                 }
             }
         } else if (msg.msg_type == DD_MSG_PING) {
-            /* No history notice - see SESSION_PING_INTERVAL_SECONDS's
-             * comment: PING is now a routine, automatic, ~10s
-             * background event, not a rare occurrence worth chat-log
-             * noise. Same "fatal on auto-reply failure" pattern as
-             * ACK's send above. */
+            /* No history notice - PING is a routine ~10s background event; fatal on failure, like ACK's send above. */
             if (session_send(ctx, DD_MSG_PONG, NULL, 0, NULL) != 0) {
                 ctx->peer_ended = 1;
                 break;
             }
         } else if (msg.msg_type == DD_MSG_PONG) {
-            /* Also no history notice, same reasoning - this is the
-             * live RTT/link-quality reading, reported to the OLED
-             * metrics section (ui_report_rtt()), not the chat log. */
+            /* Also no history notice - live RTT/link-quality reading, reported to the OLED metrics section (ui_report_rtt()), not the chat log. */
             double rtt_ms;
             if (check_and_clear_ping(ctx, &rtt_ms)) {
                 ui_report_rtt((int)rtt_ms);
@@ -823,21 +531,12 @@ static void *receiver_thread_main(void *arg)
             ctx->peer_ended = 1;
             break;
         } else if (msg.msg_type == DD_MSG_DESTROY) {
-            /* The peer triggered "/destroy CONFIRM" remotely - see this
-             * file's "/destroy CONFIRM" block comment above. No
-             * additional authentication/confirmation needed here beyond
-             * this message having arrived at all: it rode in over an
-             * already mutually-authenticated (mTLS), replay-protected
-             * (HMAC + strictly-increasing seq_num) session, so its mere
-             * valid arrival already proves it came from the legitimate
-             * paired device, not an attacker. */
+            /* The peer triggered "/destroy CONFIRM" remotely; no extra auth needed - it rode in over an already authenticated, replay-protected session. */
             session_perform_local_destroy();
             ui_add_error("EMERGENCY DESTROY: the peer remotely wiped all "
                           "chat data on this device.");
         }
-        /* Any other well-formed-but-unrecognized msg_type: treated as
-         * forward-compat noise, not fatal - dd_try_parse_message() has
-         * already validated version/HMAC/seq_num by this point. */
+        /* Any other well-formed-but-unrecognized msg_type: treated as forward-compat noise, not fatal - version/HMAC/seq_num already validated. */
     }
 
     free(recv_buf);
@@ -854,10 +553,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     shared_session_ctx ctx;
     pthread_t rtid;
     char *line;
-    char *file_body; /* scratch buffer for building an outgoing
-        DD_MSG_FILE body ("/send <path>") - see below. Separate from
-        `line` (which holds the typed "/send <path>" COMMAND text
-        itself, not the file's own binary content). */
+    char *file_body; /* scratch buffer for building an outgoing DD_MSG_FILE body ("/send <path>") - separate from `line`, the typed command text */
     struct timespec last_ping_sent;
     session_result result;
 
@@ -869,20 +565,13 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         return SESSION_DISCONNECTED;
     }
 
-    /* See session.h's "IMPORTANT for callers" comment: must happen before
-     * the receiver thread starts blocking in wolfSSL_read(), or it could
-     * legitimately hit the old pre-handshake timeout during its very
-     * first idle wait. */
+    /* See session.h: must happen before the receiver thread starts blocking in wolfSSL_read(), or it could hit the old pre-handshake timeout. */
     clear_recv_timeout(sock);
 
     ctx.state = &state;
     ctx.ssl_read = ssl;
 
-    /* wolfSSL_write_dup() turns `ssl` into a read-only object and hands
-     * back a genuinely separate write-only object - this is the actual
-     * safety mechanism that makes concurrent read (receiver thread) and
-     * write (either thread, via session_send) on this session safe at
-     * all. Needs HAVE_WRITE_DUP / --enable-writedup - see docs/BUILD.md. */
+    /* wolfSSL_write_dup() turns `ssl` into a read-only object and hands back a separate write-only object - the mechanism making concurrent read/write safe. Needs HAVE_WRITE_DUP, see docs/BUILD.md. */
     ctx.ssl_write = wolfSSL_write_dup(ssl);
     if (ctx.ssl_write == NULL) {
         ui_add_error(
@@ -897,17 +586,12 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     ctx.ping_outstanding = 0;
     ctx.peer_ended = 0;
     ctx.should_stop = 0;
-    /* Starts "now," not 0 - see SESSION_WATCHDOG_TIMEOUT_SECONDS'
-     * comment. Without this, a fresh session with a slightly slow first
-     * PONG could spuriously look like it's already been silent since
-     * epoch 0, an enormous (and wrong) duration. */
+    /* Starts "now," not 0 - see SESSION_WATCHDOG_TIMEOUT_SECONDS, or a fresh session could spuriously look silent since epoch 0. */
     ctx.last_recv_epoch = (long)time(NULL);
     ctx.hw_fd = hw_fd;
     ctx.oled_fd = oled_fd;
     ctx.peer_label = peer_label;
-    /* See self_label's own declaration comment above: inferred from
-     * peer_label the same way ui.c's g_self_is_alpha is, since this
-     * project has exactly two fixed roles. */
+    /* See self_label's declaration comment above: inferred from peer_label the same way ui.c's g_self_is_alpha is. */
     ctx.self_label = (peer_label != NULL && strcmp(peer_label, "Bravo") == 0)
                           ? "Alpha" : "Bravo";
 
@@ -918,11 +602,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         return SESSION_DISCONNECTED;
     }
 
-    /* Same DD_MAX_BODY_LEN-sized stack buffer client.c's old
-     * run_interactive_session() used for a typed line - heap-allocated
-     * here instead since this function's stack frame now also holds
-     * shared_session_ctx and dd_session_state, and a 64KB fixed stack
-     * buffer on top of those is unnecessary pressure for no benefit. */
+    /* Heap-allocated rather than a stack buffer - this frame already holds shared_session_ctx/dd_session_state, so a 64KB fixed buffer would add stack pressure. */
     line = malloc(DD_MAX_BODY_LEN);
     file_body = malloc(DD_MAX_BODY_LEN);
     if (line == NULL || file_body == NULL) {
@@ -938,33 +618,14 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
     }
 
     ui_set_statusf("Connected to %s", peer_label);
-    /* No per-connection instructional hint here anymore (2026-08-22,
-     * direct request) - this used to print the full "type a message..."
-     * paragraph on EVERY connect/reconnect, which meant a flaky link
-     * doing several reconnect cycles spammed the same instructions
-     * repeatedly. The guide is now shown once at boot (ui_init()) and
-     * on demand via the new "/help" command below - see ui_show_help(). */
+    /* No per-connection instructional hint here anymore - used to spam a flaky link on every reconnect; now shown once at boot and via "/help". */
 
-    /* Drain anything queued while offline (see outbox.h) now that a
-     * real session exists to send through - same TEXT_MESSAGE send +
-     * ack-tracking + persistence + history-echo treatment as a message
-     * typed live, just sourced from the queue instead of ui_poll_line().
-     * Runs once, right at session start, before the first real
-     * ui_poll_line() wait - if this is a long queue, sending it out
-     * takes a moment, which is fine (a handful of tiny TEXT_MESSAGEs is
-     * fast) and matches user expectation ("my queued messages went out
-     * as soon as I reconnected"). */
+    /* Drain anything queued while offline (see outbox.h), same send/ack-tracking/persistence/history-echo treatment as a live message; runs once at session start. */
     {
         char queued[OUTBOX_MSG_MAX_LEN];
         uint32_t sent_seq;
         while (outbox_try_dequeue(queued, sizeof(queued))) {
-            /* A queued "/destroy CONFIRM" from earlier, issued while the
-             * peer was unreachable (see OUTBOX_DESTROY_SENTINEL's
-             * comment) - THIS device's own wipe already happened
-             * immediately back when the command was originally typed;
-             * all that's left now is telling the peer, so this doesn't
-             * go through the normal TEXT_MESSAGE send path below at
-             * all. */
+            /* A queued "/destroy CONFIRM" from earlier - the local wipe already happened when typed; only the peer notification is left. */
             if (strcmp(queued, OUTBOX_DESTROY_SENTINEL) == 0) {
                 if (session_send(&ctx, DD_MSG_DESTROY, NULL, 0, NULL) == 0) {
                     ui_add_error("EMERGENCY DESTROY: queued wipe command "
@@ -985,10 +646,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                     msglog_append(ctx.self_label, queued);
                     ui_add_history(ctx.self_label, queued);
                 } else {
-                    /* Send failed mid-drain (connection died again) -
-                     * put it back at the front of the queue rather than
-                     * lose it, and stop draining; the next successful
-                     * session start will pick up where this left off. */
+                    /* Send failed mid-drain (connection died again) - put it back and stop draining; the next session start resumes from here. */
                     outbox_enqueue(queued);
                     break;
                 }
@@ -1008,18 +666,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             break;
         }
 
-        /* Periodic PING purely for the live RTT/link-quality reading -
-         * see SESSION_PING_INTERVAL_SECONDS's comment. Checked once per
-         * loop iteration (every up-to-STDIN_POLL_MS), which is plenty
-         * granular for a 10-second interval. Skips sending a new one if
-         * the previous PING never got a PONG back yet, rather than
-         * letting them stack up during a slow/degraded link - the next
-         * PING attempt (after this one's own outstanding flag would
-         * have been cleared by a timeout... actually there is no
-         * explicit PING timeout here: an outstanding PING that never
-         * gets a PONG simply means no fresh RTT sample until the next
-         * successful round-trip, which is an honest reflection of link
-         * quality, not a bug to work around). */
+        /* Periodic PING for RTT/link-quality - see SESSION_PING_INTERVAL_SECONDS; skips sending a new one while a previous PING is still outstanding. */
         {
             struct timespec now_ts = monotonic_now();
             if (ms_between(last_ping_sent, now_ts) >=
@@ -1035,18 +682,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             }
         }
 
-        /* Watchdog: forcibly end the session if nothing at all has been
-         * received from the peer in too long - see
-         * SESSION_WATCHDOG_TIMEOUT_SECONDS' comment for the full story
-         * on why this exists (a genuinely silent peer loss otherwise
-         * hangs forever, not just slowly, since the OS-level read
-         * timeout is deliberately disabled once a session is live).
-         * SHUTDOWN_READ() unblocks the receiver thread's blocked read
-         * immediately and unconditionally - the same mechanism this
-         * function already uses below for a local user quit - which
-         * then sets ctx.peer_ended itself; this loop's own peer_ended
-         * check at the top catches that on the very next iteration, so
-         * this doesn't need its own separate "already triggered" guard. */
+        /* Watchdog: end the session if nothing received in too long - see SESSION_WATCHDOG_TIMEOUT_SECONDS; SHUTDOWN_READ() unblocks the receiver, which sets peer_ended. */
         if ((long)time(NULL) - ctx.last_recv_epoch >=
                 SESSION_WATCHDOG_TIMEOUT_SECONDS) {
             SHUTDOWN_READ(sock);
@@ -1058,17 +694,14 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             continue;
         }
         if (pr == UI_POLL_QUIT) {
-            /* stdin closed (EOF) - only the plain-console fallback ever
-             * returns this; see ui.h. Treat the same as an explicit
-             * quit. */
+            /* stdin closed (EOF) - only the plain-console fallback ever returns this; treated the same as an explicit quit. */
             ui_add_history(NULL, "(you quit)");
             session_send(&ctx, DD_MSG_DISCONNECT, NULL, 0, NULL);
             result = SESSION_USER_QUIT;
             break;
         }
 
-        /* pr == UI_POLL_LINE: line[] holds the composed, NUL-terminated
-         * line (any trailing newline already stripped by ui_poll_line()). */
+        /* pr == UI_POLL_LINE: line[] holds the composed, NUL-terminated line (trailing newline already stripped by ui_poll_line()). */
         len = strlen(line);
 
         if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
@@ -1078,16 +711,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             break;
         }
 
-        /* "/clear" - a purely LOCAL command (never sent to the peer -
-         * this device's own copy of the chat is all it can honestly
-         * promise to zero; the peer keeps their own separate copy
-         * regardless). Checked before the ctx.peer_ended check below,
-         * same reasoning as "quit"/"exit" above: this doesn't need a
-         * live connection to do its job. See msglog.h's
-         * msglog_clear_except_saved() and ui.h's ui_clear_history() for
-         * what each half actually does - together they zero both the
-         * on-disk log and the on-screen scrollback, keeping only
-         * whatever was previously sent via "/save <text>" below. */
+        /* "/clear" - purely local, never sent to the peer; checked before ctx.peer_ended. Zeroes the on-disk log and on-screen scrollback, keeping "/save"d messages. */
         if (strcmp(line, "/clear") == 0) {
             msglog_clear_except_saved();
             ui_clear_history();
@@ -1096,26 +720,38 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             continue;
         }
 
-        /* "/help" - same purely-local, no-connection-needed reasoning as
-         * "/clear" above. Re-prints the exact guide ui_init() already
-         * shows once at boot (see ui_show_help()) - this is what replaced
-         * the old per-connection instructional hint (see this function's
-         * top comment). */
+        /* "/help" - same purely-local reasoning as "/clear" above; re-prints the guide ui_init() shows once at boot. */
         if (strcmp(line, "/help") == 0) {
             ui_show_help();
             continue;
         }
 
-        /* "/destroy" and "/destroy CONFIRM" - the emergency-wipe
-         * protocol, see this file's block comment above
-         * session_perform_local_destroy() for the full design. "/destroy"
-         * ALONE is deliberately inert (just a stark warning) so an
-         * accidental Enter-press mid-command can never trigger this -
-         * only the exact, deliberate "/destroy CONFIRM" (case-
-         * sensitive) actually wipes anything. Checked before the
-         * ctx.peer_ended check below, same as "/clear": the LOCAL half
-         * of a destroy must always succeed regardless of connection
-         * state. */
+        /* "/volume" (report) and "/volume <0-100>" (set) - an OS-level ALSA mixer setting; hw_volume_get/set() are safe no-ops on non-Linux. */
+        if (strcmp(line, "/volume") == 0) {
+            int pct = hw_volume_get();
+            if (pct < 0) {
+                ui_add_error("Could not read current volume (amixer "
+                              "unavailable?).");
+            } else {
+                ui_add_historyf(NULL, "(volume: %d%%)", pct);
+            }
+            continue;
+        }
+        if (strncmp(line, "/volume ", 8) == 0) {
+            const char *arg = line + 8;
+            char *endptr = NULL;
+            long pct = strtol(arg, &endptr, 10);
+            if (endptr == arg || *endptr != '\0' || pct < 0 || pct > 100) {
+                ui_add_error("Usage: /volume <0-100>");
+            } else if (hw_volume_set((int)pct) != 0) {
+                ui_add_error("Failed to set volume (amixer unavailable?).");
+            } else {
+                ui_add_historyf(NULL, "(volume set to %d%%)", (int)pct);
+            }
+            continue;
+        }
+
+        /* "/destroy" and "/destroy CONFIRM" - the emergency-wipe protocol; "/destroy" alone is inert (just a warning), checked before ctx.peer_ended like "/clear". */
         if (strcmp(line, "/destroy") == 0) {
             ui_add_error(
                 "EMERGENCY DESTROY: type '/destroy CONFIRM' (exact, "
@@ -1129,10 +765,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             session_perform_local_destroy();
             ui_add_error("EMERGENCY DESTROY: all local chat data wiped.");
 
-            /* Notify the peer so both devices end up wiped, not just
-             * this one - queue it (see OUTBOX_DESTROY_SENTINEL) rather
-             * than lose the intent if the peer isn't reachable right
-             * now, exactly like a queued TEXT_MESSAGE already does. */
+            /* Notify the peer so both devices end up wiped - queue it (OUTBOX_DESTROY_SENTINEL) if unreachable, like a queued TEXT_MESSAGE. */
             if (ctx.peer_ended ||
                     session_send(&ctx, DD_MSG_DESTROY, NULL, 0, NULL) != 0) {
                 if (outbox_enqueue(OUTBOX_DESTROY_SENTINEL) == 0) {
@@ -1141,9 +774,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
                         "the wipe command is queued and will be "
                         "delivered automatically once reconnected.");
                 } else {
-                    /* See ui.c's matching idle-thread comment - the
-                     * outbound queue being full is exceedingly rare, but
-                     * this must never silently fail to queue. */
+                    /* See ui.c's matching idle-thread comment - the outbound queue being full is rare, but must never silently fail to queue. */
                     ui_add_error(
                         "EMERGENCY DESTROY: peer unreachable AND the "
                         "outbound queue is full - peer notification "
@@ -1159,11 +790,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
         }
 
         if (ctx.peer_ended) {
-            /* Peer ended the session while this line was being typed -
-             * don't bother sending into an already-dead connection.
-             * Queue it instead of silently dropping it - it'll go out
-             * automatically once a new session starts (see the outbox
-             * drain above). */
+            /* Peer ended the session while this line was being typed - queue instead of sending into a dead connection. */
             outbox_enqueue(line);
             ui_add_historyf(NULL, "Connection to %s lost. Your message "
                                    "has been queued.", peer_label);
@@ -1171,18 +798,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             break;
         }
 
-        /* "/save <text>" - sends a normal TEXT_MESSAGE, same as typing
-         * the text alone would, EXCEPT it's also logged with the
-         * "[SAVED]" marker (msglog_append_saved(), not the usual
-         * msglog_append()) so a later "/clear" (above) keeps it instead
-         * of discarding it. Deliberately scoped to messages sent FROM
-         * this device, going forward - there's no way to retroactively
-         * mark an already-sent or already-received message as saved
-         * with this v1, a documented, honest limitation rather than an
-         * oversight (the append-only log has no cheap way to find and
-         * rewrite one specific earlier line without the same rewrite
-         * machinery msglog_clear_except_saved() already needs for a
-         * very different purpose). */
+        /* "/save <text>" - a normal TEXT_MESSAGE logged with the "[SAVED]" marker so "/clear" keeps it; no way to retroactively mark an older message in v1. */
         if (len > 6 && strncmp(line, "/save ", 6) == 0) {
             const char *text = line + 6;
             uint32_t sent_seq;
@@ -1190,10 +806,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             if (session_send(&ctx, DD_MSG_TEXT_MESSAGE,
                               (const uint8_t *)text, (uint32_t)strlen(text),
                               &sent_seq) != 0) {
-                outbox_enqueue(text); /* the SAVED tag itself doesn't
-                    survive an offline-queue retry - see this block's
-                    comment above on why that's an accepted limitation,
-                    not attempted here either */
+                outbox_enqueue(text); /* the SAVED tag doesn't survive an offline-queue retry - an accepted limitation */
                 result = SESSION_DISCONNECTED;
                 break;
             }
@@ -1203,11 +816,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             continue;
         }
 
-        /* "/send <path>" - a small local file, read from THIS device's
-         * own filesystem and transmitted as one DD_MSG_FILE. See
-         * PROTOCOL.md's FILE entry for the hard size cap and why there
-         * is no chunking - a file that doesn't fit is rejected here,
-         * before anything is sent, not partway through. */
+        /* "/send <path>" - a small local file, transmitted as one DD_MSG_FILE; see PROTOCOL.md's FILE entry for the hard size cap (no chunking). */
         if (len > 6 && strncmp(line, "/send ", 6) == 0) {
             const char *filepath = line + 6;
             FILE *f = fopen(filepath, "rb");
@@ -1219,11 +828,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             }
 
             {
-                /* Basename of the LOCAL path, sent as the filename
-                 * label - same sanitize_basename() used on the
-                 * receiving end for symmetry/consistency, even though
-                 * this is our own trusted local path, not untrusted
-                 * wire input, here. */
+                /* Basename of the LOCAL path, sent as the filename label - reuses sanitize_basename() for consistency, though this path is trusted. */
                 char name[DD_FILE_NAME_MAX + 1];
                 size_t name_len;
                 long file_size;
@@ -1283,9 +888,7 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             if (session_send(&ctx, DD_MSG_TEXT_MESSAGE,
                               (const uint8_t *)line, (uint32_t)len,
                               &sent_seq) != 0) {
-                /* Queue it for automatic resend on the next successful
-                 * session, rather than losing it - a real reliability
-                 * improvement over just failing silently. */
+                /* Queue it for automatic resend on the next successful session, rather than losing it. */
                 outbox_enqueue(line);
                 result = SESSION_DISCONNECTED;
                 break;
@@ -1294,23 +897,14 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             msglog_append(ctx.self_label, line);
         }
 
-        /* Echo the user's own sent message into the history. ncurses
-         * runs in noecho() mode and clears the input line once
-         * submitted (ui.c), so without this the user would have no
-         * on-screen record of what they just sent - unlike a plain
-         * terminal, which echoes typed input on its own. */
+        /* Echo the user's own sent message into the history - ncurses runs in noecho() mode and clears the input line otherwise. */
         ui_add_history(ctx.self_label, line);
     }
 
     free(line);
     free(file_body);
 
-    /* Unblock the receiver thread: shutdown() on the raw socket's read
-     * side forces its current or next blocking wolfSSL_read() to return
-     * immediately, instead of waiting up to CONN_TIMEOUT_SECONDS to
-     * notice should_stop on its own. Safe to call even if the receiver
-     * already ended itself (the ctx.peer_ended-break case above) -
-     * shutdown() on an already-idle/half-closed socket is harmless. */
+    /* Unblock the receiver thread: shutdown() on the socket's read side forces its blocking wolfSSL_read() to return; harmless if already idle. */
     ctx.should_stop = 1;
     SHUTDOWN_READ(sock);
 

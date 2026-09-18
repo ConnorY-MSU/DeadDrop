@@ -7,12 +7,7 @@
 
 #define MAX_REVOKED_SERIALS 64
 
-/* Must comfortably exceed the longest hex serial server.c's verify callback
- * can ever hand us: SERIAL_BUF_SIZE there is 32 raw bytes -> 64 hex chars
- * + a null terminator = 65 bytes minimum. 80 leaves real margin rather than
- * sizing exactly to the wire and risking a silent off-by-one the next time
- * either constant changes. (A real X.509 serial is at most 20 bytes / 40
- * hex chars per RFC 5280, so this is generous headroom, not a tight fit.) */
+/* Comfortably exceeds server.c's SERIAL_BUF_SIZE (32 bytes -> 65 hex chars incl. NUL); 80 leaves margin against a silent off-by-one. */
 #define MAX_SERIAL_LEN       80
 
 static char revoked_serials[MAX_REVOKED_SERIALS][MAX_SERIAL_LEN];
@@ -55,14 +50,7 @@ int revocation_load(const char *filepath)
                           line[raw_len - 1] != '\n');
 
         if (truncated) {
-            /* This line is longer than our read buffer. Without this
-             * check, fgets() would silently split it across two calls,
-             * and the leftover tail would get loaded as its own bogus,
-             * unrelated "revoked serial" entry on the next iteration.
-             * Discard the rest of the real line first so that doesn't
-             * happen, then skip this entry entirely - a truncated
-             * serial would never match a real one anyway, so partially
-             * loading it has no value and only obscures the warning. */
+            /* Line too long for our buffer - discard the rest so the leftover tail isn't loaded as a bogus entry next iteration. */
             int c;
             while ((c = fgetc(fp)) != '\n' && c != EOF) {
                 /* consume and discard the remainder of this line */

@@ -14,8 +14,7 @@
     #define MKDIR(path) mkdir((path), 0700)
 #endif
 
-/* Same $HOME-based path convention as lock.c's lock_pin_file_path() -
- * see msglog.h's top comment for why this specific directory. */
+/* Same $HOME-based path convention as lock.c's lock_pin_file_path(). */
 static int msglog_file_path(char *buf, size_t buf_size)
 {
     const char *home = getenv("HOME");
@@ -34,12 +33,7 @@ static int msglog_file_path(char *buf, size_t buf_size)
     return 0;
 }
 
-/* Same minimal "create the parent directory" helper as lock.c's
- * ensure_pin_dir() - not shared/exported between the two files, same
- * reasoning as every other small module in this project (wifi.c,
- * touch.c, hw_*.c) not sharing helpers either; it's a few lines,
- * duplicating it is cheaper than introducing cross-module coupling for
- * something this small. */
+/* Same minimal "create parent directory" helper as lock.c's ensure_pin_dir(), deliberately duplicated. See COMMENT_ARCHIVE.md. */
 static void ensure_log_dir(const char *log_path)
 {
     char dir[512];
@@ -56,12 +50,7 @@ static void ensure_log_dir(const char *log_path)
     MKDIR(dir);
 }
 
-/* Written right after the timestamp, before `who`, on a line saved via
- * msglog_append_saved() - see msglog.h's comment on both that function
- * and msglog_clear_except_saved(), which greps for exactly this string
- * to decide what survives a /clear. Kept human-readable on purpose (it
- * shows up as-is in the replayed history, same as everything else in
- * this file) rather than some non-printing sentinel. */
+/* Marker written before `who` on a saved line; msglog_clear_except_saved() greps for this to decide what survives a /clear. */
 #define MSGLOG_SAVED_MARKER "[SAVED] "
 
 static void msglog_append_ex(const char *who, const char *text, int saved)
@@ -101,10 +90,7 @@ static void msglog_append_ex(const char *who, const char *text, int saved)
     fclose(f);
 
 #ifndef _WIN32
-    chmod(path, 0600); /* owner read/write only, matches the PIN hash
-        file's own precedent in the same directory - see msglog.h's
-        top comment on the honest plaintext-at-rest limitation this
-        permission bit is the only real protection for. */
+    chmod(path, 0600); /* owner read/write only - the only real protection for this plaintext log, see msglog.h */
 #endif
 }
 
@@ -124,12 +110,7 @@ void msglog_clear_except_saved(void)
     char tmp_path[520];
     FILE *in;
     FILE *out;
-    char line[MSGLOG_LINE_MAX + 64]; /* generous over MSGLOG_LINE_MAX -
-        a log LINE written by msglog_append_ex() isn't itself capped to
-        MSGLOG_LINE_MAX (that cap only bounds what msglog_load_recent()
-        hands back for REPLAY - see msglog.h), so this needs its own
-        independent margin to avoid truncating a genuinely long line
-        while filtering, not reuse of the replay-side constant. */
+    char line[MSGLOG_LINE_MAX + 64]; /* generous margin - log lines aren't capped to MSGLOG_LINE_MAX (that only bounds replay output) */
 
     if (msglog_file_path(path, sizeof(path)) != 0) {
         return;
@@ -150,10 +131,7 @@ void msglog_clear_except_saved(void)
     }
 
     while (fgets(line, sizeof(line), in) != NULL) {
-        /* A saved line looks like "[YYYY-MM-DD HH:MM:SS] [SAVED] ...";
-         * strstr() (rather than checking a fixed offset) is deliberate -
-         * it stays correct regardless of exact timestamp width and
-         * doesn't need to duplicate the timestamp format used above. */
+        /* Saved lines look like "[YYYY-MM-DD HH:MM:SS] [SAVED] ..."; strstr() works regardless of timestamp width. */
         if (strstr(line, MSGLOG_SAVED_MARKER) != NULL) {
             fputs(line, out);
         }
@@ -165,13 +143,7 @@ void msglog_clear_except_saved(void)
 #ifndef _WIN32
     chmod(tmp_path, 0600);
 #endif
-    /* Atomically replace the old log with the filtered one - either the
-     * old file or the fully-written new one is what's on disk at any
-     * point, never a half-written file (rename() on POSIX and Windows
-     * with an existing destination target is not literally atomic on
-     * every filesystem, but is the closest portable primitive available
-     * here, and is the same guarantee every other "write to a temp file,
-     * then swap it in" pattern in this codebase relies on). */
+    /* Swap in the filtered log via rename() - the closest portable atomic-replace primitive. */
 #ifdef _WIN32
     remove(path); /* Windows rename() fails if the destination exists */
 #endif
@@ -187,12 +159,7 @@ void msglog_destroy_all(void)
         return;
     }
 
-    /* Best-effort overwrite before delete - see msglog.h's own comment
-     * on this function for the honest limitation (not a guaranteed
-     * secure erase on flash storage). "r+b" so this is a no-op (fopen
-     * fails, nothing to overwrite) if the log doesn't exist yet -
-     * matches every other function in this file treating "no log yet"
-     * as a normal, non-error state. */
+    /* Best-effort overwrite before delete - not a guaranteed secure erase on flash, see msglog.h. */
     f = fopen(path, "r+b");
     if (f != NULL) {
         long size;
@@ -206,9 +173,7 @@ void msglog_destroy_all(void)
                                              ? remaining
                                              : (long)sizeof(zeros));
                 if (fwrite(zeros, 1, chunk, f) != chunk) {
-                    break; /* best-effort - a partial overwrite is still
-                        strictly better than none, keep going to the
-                        remove() below regardless */
+                    break; /* best-effort - a partial overwrite is still better than none */
                 }
                 remaining -= (long)chunk;
             }
@@ -220,12 +185,7 @@ void msglog_destroy_all(void)
     remove(path);
 }
 
-/* Read at most this many trailing bytes of the log file when looking
- * for recent lines - bounds memory use even if the log has grown very
- * large over a long deployment, at the cost of possibly missing lines
- * older than this window on a single call (acceptable: this is a
- * "show recent context on boot" convenience, not a full-log viewer -
- * every line, recent or not, is still in the actual file on disk). */
+/* Max trailing bytes read when looking for recent lines - bounds memory use; this is a boot-time convenience view, not a full-log viewer. */
 #define MSGLOG_TAIL_READ_BYTES 65536
 
 int msglog_load_recent(char out_lines[][MSGLOG_LINE_MAX], int max_lines)
@@ -236,9 +196,7 @@ int msglog_load_recent(char out_lines[][MSGLOG_LINE_MAX], int max_lines)
     long read_size;
     char *buf;
     int total_lines = 0;
-    char *line_starts[512]; /* generous upper bound on how many lines
-        MSGLOG_TAIL_READ_BYTES could plausibly contain, given real
-        chat-message line lengths - a defensive cap, not a tight one */
+    char *line_starts[512]; /* generous upper bound on lines MSGLOG_TAIL_READ_BYTES could plausibly contain */
     char *saveptr = NULL;
     char *line;
     int start_idx;
@@ -287,10 +245,7 @@ int msglog_load_recent(char out_lines[][MSGLOG_LINE_MAX], int max_lines)
     }
     fclose(f);
 
-    /* Split into lines, remembering each line's start pointer - the
-     * first "line" is likely a partial line (we may have started
-     * reading mid-line, since read_size can cut the file off anywhere)
-     * and is deliberately dropped below rather than shown truncated. */
+    /* Split into lines; the first line is likely partial (read_size can cut the file off mid-line) and is dropped below. */
     line = strtok_r(buf, "\n", &saveptr);
     while (line != NULL && total_lines < (int)(sizeof(line_starts) /
                                                  sizeof(line_starts[0]))) {
@@ -298,9 +253,7 @@ int msglog_load_recent(char out_lines[][MSGLOG_LINE_MAX], int max_lines)
         line = strtok_r(NULL, "\n", &saveptr);
     }
 
-    /* Drop the first (likely-partial) line, UNLESS we read the whole
-     * file from its true beginning (read_size == file_size), in which
-     * case even the first line is genuinely complete. */
+    /* Drop the first (likely-partial) line, unless we read the whole file from its true beginning. */
     start_idx = (read_size < file_size && total_lines > 0) ? 1 : 0;
     if (total_lines - start_idx > max_lines) {
         start_idx = total_lines - max_lines;

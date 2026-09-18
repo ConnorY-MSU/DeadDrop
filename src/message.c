@@ -17,9 +17,7 @@ static uint32_t get_u32_be(const uint8_t *p)
            ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
-/* Constant-time-ish comparison for the HMAC tag: always walks the full
- * length rather than short-circuiting on the first mismatched byte, so
- * how quickly this returns doesn't leak how many leading bytes matched. */
+/* Constant-time-ish HMAC tag comparison: always walks the full length rather than short-circuiting, to avoid timing leaks. */
 static int consttime_tag_cmp(const uint8_t *a, const uint8_t *b, size_t len)
 {
     uint8_t diff = 0;
@@ -55,10 +53,7 @@ int dd_session_init(WOLFSSL *ssl, dd_session_state *state)
         return -1;
     }
 
-    /* The handshake arrays kept alive via the caller's pre-handshake
-     * wolfSSL_KeepArrays(ssl) call are only needed for this one export
-     * call - free them now rather than holding that memory for the rest
-     * of a potentially long-lived interactive session. */
+    /* Free the handshake arrays (kept alive via caller's pre-handshake wolfSSL_KeepArrays()) - only needed for this one export call. */
     wolfSSL_FreeArrays(ssl);
 
     state->next_seq_num      = 0;
@@ -123,14 +118,7 @@ dd_parse_result dd_try_parse_message(dd_session_state *state,
 
     body_len = get_u32_be(buf + 8);
 
-    /* A claimed body_length beyond the protocol's own maximum can never
-     * be legitimate. Waiting for that many bytes to arrive would just
-     * hang the connection (or, worse, be an attacker trying to get us to
-     * allocate/wait indefinitely) -- reject immediately. Because we
-     * cannot trust body_length here, we also cannot know where this
-     * "message" actually ends, so *consumed is left at 0: there is no
-     * safe resync point, and the caller should close the connection
-     * rather than keep parsing this buffer. */
+    /* A claimed body_length beyond the protocol max is rejected immediately; *consumed left at 0 - no safe resync point, caller should close. */
     if (body_len > DD_MAX_BODY_LEN) {
         *consumed = 0;
         return DD_PARSE_REJECTED;
@@ -141,10 +129,7 @@ dd_parse_result dd_try_parse_message(dd_session_state *state,
         return DD_PARSE_INCOMPLETE;
     }
 
-    /* From here on we know the full message is buffered, so *consumed is
-     * always set to `total` before returning, on both OK and REJECTED --
-     * a rejected-but-well-framed message still occupied exactly `total`
-     * bytes of the stream and must be skipped as a whole. */
+    /* Full message is buffered from here on; *consumed is set to `total` on both OK and REJECTED (a rejected message still occupied those bytes). */
     *consumed = total;
 
     out_msg->version  = buf[0];
@@ -170,8 +155,7 @@ dd_parse_result dd_try_parse_message(dd_session_state *state,
             return DD_PARSE_REJECTED;
     }
 
-    /* Replay/reorder check: strictly greater than the last seq_num we've
-     * accepted from this peer in this session. */
+    /* Replay/reorder check: strictly greater than the last seq_num we've accepted from this peer in this session. */
     if (state->have_seen_any && out_msg->seq_num <= state->last_seen_seq_num) {
         return DD_PARSE_REJECTED;
     }
@@ -183,10 +167,7 @@ dd_parse_result dd_try_parse_message(dd_session_state *state,
         return DD_PARSE_REJECTED;
     }
 
-    /* Only advance replay state once a message is fully accepted --
-     * a rejected message (e.g. failed HMAC) must not move this forward,
-     * or a single spoofed high seq_num could be used to lock out every
-     * legitimate message that follows it. */
+    /* Only advance replay state once fully accepted - a spoofed high seq_num on a rejected msg must not lock out legitimate ones after it. */
     state->last_seen_seq_num = out_msg->seq_num;
     state->have_seen_any = 1;
 

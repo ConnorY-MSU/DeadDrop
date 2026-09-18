@@ -1,8 +1,4 @@
-/*
- * hw_oled.c - see include/hw_oled.h for the full status note: Linux-only,
- * written against real sourced references, NOT yet run against real
- * hardware.
- */
+/* hw_oled.c - Linux-only, written against real sourced references. See include/hw_oled.h for full status note. */
 
 #ifdef __linux__
 
@@ -23,26 +19,10 @@
 #define OLED_CONTROL_COMMAND 0x00 /* Co=0, D/C#=0: stream of command bytes */
 #define OLED_CONTROL_DATA    0x40 /* Co=0, D/C#=1: stream of data bytes */
 
-/* Framebuffer: 8 pages x 128 columns, one byte per column per page (LSB
- * = top pixel of that page's 8-pixel-tall vertical strip) - the SSD1306's
- * own native GDDRAM layout in horizontal addressing mode, which is what
- * the init sequence below configures (SSD1306_MEMORYMODE, 0x00). One
- * static buffer, not a passed-around struct - this project has exactly
- * one physical display, matching the existing codebase's convention for
- * genuinely singleton state (e.g. revocation.c's revoked-serials list). */
+/* Framebuffer: 8 pages x 128 columns, one byte per column per page (LSB = top pixel) - the SSD1306's native GDDRAM layout. One static buffer (one physical display). */
 static uint8_t framebuffer[HW_OLED_HEIGHT / 8][HW_OLED_WIDTH];
 
-/*
- * SSD1306 128x64 init sequence, internal charge pump (SSD1306_SWITCHCAPVCC -
- * these small I2C OLED modules universally generate their own panel
- * voltage internally; SSD1306_EXTERNALVCC is for a different class of
- * higher-power module not used here). Traced byte-for-byte against
- * Adafruit_SSD1306.cpp's begin() function and the SSD1306_* command
- * constants in Adafruit_SSD1306.h (both fetched directly, not recalled
- * from memory), not assembled from general SSD1306 datasheet familiarity
- * alone. Sent as ONE I2C command-stream write (Co=0 lets multiple
- * command bytes follow a single control byte).
- */
+/* SSD1306 128x64 init sequence, internal charge pump (SSD1306_SWITCHCAPVCC). Traced byte-for-byte against Adafruit_SSD1306.cpp's begin(). Sent as one I2C command-stream write. */
 static const uint8_t oled_init_sequence[] = {
     0xAE,             /* DISPLAYOFF */
     0xD5, 0x80,       /* SETDISPLAYCLOCKDIV, suggested ratio */
@@ -63,12 +43,7 @@ static const uint8_t oled_init_sequence[] = {
     0xAF              /* DISPLAYON */
 };
 
-/* Largest single write this file ever issues: one framebuffer chunk (32
- * bytes, see hw_oled_display()) - the init sequence (26 bytes, confirmed
- * via sizeof(), not hand-counted) is smaller. Either way, comfortably
- * under a fixed stack buffer sized with real headroom, so this never
- * needs malloc() for what's a small, bounded, known-at-compile-time set
- * of transfer sizes. */
+/* Largest single write this file issues is one framebuffer chunk (32 bytes, see hw_oled_display()); comfortably under this fixed stack buffer, so malloc() is never needed. */
 #define I2C_WRITE_BUF_MAX 40
 
 static int i2c_write(int fd, uint8_t control_byte,
@@ -138,20 +113,11 @@ void hw_oled_draw_text(int fd, int line, const char *text)
         return;
     }
 
-    /* Clear the whole line first, so a shorter string correctly
-     * overwrites whatever a longer one previously left on this line -
-     * see the header comment for why callers don't need to clear
-     * themselves before every draw. */
+    /* Clear the whole line first, so a shorter string correctly overwrites whatever a longer one previously left there. */
     memset(framebuffer[line], 0, HW_OLED_WIDTH);
 
     for (i = 0, col = 0; text[i] != '\0' && col + 5 <= HW_OLED_WIDTH; i++) {
-        /* hw_oled_font is indexed by raw byte value, 5 bytes per
-         * character, covering the full 0-255 range - see
-         * hw_oled_font.h. A byte outside the font table's meaningful
-         * printable range (e.g. an incoming message containing raw
-         * control bytes) still indexes safely into real font data,
-         * it just won't look like a normal glyph - never a memory-
-         * safety concern, since the table is sized for all 256 values. */
+        /* hw_oled_font is indexed by raw byte value, 5 bytes/char, full 0-255 range - see hw_oled_font.h. Non-printable bytes index safely, just look wrong. */
         unsigned char c = (unsigned char)text[i];
         const unsigned char *glyph = &hw_oled_font[(size_t)c * 5];
         int k;
@@ -179,15 +145,7 @@ void hw_oled_display(int fd)
         return;
     }
 
-    /* Stream the framebuffer in modest chunks rather than one single
-     * 1024-byte write - a conservative, widely-used choice in reference
-     * SSD1306 drivers to stay well under I2C adapter/kernel transaction-
-     * size limits that vary by hardware, rather than assuming the full
-     * buffer always fits in one transaction. Each chunk gets its own
-     * data control byte (0x40), which is valid mid-stream per the
-     * SSD1306's own addressing auto-increment behavior in horizontal
-     * mode - the controller doesn't need one giant transaction to know
-     * where consecutive writes continue from. */
+    /* Stream the framebuffer in modest chunks rather than one 1024-byte write, to stay under I2C transaction-size limits that vary by hardware. */
     for (page = 0; page < HW_OLED_HEIGHT / 8; page++) {
         int offset;
         for (offset = 0; offset < HW_OLED_WIDTH; offset += 32) {

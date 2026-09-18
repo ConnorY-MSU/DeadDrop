@@ -3,15 +3,13 @@
 
 void sha256_transform(sha256_context *ctx, const uint8_t block[64]);
 
-/* Initial hash values, FIPS 180-4 Sec. 5.3.3 -- fractional parts of the square
-   roots of the first 8 primes ("nothing up my sleeve" numbers). */
+/* Initial hash values, FIPS 180-4 Sec. 5.3.3 (fractional parts of square roots of first 8 primes). */
 static const uint32_t H0[8] = {
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
     0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
 };
 
-/* Round constants, FIPS 180-4 Sec. 4.2.2 -- fractional parts of the cube
-   roots of the first 64 primes. */
+/* Round constants, FIPS 180-4 Sec. 4.2.2 (fractional parts of cube roots of first 64 primes). */
 static const uint32_t K[64] = {
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
     0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
@@ -23,13 +21,7 @@ static const uint32_t K[64] = {
     0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
 };
 
-/* Bitwise primitives. Lowercase snake_case, matching the rest of the project
-   (aes128.c's sub_bytes/shift_rows/etc.) rather than ALL-CAPS -- deliberate
-   choice for consistency, since in C, ALL-CAPS conventionally signals a macro,
-   not a real typed function like these. Names still map directly onto FIPS
-   180-4's own notation: rotr = ROTR, ch = Ch, maj = Maj, bsig0/1 = Sigma0/1
-   (uppercase sigma, used in the compression function), ssig0/1 = sigma0/1
-   (lowercase sigma, used in the message schedule). */
+/* Bitwise primitives; names map onto FIPS 180-4 notation (rotr=ROTR, ch=Ch, maj=Maj, bsig0/1=Sigma0/1, ssig0/1=sigma0/1). */
 static inline uint32_t rotr(uint32_t x, unsigned int n) {
     return (x >> n) | (x << (32 - n));
 }
@@ -87,10 +79,7 @@ void sha256_final(sha256_context *ctx, uint8_t digest[32]) {
     uint64_t bitlen_be = ctx->bitlen; /* snapshot before update() calls below inflate it with padding bits */
     sha256_update(ctx, &pad, 1);
     static const uint8_t zero = 0;
-    /* Pad with zero bytes until exactly 56 bytes (448 bits) are buffered, leaving
-       the last 8 bytes of the 64-byte block for the length field below. Reusing
-       update()'s buffering means this naturally spills into a second block when
-       the message was already close to a block boundary -- see FIPS 180-4 Sec. 5.1.1. */
+    /* Pad with zero bytes to 56 bytes (448 bits), leaving 8 bytes for the length field (FIPS 180-4 Sec. 5.1.1). */
     while (ctx->buffer_len != 56) {
         sha256_update(ctx, &zero, 1);
     }

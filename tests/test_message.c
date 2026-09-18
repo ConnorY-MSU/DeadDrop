@@ -5,16 +5,7 @@
 #include "message.h"
 #include "hmac.h"
 
-/* Unit tests for src/message.c's dd_serialize_message()/dd_try_parse_message(),
- * isolated from wolfSSL/TLS entirely - dd_session_init() is never called
- * here; instead, dd_session_state is populated directly with a fixed test
- * key, exactly the way a real per-session key (however it was derived)
- * would look to these functions. This tests the wire-format/HMAC/seq_num
- * logic on its own, matching the same field-by-field spec in
- * docs/PROTOCOL.md that the live client/server exchange was checked
- * against - this is the hand-checked-vector layer that exchange didn't
- * replace, the same distinction Week 1's SHA-256/AES-128 test vectors
- * drew against just "the program ran without crashing." */
+/* Unit tests for dd_serialize_message()/dd_try_parse_message(), isolated from wolfSSL/TLS via a fixed test key; checks wire-format/HMAC/seq_num logic against docs/PROTOCOL.md. */
 
 static int all_pass = 1;
 
@@ -30,9 +21,7 @@ static void check_bytes(const char *name, const uint8_t *actual, const uint8_t *
     if (!ok) all_pass = 0;
 }
 
-/* Fixed test key - stands in for whatever dd_session_init() would have
- * derived from a real TLS session via wolfSSL_export_keying_material().
- * Sender and receiver share it, exactly like two ends of a real session. */
+/* Fixed test key standing in for a real TLS-derived key; shared by sender and receiver like a real session. */
 static const uint8_t test_key[DD_HMAC_KEY_SIZE] = {
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
     0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
@@ -45,12 +34,7 @@ static void init_state(dd_session_state *s) {
     memcpy(s->hmac_key, test_key, sizeof(test_key));
 }
 
-/* Recomputes the HMAC tag over buf[0 .. total-33) and overwrites the last
- * 32 bytes with it - used after deliberately corrupting a header field
- * OTHER than the tag itself, so a test can isolate "this specific field
- * check rejects it" from "the HMAC happens to not match anymore", which a
- * bare bit-flip alone can't distinguish (message.c checks version/type
- * before HMAC, so this matters for actually proving those checks fire). */
+/* Recomputes the HMAC tag over buf[0 .. total-33) so a test isolates a corrupted field's rejection from a stale-HMAC failure. */
 static void refresh_tag(uint8_t *buf, size_t total) {
     hmac_sha256(test_key, sizeof(test_key), buf, total - DD_HMAC_SIZE, buf + total - DD_HMAC_SIZE);
 }
@@ -80,9 +64,7 @@ int main(void) {
     check("round-trip: body_len", (int)msg.body_len, 5);
     check_bytes("round-trip: body content", msg.body, (const uint8_t *)"hello", 5);
 
-    /* Hand-verify the exact byte layout against docs/PROTOCOL.md's worked
-     * example for this same message (msg_type=1, seq_num=0, body="hello"):
-     * offsets 0-16 should be 01 01 00 00 00 00 00 00 00 00 00 05 68 65 6C 6C 6F */
+    /* Hand-verify the byte layout against docs/PROTOCOL.md's worked example (msg_type=1, seq_num=0, body="hello"). */
     {
         static const uint8_t expected_prefix[17] = {
             0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

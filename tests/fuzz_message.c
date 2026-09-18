@@ -4,36 +4,7 @@
 #include <time.h>
 #include "message.h"
 
-/* Fuzz harness for dd_try_parse_message() (src/message.c) - Week 3 Day 5,
- * intensified beyond the walkthrough's baseline example after an explicit
- * request to make this "super intensive" rather than just meeting the
- * minimum bar. Must be built with -fsanitize=address -fsanitize=undefined
- * to mean anything - see TESTING.md for the exact build line used.
- *
- * "Pass" means: every single iteration, the parser either correctly
- * parses well-formed input or cleanly returns DD_PARSE_REJECTED /
- * DD_PARSE_INCOMPLETE - never crashes, never triggers an ASan/UBSan
- * report, never hangs. A sanitizer report aborts the process mid-run and
- * is unmistakable in the output; a clean "FUZZING COMPLETE, NO CRASHES"
- * with exit code 0 is what "passed" looks like.
- *
- * What's more intensive here than the original pass:
- *  - 10x the iteration count (1,000,000 per strategy instead of 100,000)
- *  - pure-random buffers now span the FULL valid message-size range
- *    (up to DD_MAX_MSG_SIZE, ~64KB) instead of being capped at 512 bytes -
- *    the original range barely touched realistic message sizes at all
- *  - mutation fuzzing now runs against THREE base messages of very
- *    different sizes (tiny/medium/near-max body), not just one ~44-byte
- *    message - a bug that only manifests on large-message code paths
- *    (e.g. buffer-boundary arithmetic near DD_MAX_BODY_LEN) would never
- *    have been reachable by mutating only a small message
- *  - three new mutation strategies (stacked multi-mutation, extreme
- *    header field values, same-length pure garbage) alongside the
- *    original five
- *  - a deterministic fixed-edge-case pass (not randomized at all) that
- *    always runs the same specific boundary inputs every time, so those
- *    specific cases are guaranteed covered rather than left to chance
- */
+/* Fuzz harness for dd_try_parse_message() (src/message.c); build with -fsanitize=address,undefined per TESTING.md. See COMMENT_ARCHIVE.md. */
 
 #define ITERATIONS_PURE_RANDOM 1000000
 #define ITERATIONS_MUTATED     1000000
@@ -56,10 +27,7 @@ static void init_state(dd_session_state *s)
     memcpy(s->hmac_key, test_key, sizeof(test_key));
 }
 
-/* Feeds one buffer through the parser and confirms it returns one of the
- * three defined outcomes. A crash/ASan report during this call ends the
- * whole process - there is nothing further to check in that case, since
- * it never returns. */
+/* Feeds one buffer through the parser; a crash/ASan report ends the process here. */
 static void fuzz_one(dd_session_state *state, const uint8_t *buf, size_t len,
                       fuzz_stats *stats)
 {
@@ -78,10 +46,7 @@ static void fuzz_one(dd_session_state *state, const uint8_t *buf, size_t len,
             stats->incomplete++;
             break;
         default:
-            /* Genuinely should be unreachable - dd_parse_result has
-             * exactly three values. If this ever fires, that IS the
-             * finding: the parser returned something outside its own
-             * defined contract. */
+            /* Unreachable in a correct build - dd_parse_result has only three values. */
             stats->unexpected++;
             fprintf(stderr,
                 "fuzz_one: dd_try_parse_message returned undefined "
@@ -96,11 +61,7 @@ static void print_stats(const char *label, const fuzz_stats *s)
            label, s->ok, s->rejected, s->incomplete, s->unexpected);
 }
 
-/* Pure-random buffers, full valid-message-size range (0 to
- * DD_MAX_MSG_SIZE) - not capped at some small arbitrary length. Real
- * messages this project actually sends span this whole range (a
- * DISCONNECT is 44 bytes, a max-size TEXT_MESSAGE is ~64KB), so the
- * fuzzer should too. */
+/* Pure-random buffers across the full valid message-size range (0 to DD_MAX_MSG_SIZE). */
 static void run_pure_random(fuzz_stats *stats)
 {
     dd_session_state state;
@@ -117,13 +78,7 @@ static void run_pure_random(fuzz_stats *stats)
            "bytes (%d iterations)...\n", MAX_FUZZ_LEN, ITERATIONS_PURE_RANDOM);
 
     for (i = 0; i < ITERATIONS_PURE_RANDOM; i++) {
-        /* Bias toward smaller lengths (where real messages actually
-         * live) while still reaching the full range regularly - a flat
-         * distribution over 0..65580 would spend disproportionate time
-         * near the top end where every single byte has to be randomized
-         * (slow) for comparatively little additional coverage value
-         * beyond confirming large lengths are handled at all, which a
-         * smaller sample of large buffers already establishes. */
+        /* Biased toward smaller lengths (where real messages live), while still reaching the full range. */
         size_t len;
         int roll = rand() % 100;
         if (roll < 70) {
@@ -146,10 +101,7 @@ static void run_pure_random(fuzz_stats *stats)
     free(buf);
 }
 
-/* Builds one valid, correctly-signed base message of the given body
- * length, filled with a repeating but non-trivial byte pattern (not all
- * zero/all same byte, so a bug that depends on body content isn't
- * accidentally masked by uniform content). */
+/* Builds one valid, correctly-signed base message of the given body length. */
 static int build_base_message(dd_session_state *sender, uint32_t body_len,
                                uint8_t *out_buf, size_t out_buf_size)
 {
@@ -169,12 +121,7 @@ static int build_base_message(dd_session_state *sender, uint32_t body_len,
     return total;
 }
 
-/* Mutation strategy, cycling through eight kinds each iteration, run
- * against three differently-sized base messages in turn (tiny/medium/
- * near-max) rather than just one small one - specifically targeting the
- * "subtly wrong, not obviously wrong" input class [[Memory Safety Testing
- * Concepts]] calls out as the real blind spot, and specifically exercising
- * large-message code paths a single small base message never would. */
+/* Mutation strategy cycling through eight kinds each iteration, run against three differently-sized base messages. */
 static void run_mutated(fuzz_stats *stats)
 {
     dd_session_state sender, receiver;
@@ -182,10 +129,7 @@ static void run_mutated(fuzz_stats *stats)
     uint8_t *buf = malloc(DD_MAX_MSG_SIZE);
     int i;
 
-    /* Tiny (44-byte body, ~86-byte message), medium (4KB body), and
-     * near-max (DD_MAX_BODY_LEN - 1, deliberately not exactly the max so
-     * this is still a genuinely valid message before any mutation, not
-     * something already sitting on the rejection boundary). */
+    /* Tiny, medium, and near-max (not exactly max, so still valid before mutation) base message sizes. */
     static const uint32_t base_body_lens[3] = {
         44, 4096, DD_MAX_BODY_LEN - 1
     };
@@ -217,8 +161,7 @@ static void run_mutated(fuzz_stats *stats)
 
         for (i = 0; i < ITERATIONS_MUTATED / 3; i++) {
             size_t len = (size_t)good_total;
-            /* 8 strategies now instead of 5 - see individual comments
-             * below for what each targets. */
+            /* 8 strategies - see individual comments below for what each targets. */
             int strategy = rand() % 8;
             int num_passes = (strategy == 5) ? (2 + rand() % 2) : 1;
             int pass;
@@ -226,16 +169,12 @@ static void run_mutated(fuzz_stats *stats)
             memcpy(buf, good_msg, len);
 
             for (pass = 0; pass < num_passes; pass++) {
-                /* strategy 5 (stacked) picks a FRESH random sub-strategy
-                 * on each pass rather than reusing 5 itself, so "stacked"
-                 * actually means "apply several DIFFERENT mutations
-                 * together", not the same one repeated. */
+                /* Each pass of a stacked (5) sequence picks a fresh random sub-strategy. */
                 int sub = (strategy == 5) ? (rand() % 5) : strategy;
 
                 switch (sub) {
                     case 0: {
-                        /* Flip a handful of random bits anywhere,
-                         * including the HMAC tag itself. */
+                        /* Flip a handful of random bits anywhere, including the HMAC tag itself. */
                         int flips = 1 + (rand() % 5);
                         int f;
                         for (f = 0; f < flips; f++) {
@@ -245,17 +184,7 @@ static void run_mutated(fuzz_stats *stats)
                         break;
                     }
                     case 1: {
-                        /* Truncate to a random shorter length, but never
-                         * to exactly 0 - the empty-buffer case is
-                         * already covered deterministically by
-                         * run_fixed_edge_cases(), and letting len reach
-                         * 0 here made every OTHER case's `rand() %
-                         * (int)len` (e.g. case 0 picking a byte position
-                         * to flip) a division-by-zero once a stacked
-                         * iteration's later pass ran against an
-                         * already-zeroed len - a real UBSan/ASan catch
-                         * hit while building this, in this harness, not
-                         * in message.c. */
+                        /* Truncate to a random shorter length, never exactly 0 (len==0 caused a real UBSan div-by-zero here - see COMMENT_ARCHIVE.md). */
                         len = 1 + (size_t)(rand() % (int)len);
                         break;
                     }
@@ -265,9 +194,7 @@ static void run_mutated(fuzz_stats *stats)
                         break;
                     }
                     case 3: {
-                        /* Plausible-but-wrong body_length: small delta,
-                         * not an absurd value the length check trivially
-                         * catches. */
+                        /* Plausible-but-wrong body_length: small delta, not an absurd value the length check trivially catches. */
                         uint32_t body_len_field =
                             ((uint32_t)buf[8] << 24) | ((uint32_t)buf[9] << 16) |
                             ((uint32_t)buf[10] << 8) | (uint32_t)buf[11];
@@ -282,8 +209,7 @@ static void run_mutated(fuzz_stats *stats)
                     }
                     case 4:
                     default: {
-                        /* Corrupt only the HMAC tag - header/body
-                         * untouched, isolating "HMAC-only failure". */
+                        /* Corrupt only the HMAC tag - header/body untouched, isolating "HMAC-only failure". */
                         size_t tag_start = (size_t)good_total - DD_HMAC_SIZE;
                         int flips = 1 + (rand() % 4);
                         int f;
@@ -298,13 +224,7 @@ static void run_mutated(fuzz_stats *stats)
             }
 
             if (strategy == 6) {
-                /* Extreme header field values, on top of whatever the
-                 * base message had - seq_num and reserved pushed to
-                 * their bit-pattern extremes. body_length is
-                 * deliberately left alone here (strategy 7 covers that
-                 * specific extreme separately, since combining both at
-                 * once would make it hard to tell which one mattered if
-                 * something were ever found). */
+                /* Extreme header field values: seq_num and reserved pushed to bit-pattern extremes (body_length covered by strategy 7). */
                 uint32_t extreme_seq = (rand() % 2) ? 0xFFFFFFFFu : 0u;
                 buf[4] = (uint8_t)(extreme_seq >> 24);
                 buf[5] = (uint8_t)(extreme_seq >> 16);
@@ -313,15 +233,7 @@ static void run_mutated(fuzz_stats *stats)
                 buf[2] = (uint8_t)(rand() % 2 ? 0xFF : 0x00); /* reserved */
                 buf[3] = (uint8_t)(rand() % 2 ? 0xFF : 0x00);
             } else if (strategy == 7) {
-                /* body_length pushed to its own extreme: exactly
-                 * DD_MAX_BODY_LEN (the largest value that must still be
-                 * accepted as "plausible" and go on to the completeness
-                 * check, not rejected outright the way MAX+1 would be)
-                 * or exactly 0. Buffer bytes beyond the original message
-                 * are untouched garbage from the base message reused
-                 * across iterations - fine, since the point is exercising
-                 * the length-vs-available-bytes comparison itself, not
-                 * producing a coherent message. */
+                /* body_length pushed to its own extreme: exactly DD_MAX_BODY_LEN or exactly 0; trailing garbage bytes don't matter here. */
                 uint32_t extreme_len =
                     (rand() % 2) ? (uint32_t)DD_MAX_BODY_LEN : 0u;
                 buf[8]  = (uint8_t)(extreme_len >> 24);
@@ -331,9 +243,7 @@ static void run_mutated(fuzz_stats *stats)
             }
 
             fuzz_one(&receiver, buf, len, stats);
-            /* Reset receiver state each iteration so a mutation that
-             * happens to parse OK doesn't move every later iteration's
-             * replay baseline. */
+            /* Reset receiver state each iteration so a mutation that parses OK doesn't skew later iterations. */
             init_state(&receiver);
         }
     }
@@ -342,10 +252,7 @@ static void run_mutated(fuzz_stats *stats)
     free(buf);
 }
 
-/* Deterministic, not randomized - the same specific boundary inputs run
- * every single time this binary executes, so these exact cases are
- * guaranteed covered rather than left to chance the way the randomized
- * passes above are. */
+/* Deterministic, not randomized - these exact boundary inputs run every time this binary executes. */
 static void run_fixed_edge_cases(fuzz_stats *stats)
 {
     dd_session_state state;
@@ -362,36 +269,26 @@ static void run_fixed_edge_cases(fuzz_stats *stats)
     memset(buf, 0, DD_HEADER_SIZE);
     fuzz_one(&state, buf, DD_HEADER_SIZE - 1, stats); n++;
 
-    /* Exactly a complete header, zero body claimed, but no tag present
-     * yet (still incomplete overall). */
+    /* Exactly a complete header, zero body claimed, but no tag present yet (still incomplete). */
     fuzz_one(&state, buf, DD_HEADER_SIZE, stats); n++;
 
-    /* Exactly one byte short of the smallest possible complete message
-     * (header + zero body + tag). */
+    /* Exactly one byte short of the smallest possible complete message (header + zero body + tag). */
     memset(buf, 0, DD_HEADER_SIZE + DD_HMAC_SIZE);
     fuzz_one(&state, buf, DD_HEADER_SIZE + DD_HMAC_SIZE - 1, stats); n++;
 
-    /* All-zero buffer at several sizes, including exactly the smallest
-     * possible complete message - version 0 and type 0 are both
-     * unrecognized, so this should reject cleanly on that basis alone,
-     * well before any HMAC computation happens on it. */
+    /* All-zero buffer at several sizes - version 0 and type 0 should reject cleanly, before any HMAC work. */
     memset(buf, 0x00, sizeof(buf));
     fuzz_one(&state, buf, DD_HEADER_SIZE + DD_HMAC_SIZE, stats); n++;
     fuzz_one(&state, buf, 4096, stats); n++;
     fuzz_one(&state, buf, DD_MAX_MSG_SIZE, stats); n++;
 
-    /* All-0xFF buffer, same sizes - version 0xFF and a claimed
-     * body_length of 0xFFFFFFFF specifically exercises the "implausible
-     * length rejected before being trusted for anything, including the
-     * completeness check itself" path from a maximally hostile angle. */
+    /* All-0xFF buffer, same sizes - exercises the "implausible length rejected before trust" path from a hostile angle. */
     memset(buf, 0xFF, sizeof(buf));
     fuzz_one(&state, buf, DD_HEADER_SIZE + DD_HMAC_SIZE, stats); n++;
     fuzz_one(&state, buf, 4096, stats); n++;
     fuzz_one(&state, buf, DD_MAX_MSG_SIZE, stats); n++;
 
-    /* A well-formed header (correct version, valid msg_type) but with
-     * body_length claiming exactly DD_MAX_BODY_LEN + 1 - one past the
-     * cap, the exact boundary the length-sanity-check exists for. */
+    /* A well-formed header but body_length claiming exactly DD_MAX_BODY_LEN + 1 - one past the sanity-check cap. */
     {
         uint32_t over = (uint32_t)DD_MAX_BODY_LEN + 1;
         memset(buf, 0, sizeof(buf));
@@ -404,10 +301,7 @@ static void run_fixed_edge_cases(fuzz_stats *stats)
         fuzz_one(&state, buf, DD_HEADER_SIZE, stats); n++;
     }
 
-    /* Same, but exactly AT the cap (DD_MAX_BODY_LEN, not over it) - this
-     * must be treated as plausible and fall through to the completeness
-     * check (INCOMPLETE, since the actual bytes aren't present), not
-     * rejected outright the way MAX+1 is. */
+    /* Same, but exactly AT the cap - must fall through to the completeness check (INCOMPLETE), not be rejected outright. */
     {
         uint32_t at_cap = (uint32_t)DD_MAX_BODY_LEN;
         memset(buf, 0, sizeof(buf));

@@ -1,27 +1,7 @@
 #ifndef HW_OLED_FONT_H
 #define HW_OLED_FONT_H
 
-/*
- * hw_oled_font - the classic fixed-space 5x7 bitmap font from Adafruit's
- * Adafruit-GFX-Library (glcdfont.c), used industry-wide for SSD1306-class
- * displays. MIT licensed (github.com/adafruit/Adafruit-GFX-Library).
- *
- * Copied verbatim (programmatically extracted, not hand-retyped) from
- * https://raw.githubusercontent.com/adafruit/Adafruit-GFX-Library/master/glcdfont.c
- * on 2026-08-21, specifically to avoid the real risk of a transcription
- * error in bitmap font data, which would be silently wrong (garbled
- * characters) and hard to notice without real hardware to visually
- * check against - the same "verify, don't fabricate" discipline this
- * project has applied to every other external reference (RFC vectors,
- * NIST vectors, the FNK0100's own I2C register map) rather than typing
- * font bytes from memory.
- *
- * 256 characters, 5 bytes each (one byte per column, 7 pixels tall,
- * LSB = top pixel), starting at character code 0 - printable ASCII
- * (0x20 space through 0x7E '~') is what this project actually uses,
- * but the full table is kept intact rather than trimmed, to avoid any
- * chance of an off-by-one during extraction.
- */
+/* hw_oled_font - classic fixed-space 5x7 bitmap font from Adafruit's Adafruit-GFX-Library (glcdfont.c), MIT licensed, extracted verbatim 2026-08-21. 256 chars, 5 bytes each (one byte per column, LSB = top pixel). */
 static const unsigned char hw_oled_font[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x3E, 0x5B, 0x4F, 0x5B, 0x3E, 0x3E, 0x6B,
     0x4F, 0x6B, 0x3E, 0x1C, 0x3E, 0x7C, 0x3E, 0x1C, 0x18, 0x3C, 0x7E, 0x3C,
@@ -99,8 +79,7 @@ static const unsigned char hw_oled_font[] = {
     0x4D, 0x40, 0x20, 0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08,
     0x38, 0x2F, 0x10, 0xC8, 0xAC, 0xBA, 0x2F, 0x10, 0x28, 0x34, 0xFA, 0x00,
     0x00, 0x7B, 0x00, 0x00, 0x08, 0x14, 0x2A, 0x14, 0x22, 0x22, 0x14, 0x2A,
-    0x14, 0x08, 0x55, 0x00, 0x55, 0x00, 0x55, // #176 (25% block) missing in old
-                                              // code
+    0x14, 0x08, 0x55, 0x00, 0x55, 0x00, 0x55, // #176 (25% block) missing in old code
     0xAA, 0x55, 0xAA, 0x55, 0xAA,             // 50% block
     0xFF, 0x55, 0xFF, 0x55, 0xFF,             // 75% block
     0x00, 0x00, 0x00, 0xFF, 0x00, 0x10, 0x10, 0x10, 0xFF, 0x00, 0x14, 0x14,

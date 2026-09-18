@@ -36,10 +36,7 @@
 #define DEFAULT_HOST "127.0.0.1"
 #define DEFAULT_PORT 4433
 
-/* --- Phase 1 design decisions, documented here where they're used ---
- * (see docs/BENCHMARK_WRITEUP.md for the write-up itself, which needs
- * real numbers from an actual run filled in - this file only produces
- * the numbers, it can't write the write-up's conclusion for you). */
+/* Phase 1 design decisions; see docs/BENCHMARK_WRITEUP.md for the write-up itself (needs real run numbers filled in). */
 
 /* 10,000+ per the build log's own requirement. */
 #define HANDSHAKE_ITERATIONS 10000
@@ -48,8 +45,7 @@
 #define SMALL_PAYLOAD "Hey, you free to grab dinner tonight?"
 #define SMALL_PAYLOAD_ITERATIONS 2000
 
-/* Larger payload: "a few KB", well under DD_MAX_BODY_LEN (64 KiB).
- * 4096 bytes chosen as a clean, round few-KB size. */
+/* Larger payload: "a few KB", well under DD_MAX_BODY_LEN (64 KiB); 4096 is a clean round size. */
 #define LARGE_PAYLOAD_SIZE 4096
 #define LARGE_PAYLOAD_ITERATIONS 500
 
@@ -96,10 +92,7 @@ static void parse_args(int argc, char *argv[],
     }
 }
 
-/* n is the number of VALID entries actually in samples - callers that
- * bail out early (e.g. a dead connection mid-benchmark) pass however
- * many iterations actually completed, not the originally requested
- * count, so this never reads past what was really measured. */
+/* n is the number of VALID entries in samples - may be less than the requested iteration count if a caller bailed out early. */
 static void print_stats(const char *label, double *samples, int n)
 {
     double min, max, median, sum = 0.0;
@@ -123,14 +116,7 @@ static void print_stats(const char *label, double *samples, int n)
            label, n, min, median, sum / n, max);
 }
 
-/* Open a fresh TCP connection to host:port. Uses getaddrinfo() rather than
- * inet_pton() - matches client.c as of commit ba6ab0d, which switched for
- * exactly this reason: inet_pton() only parses numeric IP text, so it
- * flatly rejects a Tailscale MagicDNS hostname with no lookup attempted
- * at all. This benchmark needs to work against whatever addressing
- * scheme client.c ends up using once Week 3 Day 3's second device
- * exists, so it has to handle both a raw IP and a hostname the same way
- * client.c does. Returns SOCKET_INVALID on failure. */
+/* Open a fresh TCP connection to host:port. Uses getaddrinfo() (not inet_pton()) so a Tailscale MagicDNS hostname works too, not just a raw IP. Returns SOCKET_INVALID on failure. */
 static socket_t open_tcp_connection(const char *host, int port)
 {
     socket_t sock;
@@ -187,23 +173,13 @@ static socket_t open_tcp_connection(const char *host, int port)
     return sock;
 }
 
-/*
- * run_handshake_benchmark - Phase 3's per-iteration handshake loop.
- * "One handshake iteration" = fresh TCP connect -> full mTLS handshake,
- * timed from just before wolfSSL_new() to just after wolfSSL_connect()
- * returns. The DISCONNECT send + close after that is NOT timed - it's
- * only there to keep the single-threaded server (see server.c: one
- * connection at a time) responsive for the next iteration instead of
- * sitting on a 30s read timeout for a connection that's just going to be
- * abandoned anyway.
- */
+/* run_handshake_benchmark - per-iteration handshake loop. Times connect+handshake only; the DISCONNECT send + close after is untimed cleanup. */
 static void run_handshake_benchmark(WOLFSSL_CTX *ctx, const char *host,
                                      int port, int iterations)
 {
     double *samples = malloc(sizeof(double) * (size_t)iterations);
     int i;
-    int valid = 0;    /* count of samples[] entries actually written -
-                        * only successful handshakes, see below */
+    int valid = 0;    /* count of samples[] entries actually written - only successful handshakes */
     int failures = 0;
 
     if (samples == NULL) {
@@ -234,10 +210,7 @@ static void run_handshake_benchmark(WOLFSSL_CTX *ctx, const char *host,
             break;
         }
         wolfSSL_set_fd(ssl, (int)sock);
-        /* Needed because the (untimed) block below calls dd_session_init(),
-         * which exports keying material after the handshake completes -
-         * without this, wolfSSL would have already freed the temporary
-         * arrays that export needs. */
+        /* Needed so dd_session_init() below can still export keying material - without this wolfSSL frees the temporary arrays first. */
         wolfSSL_KeepArrays(ssl);
         rc = wolfSSL_connect(ssl);
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -249,13 +222,7 @@ static void run_handshake_benchmark(WOLFSSL_CTX *ctx, const char *host,
             char errbuf[80];
             fprintf(stderr, "iteration %d: handshake failed: %s\n", i,
                     wolfSSL_ERR_error_string(err, errbuf));
-            /* Do NOT record sample_ms below - a failed attempt's timing
-             * describes how long it took to error out, not how long a
-             * real handshake takes, and mixing the two into the same
-             * stats with no visible failure count would make a bad
-             * min/median/max silently look like normal variance instead
-             * of what it actually is. failures is reported explicitly
-             * below instead. */
+            /* Don't record sample_ms - a failed attempt times the error-out, not a real handshake; failures is reported separately below. */
             failures++;
         } else {
             dd_session_state state;
@@ -285,12 +252,7 @@ static void run_handshake_benchmark(WOLFSSL_CTX *ctx, const char *host,
     free(samples);
 }
 
-/*
- * run_throughput_benchmark - connect and handshake ONCE, then send
- * `iterations` TEXT_MESSAGEs of `payload_len` bytes over that one
- * persistent connection, timing each round trip: send -> wait for the
- * server's "ack: " reply (server.c echoes every TEXT_MESSAGE this way).
- */
+/* run_throughput_benchmark - connect and handshake once, then send `iterations` TEXT_MESSAGEs of `payload_len` bytes over that connection, timing each round trip until the server's ack. */
 static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
                                       int port, const char *label,
                                       size_t payload_len, int iterations)
@@ -318,11 +280,7 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
         return;
     }
     wolfSSL_set_fd(ssl, (int)sock);
-    /* Same requirement as run_handshake_benchmark() above: the upcoming
-     * dd_session_init() call needs wolfSSL's handshake arrays to still be
-     * around after wolfSSL_connect() returns, which only happens if this
-     * is called before the handshake, not after. Missing here is exactly
-     * the Day 2 wolfSSL_export_keying_material-fails-silently bug. */
+    /* Same requirement as run_handshake_benchmark() above - must be called before wolfSSL_connect(). See COMMENT_ARCHIVE.md for a real bug this avoids. */
     wolfSSL_KeepArrays(ssl);
 
     rc = wolfSSL_connect(ssl);
@@ -375,9 +333,7 @@ static void run_throughput_benchmark(WOLFSSL_CTX *ctx, const char *host,
             break;
         }
 
-        /* Wait for the server's reply - same streaming-parse shape as
-         * client.c's receive_one_message(), inlined here since this is
-         * the only place in this file that needs it. */
+        /* Wait for the server's reply - same streaming-parse shape as client.c's receive_one_message(), inlined here. */
         for (;;) {
             dd_parsed_message msg;
             size_t consumed = 0;

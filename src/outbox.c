@@ -4,13 +4,7 @@
 
 #include "outbox.h"
 
-/* Fixed-size circular buffer of fixed-size string slots - simplest
- * correct implementation for a small, bounded queue; no dynamic
- * allocation, no linked-list bookkeeping. pthread is available
- * unconditionally on this project's two real targets (Linux natively,
- * this project's Windows dev machine via winpthreads - confirmed
- * working during the two-way redesign, see session.c/session.h),
- * so no __linux__ split is needed here. */
+/* Fixed-size circular buffer of fixed-size string slots; pthread works unconditionally on both real targets, no __linux__ split needed. */
 static char slots[OUTBOX_MAX_MESSAGES][OUTBOX_MSG_MAX_LEN];
 static int head = 0;   /* next slot to dequeue from */
 static int count = 0;  /* number of messages currently queued */

@@ -2,9 +2,7 @@
 #include "sha256.h"
 #include <string.h>
 
-/* SHA-256's internal block size (FIPS 180-4 Sec. 4.2.2) -- also the block
- * size HMAC pads its key to, per RFC 2104. Not the same thing as the
- * digest size (32 bytes); this is deliberately a separate constant. */
+/* SHA-256's internal block size (FIPS 180-4 Sec. 4.2.2); also the size HMAC pads its key to (RFC 2104), distinct from the 32-byte digest size. */
 #define HMAC_SHA256_BLOCK_SIZE 64
 
 void hmac_sha256(const uint8_t *key, size_t key_len,
@@ -18,10 +16,7 @@ void hmac_sha256(const uint8_t *key, size_t key_len,
     sha256_context ctx;
     size_t i;
 
-    /* RFC 2104 step 1/5.a: keys longer than one block are hashed down to
-     * digest size first; keys shorter than one block are zero-padded out
-     * to the full block. Either way key_block ends up exactly
-     * HMAC_SHA256_BLOCK_SIZE bytes. */
+    /* RFC 2104 step 1/5.a: longer keys are hashed down, shorter keys zero-padded; key_block ends up exactly HMAC_SHA256_BLOCK_SIZE bytes. */
     memset(key_block, 0, sizeof(key_block));
     if (key_len > HMAC_SHA256_BLOCK_SIZE) {
         sha256_init(&ctx);
@@ -48,8 +43,7 @@ void hmac_sha256(const uint8_t *key, size_t key_len,
     sha256_update(&ctx, inner_digest, sizeof(inner_digest));
     sha256_final(&ctx, digest);
 
-    /* Don't leave key material or intermediate state sitting in locals
-     * longer than necessary. */
+    /* Don't leave key material or intermediate state sitting in locals longer than necessary. */
     memset(key_block, 0, sizeof(key_block));
     memset(ipad, 0, sizeof(ipad));
     memset(opad, 0, sizeof(opad));

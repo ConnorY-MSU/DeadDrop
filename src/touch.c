@@ -14,10 +14,7 @@
 
 #define TOUCH_DEV_GLOB_MAX 32
 
-/* Per-fd state needed to normalize raw ABS_X/ABS_Y readings - queried
- * once at open time via EVIOCGABS and cached here, keyed by fd. A
- * small fixed table rather than a dynamic structure returned to the
- * caller: this project only ever opens one touch device at a time. */
+/* Per-fd state to normalize raw ABS_X/ABS_Y readings, queried once via EVIOCGABS at open time and cached here, keyed by fd. */
 #define TOUCH_MAX_OPEN_FDS 4
 static struct {
     int fd;
@@ -31,13 +28,7 @@ static int bit_is_set(const unsigned char *bits, int bit)
     return (bits[bit / 8] >> (bit % 8)) & 1;
 }
 
-/*
- * device_is_touchscreen - true if this fd's device reports ABS_X,
- * ABS_Y, and INPUT_PROP_DIRECT - the capability signature confirmed
- * against the real ft5x06 touch controller (see touch.h), not
- * assumed. A mouse or trackpad has ABS/REL axes without
- * INPUT_PROP_DIRECT; a keyboard has neither.
- */
+/* device_is_touchscreen - true if this fd reports ABS_X, ABS_Y, and INPUT_PROP_DIRECT (confirmed against the real ft5x06 controller, see touch.h). */
 static int device_is_touchscreen(int fd)
 {
     unsigned char abs_bits[(ABS_MAX + 7) / 8];
@@ -161,11 +152,7 @@ int touch_read_tap(int fd, touch_point *out_point, int timeout_ms)
                 have_xy |= 2;
             } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH &&
                        ev.value == 1 && have_xy == 3) {
-                /* Touch-down, and we have a real X/Y pair for it -
-                 * per the "type A" evdev convention, ABS_X/ABS_Y are
-                 * reported before BTN_TOUCH within the same event
-                 * packet, so both are already current by the time
-                 * this fires. */
+                /* Touch-down with a real X/Y pair - "type A" evdev convention delivers ABS_X/ABS_Y before BTN_TOUCH in the same packet. */
                 int x_range = g_touch_state[state_idx].x_max -
                               g_touch_state[state_idx].x_min;
                 int y_range = g_touch_state[state_idx].y_max -
@@ -182,9 +169,7 @@ int touch_read_tap(int fd, touch_point *out_point, int timeout_ms)
                 return 1;
             }
         }
-        /* Drained this batch with no completed tap yet (e.g. touch-up,
-         * or a mid-drag position update) - poll again for the rest of
-         * the caller's timeout rather than returning a false timeout. */
+        /* Drained this batch with no completed tap yet - poll again for the rest of the timeout rather than returning a false timeout. */
     }
 }
 
@@ -203,10 +188,7 @@ void touch_close(int fd)
 
 #else /* !__linux__ */
 
-/* No touchscreen exists on this project's Windows dev machine - these
- * stubs exist only so callers can link on either platform without
- * #ifdef guards at every call site, matching hw_expansion.h's
- * established precedent. */
+/* No touchscreen on this project's Windows dev machine - these stubs let callers link on either platform (matches hw_expansion.h's precedent). */
 
 int touch_open(void)
 {
