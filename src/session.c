@@ -15,6 +15,7 @@
 #include "hw_oled.h"
 #include "hw_tts.h"
 #include "hw_volume.h"
+#include "wardrive.h"
 #include "ui.h"
 #include "outbox.h"
 #include "msglog.h"
@@ -748,6 +749,26 @@ session_result run_symmetric_session(WOLFSSL *ssl, socket_t sock, int hw_fd,
             } else {
                 ui_add_historyf(NULL, "(volume set to %d%%)", (int)pct);
             }
+            continue;
+        }
+
+        /* "/wardrive" (report), "/wardrive on"/"/wardrive off" (toggle) - fallback-only auto-connect to the strongest open WiFi network when no trusted network is in range; see wardrive.h. Purely local/device-level, like "/volume". */
+        if (strcmp(line, "/wardrive") == 0) {
+            char status[160];
+            wardrive_status_line(status, sizeof(status));
+            ui_add_history(NULL, status);
+            continue;
+        }
+        if (strcmp(line, "/wardrive on") == 0) {
+            wardrive_set_enabled(1);
+            ui_add_history(NULL,
+                "(wardrive mode: ON - will auto-connect to the strongest "
+                "open network when no trusted network is in range)");
+            continue;
+        }
+        if (strcmp(line, "/wardrive off") == 0) {
+            wardrive_set_enabled(0);
+            ui_add_history(NULL, "(wardrive mode: OFF)");
             continue;
         }
 

@@ -37,6 +37,7 @@
 #include "hw_expansion.h"
 #include "hw_oled.h"
 #include "hw_tts.h"
+#include "wardrive.h"
 #include "session.h"
 #include "ui.h"
 #include "keyshare.h"
@@ -555,6 +556,9 @@ int main(int argc, char *argv[])
     /* Resident Piper TTS pipeline + speaker thread; failure here (piper/aplay missing) is silently non-fatal - hw_tts_speak() becomes a no-op. */
     hw_tts_init();
 
+    /* Background wardrive thread - starts either way, but stays idle (OFF) unless a prior "/wardrive on" persisted it enabled. See wardrive.h. */
+    wardrive_init();
+
     /* Reconnect loop. ctx is reused across attempts; only the socket and WOLFSSL* are per-connection. */
     for (;;) {
         int connected_ok = 0;
@@ -589,6 +593,7 @@ int main(int argc, char *argv[])
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
     hw_tts_shutdown();
+    wardrive_shutdown();
     ui_stop_idle_input();
     ui_shutdown();
 

@@ -258,6 +258,138 @@ int wifi_get_link_info(wifi_link_info *out_info)
     return -1; /* no active WiFi connection right now */
 }
 
+int wifi_scan_open(wifi_open_network *out_networks, int max_results)
+{
+    char buf[8192];
+    char *line;
+    char *saveptr = NULL;
+    int count = 0;
+    char *rescan_argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
+                              (char *)"wifi", (char *)"rescan", NULL };
+    char *argv[] = { (char *)"nmcli", (char *)"-t", (char *)"-f",
+                      (char *)"SSID,SECURITY,SIGNAL", (char *)"device",
+                      (char *)"wifi", (char *)"list", NULL };
+
+    if (out_networks == NULL || max_results <= 0) {
+        return -1;
+    }
+
+    run_nmcli(rescan_argv, NULL, 0); /* best-effort, same as wifi_scan() */
+    sleep(WIFI_SCAN_SETTLE_SECONDS);
+
+    if (run_nmcli(argv, buf, sizeof(buf)) < 0) {
+        return -1;
+    }
+
+    line = strtok_r(buf, "\n", &saveptr);
+    while (line != NULL && count < max_results) {
+        char ssid[WIFI_SSID_MAX];
+        char security[64];
+        const char *p = line;
+        int signal_percent;
+
+        parse_escaped_ssid_field(&p, ssid, sizeof(ssid));
+        parse_escaped_ssid_field(&p, security, sizeof(security));
+        signal_percent = atoi(p);
+
+        /* Open only - terse mode leaves SECURITY empty for an open network, same convention wifi_scan() relies on above. */
+        if (ssid[0] != '\0' && security[0] == '\0') {
+            int dup = 0;
+            int i;
+            for (i = 0; i < count; i++) {
+                if (strcmp(out_networks[i].ssid, ssid) == 0) {
+                    dup = 1;
+                    if (signal_percent > out_networks[i].signal_percent) {
+                        out_networks[i].signal_percent = signal_percent;
+                    }
+                    break;
+                }
+            }
+            if (!dup) {
+                snprintf(out_networks[count].ssid,
+                          sizeof(out_networks[count].ssid), "%s", ssid);
+                out_networks[count].signal_percent = signal_percent;
+                count++;
+            }
+        }
+
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    return count;
+}
+
+int wifi_connect_open_named(const char *ssid, const char *conn_name,
+                              char *out_error, size_t out_error_size)
+{
+    char output[2048];
+    int rc;
+
+    if (ssid == NULL || ssid[0] == '\0' ||
+            conn_name == NULL || conn_name[0] == '\0') {
+        return -1;
+    }
+
+    {
+        char *rescan_argv[] = { (char *)"sudo", (char *)"nmcli",
+                                  (char *)"device", (char *)"wifi",
+                                  (char *)"rescan", NULL };
+        run_nmcli(rescan_argv, NULL, 0); /* best-effort - ignore rc */
+        sleep(2); /* let the radio finish the scan before connecting */
+    }
+
+    {
+        char *argv[] = { (char *)"sudo", (char *)"nmcli", (char *)"device",
+                          (char *)"wifi", (char *)"connect", (char *)ssid,
+                          (char *)"name", (char *)conn_name, NULL };
+        rc = run_nmcli(argv, output, sizeof(output));
+    }
+
+    if (rc != 0 && out_error != NULL && out_error_size > 0) {
+        snprintf(out_error, out_error_size, "%s", output);
+    }
+
+    return rc == 0 ? 0 : -1;
+}
+
+void wifi_delete_connections_with_prefix(const char *prefix)
+{
+    char buf[4096];
+    char *line;
+    char *saveptr = NULL;
+    size_t prefix_len;
+    char *list_argv[] = { (char *)"nmcli", (char *)"-t", (char *)"-f",
+                            (char *)"NAME,ACTIVE", (char *)"connection",
+                            (char *)"show", NULL };
+
+    if (prefix == NULL || prefix[0] == '\0') {
+        return;
+    }
+    prefix_len = strlen(prefix);
+
+    if (run_nmcli(list_argv, buf, sizeof(buf)) < 0) {
+        return;
+    }
+
+    line = strtok_r(buf, "\n", &saveptr);
+    while (line != NULL) {
+        char name[128];
+        const char *p = line;
+
+        parse_escaped_ssid_field(&p, name, sizeof(name)); /* generic colon-escaped field parse, not SSID-specific despite the helper's name */
+
+        if (strncmp(name, prefix, prefix_len) == 0 &&
+                strcmp(p, "yes") != 0) {
+            char *del_argv[] = { (char *)"sudo", (char *)"nmcli",
+                                   (char *)"connection", (char *)"delete",
+                                   (char *)name, NULL };
+            run_nmcli(del_argv, NULL, 0); /* best-effort */
+        }
+
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+}
+
 #else /* !__linux__ */
 
 /* No nmcli on non-Linux (WiFi setup screen is Linux/ncurses-only, see ui.c); these stubs let callers link unconditionally. */
@@ -293,6 +425,29 @@ int wifi_get_link_info(wifi_link_info *out_info)
         out_info->rate[0] = '\0';
     }
     return -1; /* no OLED/WiFi metrics display exists on non-Linux */
+}
+
+int wifi_scan_open(wifi_open_network *out_networks, int max_results)
+{
+    (void)out_networks;
+    (void)max_results;
+    return -1;
+}
+
+int wifi_connect_open_named(const char *ssid, const char *conn_name,
+                              char *out_error, size_t out_error_size)
+{
+    (void)ssid;
+    (void)conn_name;
+    if (out_error != NULL && out_error_size > 0) {
+        out_error[0] = '\0';
+    }
+    return -1;
+}
+
+void wifi_delete_connections_with_prefix(const char *prefix)
+{
+    (void)prefix;
 }
 
 #endif /* __linux__ */

@@ -34,6 +34,7 @@
 #include "hw_expansion.h"
 #include "hw_oled.h"
 #include "hw_tts.h"
+#include "wardrive.h"
 #include "session.h"
 #include "ui.h"
 #include "keyshare.h"
@@ -466,6 +467,9 @@ int main(int argc, char *argv[])
     /* Resident Piper TTS pipeline + speaker thread, started once for the process's life; failure here is silently non-fatal (hw_tts_speak() becomes a no-op). */
     hw_tts_init();
 
+    /* Background wardrive thread - starts either way, but stays idle (OFF) unless a prior "/wardrive on" persisted it enabled. See wardrive.h. */
+    wardrive_init();
+
     /* ui_start_idle_input() is already running (started earlier); covers accept()'s block below. Each run_symmetric_session() call still brackets its own stop/start. */
 
     for (;;) {
@@ -538,6 +542,7 @@ int main(int argc, char *argv[])
     hw_expansion_close(hw_fd);
     hw_oled_close(oled_fd);
     hw_tts_shutdown();
+    wardrive_shutdown();
     ui_stop_idle_input();
     ui_shutdown();
     wolfSSL_CTX_free(ctx);

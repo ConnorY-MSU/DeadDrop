@@ -16,6 +16,7 @@
 
 #include "lock.h"
 #include "wifi.h"
+#include "wardrive.h"
 #include "touch.h"
 #include "hw_expansion.h"
 #include "hw_oled.h"
@@ -656,6 +657,10 @@ void ui_show_help(void)
         "/clear: wipe chat history (keeps any /save'd messages)",
         "/volume: show current speaker volume",
         "/volume <0-100>: set speaker volume",
+        "/wardrive: show wardrive mode status",
+        "/wardrive on: auto-connect to the strongest open WiFi network",
+        "             when no trusted network is in range (mobile use)",
+        "/wardrive off: turn wardrive mode back off",
         "/destroy CONFIRM: EMERGENCY - irreversibly wipe ALL chat data",
         "                  on BOTH devices, no exceptions",
         "/help: show this guide again",
@@ -1424,6 +1429,20 @@ static void *idle_input_thread_main(void *arg)
             } else if (strcmp(dummy, "/help") == 0) {
                 /* Same reasoning as "/clear" above - purely local, no connection needed. */
                 ui_show_help();
+            } else if (strcmp(dummy, "/wardrive") == 0) {
+                /* Same reasoning as "/clear"/"/help" above - a device-level WiFi setting, not a chat command, so it works with no peer connected. wardrive_status_line() runs a subprocess call (nmcli) - safe here, this loop body already runs outside ui_mutex (see ui_poll_line() above). */
+                char status[160];
+                wardrive_status_line(status, sizeof(status));
+                ui_add_history(NULL, status);
+            } else if (strcmp(dummy, "/wardrive on") == 0) {
+                wardrive_set_enabled(1);
+                ui_add_history(NULL,
+                    "(wardrive mode: ON - will auto-connect to the "
+                    "strongest open network when no trusted network is "
+                    "in range)");
+            } else if (strcmp(dummy, "/wardrive off") == 0) {
+                wardrive_set_enabled(0);
+                ui_add_history(NULL, "(wardrive mode: OFF)");
             } else if (strcmp(dummy, "/destroy") == 0) {
                 ui_add_error(
                     "EMERGENCY DESTROY: type '/destroy CONFIRM' (exact, "
