@@ -474,6 +474,17 @@ int main(int argc, char *argv[])
             ui_add_errorf("accept() failed: %d", SOCK_LAST_ERROR());
             continue;
         }
+
+        /* BUGFIX (2026-09-23): idle-input MUST stop before the first UI
+         * call touches input_win, not just before run_symmetric_session().
+         * The idle thread re-locks ui_mutex every ~20ms in a tight loop
+         * (see UI_POLL_SLICE_MS) with no fairness guarantee, so leaving
+         * it running through the whole accept()+handshake window let it
+         * starve this thread's ui_set_status() below indefinitely - a
+         * real, reproduced hang, not a theoretical race. Restarted once
+         * at the end of this iteration, on every exit path. See
+         * COMMENT_ARCHIVE.md. */
+        ui_stop_idle_input();
         ui_set_status("bravo connected - starting TLS handshake...");
 
         /* See CONN_TIMEOUT_SECONDS above: bounds how long one stalled/malicious connection can block every other connection. */
@@ -483,6 +494,7 @@ int main(int argc, char *argv[])
         if (ssl == NULL) {
             ui_add_error("wolfSSL_new failed");
             CLOSE_SOCKET(client_sock);
+            ui_start_idle_input();
             continue;
         }
 
@@ -504,10 +516,7 @@ int main(int argc, char *argv[])
             hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
             hw_oled_draw_text(oled_fd, 1, "Connected");
             hw_oled_display(oled_fd);
-            /* Stop the idle-input thread before run_symmetric_session() reads the same input_win, resume right after - see ui.h's "IDLE INPUT" comment. */
-            ui_stop_idle_input();
             run_symmetric_session(ssl, client_sock, hw_fd, oled_fd, "Bravo");
-            ui_start_idle_input();
             hw_expansion_set_status_color(hw_fd, HW_STATUS_DISCONNECTED);
             ui_set_link_state(0);
             hw_oled_draw_text(oled_fd, 0, "DeadDrop Alpha");
@@ -519,6 +528,7 @@ int main(int argc, char *argv[])
             ui_set_statusf("Listening on port %d...", SERVER_PORT);
         }
 
+        ui_start_idle_input();
         wolfSSL_free(ssl);
         CLOSE_SOCKET(client_sock);
     }

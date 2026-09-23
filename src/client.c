@@ -336,6 +336,15 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
         CLOSE_SOCKET(sock);
         return SESSION_DISCONNECTED;
     }
+    /* BUGFIX (2026-09-23): idle-input MUST stop before the first UI call
+     * touches input_win, not just before run_symmetric_session(). The
+     * idle thread re-locks ui_mutex every ~20ms in a tight loop (see
+     * UI_POLL_SLICE_MS) with no fairness guarantee, so leaving it
+     * running through the whole connect()+handshake window let it
+     * starve this thread's ui_set_status() below indefinitely - a real,
+     * reproduced hang, not a theoretical race. Restarted on every exit
+     * path below. See COMMENT_ARCHIVE.md. */
+    ui_stop_idle_input();
     ui_set_status("TCP connected - starting TLS handshake...");
 
     /* See CONN_TIMEOUT_SECONDS above - turns a silent network death into a detectable read failure instead of an indefinite hang. */
@@ -345,6 +354,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     if (ssl == NULL) {
         ui_add_error("wolfSSL_new failed");
         CLOSE_SOCKET(sock);
+        ui_start_idle_input();
         return SESSION_DISCONNECTED;
     }
 
@@ -361,6 +371,7 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
                        wolfSSL_ERR_error_string(err, errbuf));
         wolfSSL_free(ssl);
         CLOSE_SOCKET(sock);
+        ui_start_idle_input();
         return SESSION_DISCONNECTED;
     }
     ui_set_status("mTLS handshake succeeded");
@@ -371,8 +382,6 @@ static session_result connect_and_run(WOLFSSL_CTX *ctx, const char *host,
     hw_oled_draw_text(oled_fd, 1, "Connected");
     hw_oled_display(oled_fd);
 
-    /* Stop the idle-input thread before run_symmetric_session() reads input_win; resume right after (see ui.h "IDLE INPUT"). */
-    ui_stop_idle_input();
     result = run_symmetric_session(ssl, sock, hw_fd, oled_fd, "Alpha");
     ui_start_idle_input();
 
